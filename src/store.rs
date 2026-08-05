@@ -409,6 +409,7 @@ impl Store {
 
     /// Compare-and-set write. `expected_version` 0 means "must not exist".
     /// Returns Ok(new_version) or Err(CasConflict{current}) via the enum below.
+    #[allow(clippy::too_many_arguments)] // mirrors the secret_version row
     pub fn put_secret(
         &mut self,
         group_id: i64,
@@ -531,7 +532,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT ts, endpoint_id, op, target, outcome, prev_hash, hash FROM audit_log ORDER BY seq",
         )?;
-        let rows: Vec<(i64, String, String, String, String, Vec<u8>, Vec<u8>)> = stmt
+        type AuditRow = (i64, String, String, String, String, Vec<u8>, Vec<u8>);
+        let rows: Vec<AuditRow> = stmt
             .query_map([], |r| {
                 Ok((
                     r.get(0)?,
