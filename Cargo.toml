@@ -3,6 +3,9 @@ name = "secret-bunker-iroh"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
+license = "AGPL-3.0-or-later"
+description = "Secrets bunker over iroh: p2p QUIC transport, EndpointId ACLs, age at-rest crypto"
+repository = "https://github.com/fables-for-robots/secret-bunker-iroh"
 
 [dependencies]
 age = "0.11"
