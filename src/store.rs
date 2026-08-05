@@ -299,6 +299,45 @@ impl Store {
         Ok(())
     }
 
+    /// Groups the identity holds any permission on, with that bitmask.
+    pub fn groups_for_identity(&self, identity_id: i64) -> Result<Vec<(String, u8)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.name, a.perms FROM secret_group g
+             JOIN group_acl a ON a.group_id = g.id
+             WHERE a.identity_id = ?1 ORDER BY g.name",
+        )?;
+        let rows = stmt.query_map([identity_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u8))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Every group, with the identity's permission bitmask (0 when none).
+    pub fn all_groups_with_perms(&self, identity_id: i64) -> Result<Vec<(String, u8)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.name, COALESCE(a.perms, 0) FROM secret_group g
+             LEFT JOIN group_acl a ON a.group_id = g.id AND a.identity_id = ?1
+             ORDER BY g.name",
+        )?;
+        let rows = stmt.query_map([identity_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u8))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The ACL of a group as (identity name, perms) pairs.
+    pub fn group_acl_entries(&self, group_id: i64) -> Result<Vec<(String, u8)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.name, a.perms FROM group_acl a
+             JOIN identity i ON i.id = a.identity_id
+             WHERE a.group_id = ?1 ORDER BY i.name",
+        )?;
+        let rows = stmt.query_map([group_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u8))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn current_dek(&self, group_id: i64) -> Result<WrappedDek> {
         Ok(self.conn.query_row(
             "SELECT version, wrapped_operational, wrapped_backup FROM group_dek

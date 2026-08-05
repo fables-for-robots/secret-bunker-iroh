@@ -17,6 +17,7 @@ iroh = "1"
 iroh-mdns-address-lookup = "0.4"
 postcard = { version = "1", features = ["use-std"] }
 rand = "0.8"
+ratatui = "0.30"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

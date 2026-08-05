@@ -4,3 +4,4 @@ pub mod keys;
 pub mod proto;
 pub mod server;
 pub mod store;
+pub mod tui;

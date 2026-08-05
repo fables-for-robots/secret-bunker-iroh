@@ -489,3 +489,134 @@ async fn mdns_discovery_connects_by_bare_endpoint_id() {
     admin.close().await;
     router.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn list_groups_and_acl_visibility() {
+    // ListGroups shows each caller exactly what it may see: service admins
+    // see all groups, users see only groups they hold permissions on, and
+    // unknown peers see nothing at all. GroupAcl requires group admin.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bunker.sqlite");
+
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+    let reader_secret = SecretKey::generate();
+    let stranger_secret = SecretKey::generate();
+
+    let store = init_store(&db, &op, &backup, &admin_secret.public());
+    let bunker = Bunker::new(store, op).unwrap();
+    let server = Endpoint::bind(presets::Minimal).await.unwrap();
+    let router = Router::builder(server).accept(ALPN, bunker).spawn();
+    let addr = router.endpoint().addr();
+
+    let admin = Client::with_endpoint(client_endpoint(admin_secret).await, addr.clone())
+        .await
+        .unwrap();
+    for group in ["alpha", "beta"] {
+        assert_eq!(
+            admin
+                .request(&Request::CreateGroup { name: group.into() })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+    }
+    assert_eq!(
+        admin
+            .request(&Request::AddIdentity {
+                name: "reader".into(),
+                endpoint_id: reader_secret.public().to_string(),
+                service_admin: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Grant {
+                group: "alpha".into(),
+                identity: "reader".into(),
+                perms: 1,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+
+    // Service admin sees every group, with its own perms (rwa on both,
+    // granted at creation).
+    match admin.request(&Request::ListGroups).await.unwrap() {
+        Response::Groups {
+            service_admin,
+            groups,
+        } => {
+            assert!(service_admin);
+            assert_eq!(
+                groups
+                    .iter()
+                    .map(|g| (g.name.as_str(), g.perms))
+                    .collect::<Vec<_>>(),
+                vec![("alpha", 7), ("beta", 7)]
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    // The reader sees only the group it was granted on — beta stays
+    // invisible.
+    let reader = Client::with_endpoint(client_endpoint(reader_secret).await, addr.clone())
+        .await
+        .unwrap();
+    match reader.request(&Request::ListGroups).await.unwrap() {
+        Response::Groups {
+            service_admin,
+            groups,
+        } => {
+            assert!(!service_admin);
+            assert_eq!(
+                groups
+                    .iter()
+                    .map(|g| (g.name.as_str(), g.perms))
+                    .collect::<Vec<_>>(),
+                vec![("alpha", 1)]
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    // Unknown peers get the uniform denial, not an empty list.
+    let stranger = Client::with_endpoint(client_endpoint(stranger_secret).await, addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        stranger.request(&Request::ListGroups).await.unwrap(),
+        Response::Denied
+    );
+
+    // GroupAcl: group admin sees the entries; a mere reader is denied.
+    assert_eq!(
+        admin
+            .request(&Request::GroupAcl {
+                group: "alpha".into()
+            })
+            .await
+            .unwrap(),
+        Response::Acl(vec![("admin".into(), 7), ("reader".into(), 1)])
+    );
+    assert_eq!(
+        reader
+            .request(&Request::GroupAcl {
+                group: "alpha".into()
+            })
+            .await
+            .unwrap(),
+        Response::Denied
+    );
+
+    admin.close().await;
+    reader.close().await;
+    stranger.close().await;
+    router.shutdown().await.unwrap();
+}

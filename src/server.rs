@@ -116,6 +116,40 @@ impl Bunker {
                 perms,
             } => Self::grant(store, &ident, group, identity, *perms),
             Request::RotateDek { group } => Self::rotate_dek(inner, store, &ident, group),
+            Request::ListGroups => Self::list_groups(store, &ident),
+            Request::GroupAcl { group } => Self::group_acl(store, &ident, group),
+        }
+    }
+
+    fn list_groups(store: &Store, ident: &Identity) -> Response {
+        let groups = if ident.service_admin {
+            store.all_groups_with_perms(ident.id)
+        } else {
+            store.groups_for_identity(ident.id)
+        };
+        match groups {
+            Ok(groups) => Response::Groups {
+                service_admin: ident.service_admin,
+                groups: groups
+                    .into_iter()
+                    .map(|(name, perms)| crate::proto::GroupInfo { name, perms })
+                    .collect(),
+            },
+            Err(_) => Response::Failed {
+                reason: "internal error".into(),
+            },
+        }
+    }
+
+    fn group_acl(store: &Store, ident: &Identity, group: &str) -> Response {
+        let Some(group_id) = Self::authorize_group(store, ident, group, PERM_ADMIN) else {
+            return Response::Denied;
+        };
+        match store.group_acl_entries(group_id) {
+            Ok(entries) => Response::Acl(entries),
+            Err(_) => Response::Failed {
+                reason: "internal error".into(),
+            },
         }
     }
 

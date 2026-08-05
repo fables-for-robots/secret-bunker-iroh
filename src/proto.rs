@@ -54,6 +54,13 @@ pub enum Request {
     RotateDek {
         group: String,
     },
+    /// Groups visible to the caller: those it holds permissions on, or
+    /// every group when the caller is a service admin.
+    ListGroups,
+    /// The ACL of a group; requires `admin` on that group.
+    GroupAcl {
+        group: String,
+    },
 }
 
 impl Request {
@@ -70,6 +77,8 @@ impl Request {
             Request::ListIdentities => "list-identities",
             Request::Grant { .. } => "grant",
             Request::RotateDek { .. } => "rotate-dek",
+            Request::ListGroups => "list-groups",
+            Request::GroupAcl { .. } => "group-acl",
         }
     }
 
@@ -79,10 +88,12 @@ impl Request {
             Request::Get { group, name }
             | Request::Put { group, name, .. }
             | Request::Delete { group, name, .. } => format!("{group}/{name}"),
-            Request::List { group } | Request::RotateDek { group } => group.clone(),
+            Request::List { group }
+            | Request::RotateDek { group }
+            | Request::GroupAcl { group } => group.clone(),
             Request::CreateGroup { name } => name.clone(),
             Request::AddIdentity { name, .. } | Request::RemoveIdentity { name } => name.clone(),
-            Request::ListIdentities => String::new(),
+            Request::ListIdentities | Request::ListGroups => String::new(),
             Request::Grant {
                 group, identity, ..
             } => format!("{group}:{identity}"),
@@ -110,6 +121,14 @@ pub enum Response {
     },
     Names(Vec<(String, u64)>),
     Identities(Vec<IdentityInfo>),
+    /// Reply to ListGroups: the caller's role plus the groups it can see,
+    /// each with the caller's own permission bitmask on it.
+    Groups {
+        service_admin: bool,
+        groups: Vec<GroupInfo>,
+    },
+    /// Reply to GroupAcl: (identity name, permission bitmask) pairs.
+    Acl(Vec<(String, u8)>),
     /// Operation failed after authorization succeeded. Never sent to
     /// unauthorized callers (they get `Denied`), so the reason may be
     /// informative.
@@ -119,10 +138,41 @@ pub enum Response {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupInfo {
+    pub name: String,
+    /// The requesting caller's permission bitmask on this group.
+    pub perms: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IdentityInfo {
     pub name: String,
     pub endpoint_id: String,
     pub service_admin: bool,
+}
+
+/// Render a permission bitmask as "rwa" flags (e.g. "r--", "rw-", "rwa").
+pub fn perms_str(perms: u8) -> String {
+    let flag = |bit: u8, c: char| if perms & bit != 0 { c } else { '-' };
+    format!("{}{}{}", flag(1, 'r'), flag(2, 'w'), flag(4, 'a'))
+}
+
+/// Parse "r", "rw", "rwa", "none" (or "-") into a permission bitmask.
+pub fn parse_perms(s: &str) -> anyhow::Result<u8> {
+    let s = s.trim();
+    if s == "none" || s == "-" {
+        return Ok(0);
+    }
+    let mut perms = 0u8;
+    for c in s.chars() {
+        perms |= match c {
+            'r' => 1,
+            'w' => 2,
+            'a' => 4,
+            _ => anyhow::bail!("invalid permission '{c}' (use r, w, a, or \"none\")"),
+        };
+    }
+    Ok(perms)
 }
 
 pub fn encode<T: Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {

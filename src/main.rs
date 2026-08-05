@@ -94,6 +94,20 @@ enum Cmd {
         #[arg(long)]
         new_operational_pubkey: String,
     },
+    /// Interactive terminal UI (role-aware: user, group admin, service admin).
+    Tui {
+        /// This client's iroh endpoint secret key file. Defaults to the
+        /// XDG data dir, auto-generating there when missing.
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// The bunker's EndpointId (hex).
+        #[arg(long)]
+        server: String,
+        /// Direct socket address(es) of the bunker; when omitted, n0
+        /// discovery resolves the EndpointId.
+        #[arg(long)]
+        server_addr: Vec<SocketAddr>,
+    },
     /// Talk to a bunker.
     Client {
         /// This client's iroh endpoint secret key file. Defaults to the
@@ -143,6 +157,13 @@ enum ClientCmd {
     },
     /// List secrets in a group.
     Ls {
+        #[arg(long)]
+        group: String,
+    },
+    /// List groups you can see (service admins see all groups).
+    ListGroups,
+    /// Show a group's ACL (requires admin on the group).
+    Acl {
         #[arg(long)]
         group: String,
     },
@@ -453,6 +474,31 @@ async fn main() -> Result<()> {
             store.meta_set("operational_pubkey", &new_op.to_string())?;
             println!("re-wrapped {rewrapped} DEK(s) to {new_op}");
         }
+        Cmd::Tui {
+            key,
+            server,
+            server_addr,
+        } => {
+            use std::io::IsTerminal;
+            anyhow::ensure!(
+                std::io::stdout().is_terminal(),
+                "the TUI needs an interactive terminal"
+            );
+            let secret = resolve_endpoint_key(key, KeyRole::Client)?;
+            let my_id = secret.public().to_string();
+            let server_id: EndpointId = server.parse().context("parsing --server")?;
+            let addr = if server_addr.is_empty() {
+                EndpointAddr::new(server_id)
+            } else {
+                EndpointAddr::from_parts(server_id, server_addr.into_iter().map(TransportAddr::Ip))
+            };
+            let client = Client::connect(secret, addr).await?;
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                secret_bunker_iroh::tui::run(handle, client, my_id)
+            })
+            .await??;
+        }
         Cmd::Client {
             key,
             server,
@@ -505,6 +551,10 @@ async fn main() -> Result<()> {
                 ClientCmd::Ls { group } => Request::List {
                     group: group.clone(),
                 },
+                ClientCmd::ListGroups => Request::ListGroups,
+                ClientCmd::Acl { group } => Request::GroupAcl {
+                    group: group.clone(),
+                },
                 ClientCmd::CreateGroup { name } => Request::CreateGroup { name: name.clone() },
                 ClientCmd::AddIdentity {
                     name,
@@ -544,6 +594,29 @@ async fn main() -> Result<()> {
                 Response::Names(names) => {
                     for (name, version) in names {
                         println!("{name}\tv{version}");
+                    }
+                }
+                Response::Groups {
+                    service_admin,
+                    groups,
+                } => {
+                    if service_admin {
+                        eprintln!("role: service admin (all groups shown)");
+                    }
+                    for g in groups {
+                        println!(
+                            "{}\t[{}]",
+                            g.name,
+                            secret_bunker_iroh::proto::perms_str(g.perms)
+                        );
+                    }
+                }
+                Response::Acl(entries) => {
+                    for (identity, perms) in entries {
+                        println!(
+                            "{identity}\t[{}]",
+                            secret_bunker_iroh::proto::perms_str(perms)
+                        );
                     }
                 }
                 Response::Identities(ids) => {
