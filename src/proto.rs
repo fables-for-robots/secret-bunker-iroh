@@ -12,6 +12,10 @@ pub const ALPN: &[u8] = b"secret-bunker/1";
 /// Maximum encoded message size accepted on a stream (either direction).
 pub const MAX_MSG: usize = 4 * 1024 * 1024;
 
+// WIRE CONTRACT: variant order is the postcard discriminant. Non-Rust
+// clients (github.com/fables-for-robots/go-secret-bunker-iroh) encode
+// these by index — never reorder or insert variants mid-enum; append
+// only. Guarded by the wire_format_is_stable test below.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Get {
@@ -186,6 +190,58 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> anyhow::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Golden vectors shared with the Go client
+    /// (go-secret-bunker-iroh/proto_test.go). A failure here means the
+    /// wire format changed and every non-Rust client breaks.
+    #[test]
+    fn wire_format_is_stable() {
+        let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (
+                encode(&Request::Get { group: "prod".into(), name: "db".into() }).unwrap(),
+                "000470726f64026462",
+            ),
+            (
+                encode(&Request::Put {
+                    group: "g".into(),
+                    name: "n".into(),
+                    value: vec![1, 2, 255],
+                    expected_version: 300,
+                })
+                .unwrap(),
+                "010167016e030102ffac02",
+            ),
+            (encode(&Request::ListGroups).unwrap(), "0a"),
+            (
+                encode(&Request::Grant { group: "g".into(), identity: "id".into(), perms: 7 })
+                    .unwrap(),
+                "08016702696407",
+            ),
+            (encode(&Response::Denied).unwrap(), "00"),
+            (
+                encode(&Response::Secret { value: b"hi".to_vec(), version: 128 }).unwrap(),
+                "020268698001",
+            ),
+            (
+                encode(&Response::Names(vec![("a".into(), 1), ("b".into(), 2)])).unwrap(),
+                "0502016101016202",
+            ),
+            (
+                encode(&Response::Groups {
+                    service_admin: true,
+                    groups: vec![GroupInfo { name: "g".into(), perms: 5 }],
+                })
+                .unwrap(),
+                "070101016705",
+            ),
+            (encode(&Response::Failed { reason: "no".into() }).unwrap(), "09026e6f"),
+            (encode(&Response::VersionConflict { current: 65535 }).unwrap(), "04ffff03"),
+        ];
+        for (bytes, expected) in cases {
+            assert_eq!(hex(&bytes), expected);
+        }
+    }
 
     #[test]
     fn request_roundtrip() {
