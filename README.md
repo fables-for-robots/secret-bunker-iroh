@@ -14,7 +14,10 @@ The security model of the network surface:
 > some secrets.**
 
 See [`design/crypto-design.md`](design/crypto-design.md) for the full
-cryptographic design, threat model, and non-goals. The short version:
+cryptographic design, threat model, and non-goals, and
+[`docs/protocol.md`](docs/protocol.md) for the wire protocol (framing,
+CBOR message encoding with examples, and compatibility rules). The short
+version:
 
 - **Transport**: iroh QUIC (TLS 1.3 with raw public keys). Both sides are
   mutually authenticated by their EndpointIds; relays only ever forward
