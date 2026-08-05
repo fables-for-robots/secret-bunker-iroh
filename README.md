@@ -185,10 +185,11 @@ mount on your own `Router` under the `secret-bunker/1` ALPN.
 [go-secret-bunker-iroh](https://github.com/fables-for-robots/go-secret-bunker-iroh)
 is a pure-Go client for this server, built on the native Go iroh
 implementation. It covers the full protocol with a typed API and is tested
-end-to-end against this server's binary in its CI. The postcard wire
-format is the contract between the two: `Request`/`Response` variant order
-in `src/proto.rs` is append-only, pinned on both sides by shared golden
-vectors (`wire_format_is_stable` here, `proto_test.go` there).
+end-to-end against this server's binary in its CI. The CBOR wire format is
+the contract between the two: `Request`/`Response` variant and field names
+in `src/proto.rs` are the encoding (serde's externally-tagged
+representation) and must never be renamed, pinned on both sides by shared
+golden vectors (`wire_format_is_stable` here, `proto_test.go` there).
 
 ## License
 

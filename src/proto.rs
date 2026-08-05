@@ -1,9 +1,12 @@
-//! Wire protocol: one request per bidirectional QUIC stream, postcard-encoded.
+//! Wire protocol: one request per bidirectional QUIC stream, CBOR-encoded
+//! (serde's externally-tagged enum representation: unit variants are text
+//! strings, others are single-entry maps keyed by the variant name).
 //!
 //! Authentication is the transport's job (iroh handshake); these messages
 //! carry no signatures, timestamps, or client identity fields. See
 //! design/crypto-design.md section 5.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// ALPN identifier for the bunker protocol.
@@ -12,10 +15,10 @@ pub const ALPN: &[u8] = b"secret-bunker/1";
 /// Maximum encoded message size accepted on a stream (either direction).
 pub const MAX_MSG: usize = 4 * 1024 * 1024;
 
-// WIRE CONTRACT: variant order is the postcard discriminant. Non-Rust
-// clients (github.com/fables-for-robots/go-secret-bunker-iroh) encode
-// these by index — never reorder or insert variants mid-enum; append
-// only. Guarded by the wire_format_is_stable test below.
+// WIRE CONTRACT: variant and field NAMES are the CBOR encoding. Non-Rust
+// clients (github.com/fables-for-robots/go-secret-bunker-iroh) match them
+// as strings — never rename a variant or field; adding variants is fine.
+// Guarded by the wire_format_is_stable test below.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Get {
@@ -26,6 +29,7 @@ pub enum Request {
     Put {
         group: String,
         name: String,
+        #[serde(with = "serde_bytes")]
         value: Vec<u8>,
         expected_version: u64,
     },
@@ -112,6 +116,7 @@ pub enum Response {
     Denied,
     Ok,
     Secret {
+        #[serde(with = "serde_bytes")]
         value: Vec<u8>,
         version: u64,
     },
@@ -180,18 +185,20 @@ pub fn parse_perms(s: &str) -> anyhow::Result<u8> {
 }
 
 pub fn encode<T: Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
-    Ok(postcard::to_stdvec(msg)?)
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(msg, &mut out)?;
+    Ok(out)
 }
 
-pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> anyhow::Result<T> {
-    Ok(postcard::from_bytes(bytes)?)
+pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> anyhow::Result<T> {
+    Ok(ciborium::de::from_reader(bytes)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Golden vectors shared with the Go client
+    /// CBOR golden vectors shared with the Go client
     /// (go-secret-bunker-iroh/proto_test.go). A failure here means the
     /// wire format changed and every non-Rust client breaks.
     #[test]
@@ -204,7 +211,7 @@ mod tests {
                     name: "db".into(),
                 })
                 .unwrap(),
-                "000470726f64026462",
+                "a163476574a26567726f75706470726f64646e616d65626462",
             ),
             (
                 encode(&Request::Put {
@@ -214,9 +221,12 @@ mod tests {
                     expected_version: 300,
                 })
                 .unwrap(),
-                "010167016e030102ffac02",
+                "a163507574a46567726f75706167646e616d65616e6576616c7565430102ff7065787065637465645f76657273696f6e19012c",
             ),
-            (encode(&Request::ListGroups).unwrap(), "0a"),
+            (
+                encode(&Request::ListGroups).unwrap(),
+                "6a4c69737447726f757073",
+            ),
             (
                 encode(&Request::Grant {
                     group: "g".into(),
@@ -224,20 +234,20 @@ mod tests {
                     perms: 7,
                 })
                 .unwrap(),
-                "08016702696407",
+                "a1654772616e74a36567726f75706167686964656e74697479626964657065726d7307",
             ),
-            (encode(&Response::Denied).unwrap(), "00"),
+            (encode(&Response::Denied).unwrap(), "6644656e696564"),
             (
                 encode(&Response::Secret {
                     value: b"hi".to_vec(),
                     version: 128,
                 })
                 .unwrap(),
-                "020268698001",
+                "a166536563726574a26576616c75654268696776657273696f6e1880",
             ),
             (
                 encode(&Response::Names(vec![("a".into(), 1), ("b".into(), 2)])).unwrap(),
-                "0502016101016202",
+                "a1654e616d6573828261610182616202",
             ),
             (
                 encode(&Response::Groups {
@@ -248,18 +258,18 @@ mod tests {
                     }],
                 })
                 .unwrap(),
-                "070101016705",
+                "a16647726f757073a26d736572766963655f61646d696ef56667726f75707381a2646e616d656167657065726d7305",
             ),
             (
                 encode(&Response::Failed {
                     reason: "no".into(),
                 })
                 .unwrap(),
-                "09026e6f",
+                "a1664661696c6564a166726561736f6e626e6f",
             ),
             (
                 encode(&Response::VersionConflict { current: 65535 }).unwrap(),
-                "04ffff03",
+                "a16f56657273696f6e436f6e666c696374a16763757272656e7419ffff",
             ),
         ];
         for (bytes, expected) in cases {
