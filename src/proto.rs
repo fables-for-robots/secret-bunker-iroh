@@ -199,7 +199,11 @@ mod tests {
         let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
         let cases: Vec<(Vec<u8>, &str)> = vec![
             (
-                encode(&Request::Get { group: "prod".into(), name: "db".into() }).unwrap(),
+                encode(&Request::Get {
+                    group: "prod".into(),
+                    name: "db".into(),
+                })
+                .unwrap(),
                 "000470726f64026462",
             ),
             (
@@ -214,13 +218,21 @@ mod tests {
             ),
             (encode(&Request::ListGroups).unwrap(), "0a"),
             (
-                encode(&Request::Grant { group: "g".into(), identity: "id".into(), perms: 7 })
-                    .unwrap(),
+                encode(&Request::Grant {
+                    group: "g".into(),
+                    identity: "id".into(),
+                    perms: 7,
+                })
+                .unwrap(),
                 "08016702696407",
             ),
             (encode(&Response::Denied).unwrap(), "00"),
             (
-                encode(&Response::Secret { value: b"hi".to_vec(), version: 128 }).unwrap(),
+                encode(&Response::Secret {
+                    value: b"hi".to_vec(),
+                    version: 128,
+                })
+                .unwrap(),
                 "020268698001",
             ),
             (
@@ -230,13 +242,25 @@ mod tests {
             (
                 encode(&Response::Groups {
                     service_admin: true,
-                    groups: vec![GroupInfo { name: "g".into(), perms: 5 }],
+                    groups: vec![GroupInfo {
+                        name: "g".into(),
+                        perms: 5,
+                    }],
                 })
                 .unwrap(),
                 "070101016705",
             ),
-            (encode(&Response::Failed { reason: "no".into() }).unwrap(), "09026e6f"),
-            (encode(&Response::VersionConflict { current: 65535 }).unwrap(), "04ffff03"),
+            (
+                encode(&Response::Failed {
+                    reason: "no".into(),
+                })
+                .unwrap(),
+                "09026e6f",
+            ),
+            (
+                encode(&Response::VersionConflict { current: 65535 }).unwrap(),
+                "04ffff03",
+            ),
         ];
         for (bytes, expected) in cases {
             assert_eq!(hex(&bytes), expected);
