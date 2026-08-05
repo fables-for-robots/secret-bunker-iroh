@@ -97,6 +97,8 @@ version instead of clobbering a concurrent write.
 
 ## Terminal UI
 
+![Demo of the secret-bunker TUI: browsing groups, viewing and creating secrets, managing ACLs and identities](docs/tui-demo.gif)
+
 `tui` opens an interactive, role-aware view of the bunker:
 
 ```sh
