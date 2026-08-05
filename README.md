@@ -40,36 +40,34 @@ cargo test          # unit + end-to-end tests (in-process iroh endpoints)
 
 ## Quick start
 
-Generate keys — the server's endpoint key, the operational age key, an
-offline backup age key, and an admin client key:
+Private keys live under `$XDG_DATA_HOME/secret-bunker-iroh` (falling back
+to `~/.local/share/secret-bunker-iroh`) and are auto-generated on first
+use, so most commands need no key flags at all.
+
+On the admin's machine, create a client identity and note its EndpointId:
 
 ```sh
-secret-bunker-iroh keygen-endpoint --out server.key     # prints the bunker's EndpointId
-secret-bunker-iroh keygen-endpoint --out admin.key      # prints the admin's EndpointId
-secret-bunker-iroh keygen-age --out operational.age     # prints age1... pubkey
-secret-bunker-iroh keygen-age --out backup.age          # keep this file OFFLINE
+secret-bunker-iroh key generate client
 ```
 
-Initialize the database (one-shot) and start the bunker:
+On the server, generate an offline backup key, initialize the database
+(one-shot), and serve — the endpoint and operational keys auto-generate:
 
 ```sh
+secret-bunker-iroh keygen-age --out backup.age   # move this OFFLINE; note the age1... pubkey
 secret-bunker-iroh init \
   --db bunker.sqlite \
-  --operational-key operational.age \
   --backup-pubkey age1... \
   --admin-id <admin EndpointId>
 
-secret-bunker-iroh serve \
-  --db bunker.sqlite \
-  --endpoint-key server.key \
-  --operational-key operational.age
+secret-bunker-iroh serve --db bunker.sqlite      # prints the bunker's EndpointId
 ```
 
 Use it. With the default n0 relays and discovery, the bunker's EndpointId is
 all a client needs; add `--server-addr ip:port` to dial directly:
 
 ```sh
-alias bunker='secret-bunker-iroh client --key admin.key --server <bunker EndpointId>'
+alias bunker='secret-bunker-iroh client --server <bunker EndpointId>'
 
 bunker create-group prod
 echo -n "hunter2" | bunker put --group prod --name db-password
@@ -87,6 +85,28 @@ bunker list-identities
 Writes are compare-and-set: `put` takes `--expected-version` (0 = create;
 otherwise the current version), and a mismatch fails with the current
 version instead of clobbering a concurrent write.
+
+## Key management
+
+Three keys are managed in the XDG data directory: `client.key` (the
+`client` subcommand's identity), `server.key` (the bunker's identity), and
+`operational.age` (wraps the group DEKs). All are created mode 0600 in a
+0700 directory.
+
+```sh
+secret-bunker-iroh key show                        # paths + public identifiers
+secret-bunker-iroh key generate client             # ensure a key exists, print its id
+secret-bunker-iroh key export client --out c.key   # or to stdout (it is SECRET material)
+secret-bunker-iroh key import client --in c.key    # onto another machine; --force to overwrite
+```
+
+Export/import moves an identity between machines without changing its
+EndpointId, so existing ACL grants keep working. Auto-generation only ever
+happens at the default XDG paths — an explicitly passed `--key`,
+`--endpoint-key`, or `--operational-key` path that does not exist is an
+error, so a typo cannot silently mint a fresh identity. `keygen-endpoint`
+and `keygen-age` remain for creating keys at arbitrary paths (e.g. the
+offline backup key).
 
 ## Connectivity: NATs and local networks
 

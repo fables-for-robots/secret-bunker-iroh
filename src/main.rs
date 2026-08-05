@@ -10,6 +10,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 
 use secret_bunker_iroh::client::Client;
+use secret_bunker_iroh::keys::KeyRole;
 use secret_bunker_iroh::proto::{Request, Response};
 use secret_bunker_iroh::server::Bunker;
 use secret_bunker_iroh::store::{PERM_ADMIN, PERM_READ, PERM_WRITE, Store};
@@ -40,13 +41,19 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Show, import, or export the keys in the XDG data directory.
+    Key {
+        #[command(subcommand)]
+        cmd: KeyCmd,
+    },
     /// Initialize a new bunker database (one-shot).
     Init {
         #[arg(long)]
         db: PathBuf,
-        /// Operational age identity file (private key stays with the server).
+        /// Operational age identity file. Defaults to the XDG data dir,
+        /// auto-generating there when missing.
         #[arg(long)]
-        operational_key: PathBuf,
+        operational_key: Option<PathBuf>,
         /// Backup age public key (`age1...`); private half stays offline.
         #[arg(long)]
         backup_pubkey: String,
@@ -60,12 +67,14 @@ enum Cmd {
     Serve {
         #[arg(long)]
         db: PathBuf,
-        /// Iroh endpoint secret key file.
+        /// Iroh endpoint secret key file. Defaults to the XDG data dir,
+        /// auto-generating there when missing.
         #[arg(long)]
-        endpoint_key: PathBuf,
-        /// Operational age identity file.
+        endpoint_key: Option<PathBuf>,
+        /// Operational age identity file. Defaults to the XDG data dir,
+        /// auto-generating there when missing.
         #[arg(long)]
-        operational_key: PathBuf,
+        operational_key: Option<PathBuf>,
         /// Disable relays (direct connections only).
         #[arg(long)]
         no_relay: bool,
@@ -87,9 +96,10 @@ enum Cmd {
     },
     /// Talk to a bunker.
     Client {
-        /// This client's iroh endpoint secret key file.
+        /// This client's iroh endpoint secret key file. Defaults to the
+        /// XDG data dir, auto-generating there when missing.
         #[arg(long)]
-        key: PathBuf,
+        key: Option<PathBuf>,
         /// The bunker's EndpointId (hex).
         #[arg(long)]
         server: String,
@@ -167,6 +177,145 @@ enum ClientCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// List key locations and their public identifiers.
+    Show,
+    /// Ensure a key exists (generating it when missing) and print its
+    /// public identifier. Idempotent.
+    Generate {
+        #[arg(value_enum)]
+        role: KeyRole,
+    },
+    /// Print a key's secret material (canonical form) to stdout or --out.
+    Export {
+        #[arg(value_enum)]
+        role: KeyRole,
+        /// Write to this file (mode 0600) instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Import secret key material from --in (or stdin) into the XDG data dir.
+    Import {
+        #[arg(value_enum)]
+        role: KeyRole,
+        /// Read from this file instead of stdin.
+        #[arg(long = "in")]
+        input: Option<PathBuf>,
+        /// Overwrite an existing key. The old key is irrecoverable
+        /// afterwards unless exported first.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// Resolve a key path: an explicit path must exist (no silent identity
+/// minting on typos); the default XDG path is auto-generated when missing.
+fn resolve_endpoint_key(explicit: Option<PathBuf>, role: KeyRole) -> Result<iroh::SecretKey> {
+    match explicit {
+        Some(path) => keys::load_endpoint_key(&path),
+        None => {
+            let path = keys::default_key_path(role)?;
+            let (secret, generated) = keys::load_or_generate_endpoint_key(&path)?;
+            if generated {
+                eprintln!(
+                    "generated new {} key at {} (endpoint id: {})",
+                    role.filename(),
+                    path.display(),
+                    secret.public()
+                );
+            }
+            Ok(secret)
+        }
+    }
+}
+
+fn resolve_operational_key(explicit: Option<PathBuf>) -> Result<age::x25519::Identity> {
+    match explicit {
+        Some(path) => keys::load_age_identity(&path),
+        None => {
+            let path = keys::default_key_path(KeyRole::Operational)?;
+            let (identity, generated) = keys::load_or_generate_age_identity(&path)?;
+            if generated {
+                eprintln!(
+                    "generated new operational key at {} (recipient: {})",
+                    path.display(),
+                    identity.to_public()
+                );
+            }
+            Ok(identity)
+        }
+    }
+}
+
+fn run_key_cmd(cmd: KeyCmd) -> Result<()> {
+    match cmd {
+        KeyCmd::Show => {
+            for role in [KeyRole::Client, KeyRole::Server, KeyRole::Operational] {
+                let path = keys::default_key_path(role)?;
+                let status = if path.exists() {
+                    keys::public_identifier(role, &path)?
+                } else {
+                    "(not generated yet)".into()
+                };
+                println!("{:<12} {}  {}", role.filename(), path.display(), status);
+            }
+        }
+        KeyCmd::Generate { role } => {
+            let path = keys::default_key_path(role)?;
+            let generated = if role.is_age() {
+                keys::load_or_generate_age_identity(&path)?.1
+            } else {
+                keys::load_or_generate_endpoint_key(&path)?.1
+            };
+            if generated {
+                eprintln!("generated {}", path.display());
+            }
+            println!("{}", keys::public_identifier(role, &path)?);
+        }
+        KeyCmd::Export { role, out } => {
+            let path = keys::default_key_path(role)?;
+            anyhow::ensure!(
+                path.exists(),
+                "{} does not exist; nothing to export",
+                path.display()
+            );
+            let contents = std::fs::read_to_string(&path)?;
+            let canonical = keys::canonicalize_key_material(role, &contents)?;
+            match out {
+                Some(out) => {
+                    keys::import_key(role, &out, &canonical, false)?;
+                    eprintln!("exported to {}", out.display());
+                }
+                None => {
+                    eprintln!("warning: printing SECRET key material to stdout");
+                    print!("{canonical}");
+                }
+            }
+        }
+        KeyCmd::Import { role, input, force } => {
+            let contents = match &input {
+                Some(path) => std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?,
+                None => {
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    buf
+                }
+            };
+            let path = keys::default_key_path(role)?;
+            keys::import_key(role, &path, &contents, force)?;
+            eprintln!(
+                "imported {} to {} ({})",
+                role.filename(),
+                path.display(),
+                keys::public_identifier(role, &path)?
+            );
+        }
+    }
+    Ok(())
+}
+
 fn parse_perms(s: &str) -> Result<u8> {
     if s == "none" {
         return Ok(0);
@@ -195,13 +344,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::KeygenEndpoint { out } => {
-            let id = keys::generate_endpoint_key(&out)?;
-            println!("{id}");
+            let secret = keys::generate_endpoint_key(&out)?;
+            println!("{}", secret.public());
         }
         Cmd::KeygenAge { out } => {
-            let recipient = keys::generate_age_identity(&out)?;
-            println!("{recipient}");
+            let identity = keys::generate_age_identity(&out)?;
+            println!("{}", identity.to_public());
         }
+        Cmd::Key { cmd } => run_key_cmd(cmd)?,
         Cmd::Init {
             db,
             operational_key,
@@ -209,7 +359,7 @@ async fn main() -> Result<()> {
             admin_id,
             admin_name,
         } => {
-            let op = keys::load_age_identity(&operational_key)?;
+            let op = resolve_operational_key(operational_key)?;
             let backup = keys::parse_age_recipient(&backup_pubkey)?;
             let admin: EndpointId = admin_id.parse().context("parsing --admin-id")?;
             let mut store = Store::open(&db)?;
@@ -228,8 +378,8 @@ async fn main() -> Result<()> {
             no_relay,
             no_mdns,
         } => {
-            let secret = keys::load_endpoint_key(&endpoint_key)?;
-            let op = keys::load_age_identity(&operational_key)?;
+            let secret = resolve_endpoint_key(endpoint_key, KeyRole::Server)?;
+            let op = resolve_operational_key(operational_key)?;
             let store = Store::open(&db)?;
             let bunker = Bunker::new(store, op)?;
             // N0 presets publish to n0 pkarr/DNS and (unless --no-relay)
@@ -309,7 +459,7 @@ async fn main() -> Result<()> {
             server_addr,
             cmd,
         } => {
-            let secret = keys::load_endpoint_key(&key)?;
+            let secret = resolve_endpoint_key(key, KeyRole::Client)?;
             let server_id: EndpointId = server.parse().context("parsing --server")?;
             let addr = if server_addr.is_empty() {
                 EndpointAddr::new(server_id)
