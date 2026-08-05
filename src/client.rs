@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 
 use crate::proto::{self, Request, Response};
 
@@ -12,11 +13,13 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect using the n0 preset (relays + address lookup), so a bare
-    /// EndpointId is enough when the server is reachable via discovery.
+    /// Connect using the n0 preset (relays + DNS/pkarr lookup, so a bare
+    /// EndpointId works across NATs) plus mDNS lookup (resolve-only) for
+    /// bunkers on the local network with no internet at all.
     pub async fn connect(secret: SecretKey, addr: impl Into<EndpointAddr>) -> Result<Self> {
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret)
+            .address_lookup(MdnsAddressLookup::builder().advertise(false))
             .bind()
             .await
             .context("binding client endpoint")?;

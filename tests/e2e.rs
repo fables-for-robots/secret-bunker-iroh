@@ -438,3 +438,54 @@ async fn recovery_rewraps_deks() {
     admin.close().await;
     router.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn mdns_discovery_connects_by_bare_endpoint_id() {
+    // Server and client know nothing about each other except the server's
+    // EndpointId: no relays, no DNS discovery, no address hints. mDNS
+    // (swarm-discovery) on the local network must resolve it.
+    // Requires a multicast-capable network interface.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bunker.sqlite");
+
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+
+    let store = init_store(&db, &op, &backup, &admin_secret.public());
+    let bunker = Bunker::new(store, op).unwrap();
+
+    let server = Endpoint::builder(presets::Minimal)
+        .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder())
+        .bind()
+        .await
+        .unwrap();
+    let server_id = server.id();
+    let router = Router::builder(server).accept(ALPN, bunker).spawn();
+
+    let client_ep = Endpoint::builder(presets::Minimal)
+        .secret_key(admin_secret)
+        .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder().advertise(false))
+        .bind()
+        .await
+        .unwrap();
+
+    // Bare EndpointId: the only way to find the server is mDNS resolution.
+    let admin = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        Client::with_endpoint(client_ep, server_id),
+    )
+    .await
+    .expect("mDNS resolution timed out")
+    .unwrap();
+
+    assert_eq!(
+        admin
+            .request(&Request::CreateGroup { name: "lan".into() })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    admin.close().await;
+    router.shutdown().await.unwrap();
+}

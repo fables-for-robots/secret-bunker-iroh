@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 
 use secret_bunker_iroh::client::Client;
 use secret_bunker_iroh::proto::{Request, Response};
@@ -68,6 +69,9 @@ enum Cmd {
         /// Disable relays (direct connections only).
         #[arg(long)]
         no_relay: bool,
+        /// Do not advertise or resolve on the local network via mDNS.
+        #[arg(long)]
+        no_mdns: bool,
     },
     /// Disaster recovery: re-wrap all group DEKs from the offline backup
     /// key to a new operational public key. Run offline, service stopped.
@@ -222,20 +226,29 @@ async fn main() -> Result<()> {
             endpoint_key,
             operational_key,
             no_relay,
+            no_mdns,
         } => {
             let secret = keys::load_endpoint_key(&endpoint_key)?;
             let op = keys::load_age_identity(&operational_key)?;
             let store = Store::open(&db)?;
             let bunker = Bunker::new(store, op)?;
-            let endpoint = if no_relay {
+            // N0 presets publish to n0 pkarr/DNS and (unless --no-relay)
+            // configure relays; hole punching is on by default, so clients
+            // behind NATs can dial the bare EndpointId. mDNS additionally
+            // announces on the local network for internet-free operation.
+            let mut builder = if no_relay {
                 Endpoint::builder(presets::N0DisableRelay)
             } else {
                 Endpoint::builder(presets::N0)
             }
-            .secret_key(secret)
-            .bind()
-            .await
-            .map_err(|e| anyhow::anyhow!("binding endpoint: {e}"))?;
+            .secret_key(secret);
+            if !no_mdns {
+                builder = builder.address_lookup(MdnsAddressLookup::builder());
+            }
+            let endpoint = builder
+                .bind()
+                .await
+                .map_err(|e| anyhow::anyhow!("binding endpoint: {e}"))?;
             eprintln!("bunker endpoint id: {}", endpoint.id());
             for addr in endpoint.bound_sockets() {
                 eprintln!("bound: {addr}");
@@ -243,6 +256,21 @@ async fn main() -> Result<()> {
             let router = Router::builder(endpoint)
                 .accept(secret_bunker_iroh::proto::ALPN, bunker)
                 .spawn();
+            if !no_relay {
+                // Wait until at least one relay handshake completes, so the
+                // printed EndpointId is actually dialable through NATs.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    router.endpoint().online(),
+                )
+                .await
+                {
+                    Ok(()) => eprintln!("online: reachable via relay"),
+                    Err(_) => {
+                        eprintln!("warning: no relay confirmed within 15s; continuing anyway")
+                    }
+                }
+            }
             tokio::signal::ctrl_c().await?;
             eprintln!("shutting down");
             router

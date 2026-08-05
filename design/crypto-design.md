@@ -87,6 +87,17 @@ what authenticates the server — there is no CA, hostname, or certificate to
 configure. Rotating this key changes the bunker's identity and requires all
 clients to re-pin (see Key Lifecycle).
 
+How clients *find* the addresses behind an EndpointId is a liveness
+concern, not a security one — every path ends in the same mutually
+authenticated handshake. The bunker announces itself three ways: its relay
+URL is published to n0's DNS/pkarr discovery (dialable from anywhere, with
+QUIC hole punching upgrading to a direct path when possible), it advertises
+over mDNS on the local network (dialable with no internet at all), and
+operators can hand out static socket addresses out of band. A wrong or
+malicious discovery record can at worst deny service; it cannot redirect a
+client to an impostor, because the EndpointId being dialed is the key that
+must complete the handshake.
+
 ### Operational encryption identity
 
 A long-lived X25519 keypair in native age format, distinct from the server
@@ -370,7 +381,9 @@ The following are explicitly not provided:
 - **Metadata privacy against infrastructure.** Relays and discovery
   services learn EndpointIds, connection timing, and traffic volume — not
   content. Anyone who learns the bunker's EndpointId can also confirm that
-  an endpoint with that id is online.
+  an endpoint with that id is online. With mDNS enabled (the default),
+  anyone on the same network segment sees the bunker's EndpointId and
+  addresses announced; run with `--no-mdns` where that matters.
 - **Audit-log integrity beyond append-only hash chaining.** A privileged
   operator can rewrite history if the log lives in the same SQLite file as
   the data. Ship the log to an external sink where this matters.

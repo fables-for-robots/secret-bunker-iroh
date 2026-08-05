@@ -88,6 +88,29 @@ Writes are compare-and-set: `put` takes `--expected-version` (0 = create;
 otherwise the current version), and a mismatch fails with the current
 version instead of clobbering a concurrent write.
 
+## Connectivity: NATs and local networks
+
+A client needs only the bunker's EndpointId; how the connection happens
+depends on where the two ends are:
+
+- **Across the internet / behind NATs** (default): the bunker registers
+  with n0 relays and publishes its relay URL to n0 discovery; `serve`
+  prints `online: reachable via relay` once that's confirmed. Clients
+  resolve the EndpointId, connect via the relay, and QUIC hole punching
+  upgrades to a direct path when the NATs allow it. Neither side needs a
+  public IP or port forwarding.
+- **Same local network, no internet**: both sides speak mDNS
+  (advertised by `serve`, resolved by `client`), so a bare EndpointId works
+  offline too — combine with `--no-relay` for fully air-gapped LANs.
+  Disable the announcement with `--no-mdns` if you don't want the bunker
+  visible to the local segment.
+- **Static addressing**: pass `--server-addr ip:port` to the client to skip
+  discovery entirely.
+
+Every path ends in the same mutually authenticated handshake against the
+EndpointId being dialed, so discovery can only affect reachability, never
+identity.
+
 ## Disaster recovery
 
 If the operational key is compromised or lost, take the service down and
