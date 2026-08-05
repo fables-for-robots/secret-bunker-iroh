@@ -94,15 +94,21 @@ enum Cmd {
         #[arg(long)]
         new_operational_pubkey: String,
     },
+    /// Manage server aliases stored in the XDG data dir.
+    Server {
+        #[command(subcommand)]
+        cmd: ServerCmd,
+    },
     /// Interactive terminal UI (role-aware: user, group admin, service admin).
     Tui {
         /// This client's iroh endpoint secret key file. Defaults to the
         /// XDG data dir, auto-generating there when missing.
         #[arg(long)]
         key: Option<PathBuf>,
-        /// The bunker's EndpointId (hex).
+        /// The bunker's EndpointId (hex) or a server alias. Defaults to
+        /// the "default" alias.
         #[arg(long)]
-        server: String,
+        server: Option<String>,
         /// Direct socket address(es) of the bunker; when omitted, n0
         /// discovery resolves the EndpointId.
         #[arg(long)]
@@ -114,9 +120,10 @@ enum Cmd {
         /// XDG data dir, auto-generating there when missing.
         #[arg(long)]
         key: Option<PathBuf>,
-        /// The bunker's EndpointId (hex).
+        /// The bunker's EndpointId (hex) or a server alias. Defaults to
+        /// the "default" alias.
         #[arg(long)]
-        server: String,
+        server: Option<String>,
         /// Direct socket address(es) of the bunker; when omitted, n0
         /// discovery resolves the EndpointId.
         #[arg(long)]
@@ -124,6 +131,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ClientCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum ServerCmd {
+    /// Map an alias to a bunker EndpointId. The alias "default" is used
+    /// whenever --server is omitted.
+    Add {
+        name: String,
+        /// The bunker's EndpointId (hex).
+        id: String,
+        /// Replace the alias if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove an alias.
+    Rm { name: String },
+    /// List aliases.
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -474,6 +499,25 @@ async fn main() -> Result<()> {
             store.meta_set("operational_pubkey", &new_op.to_string())?;
             println!("re-wrapped {rewrapped} DEK(s) to {new_op}");
         }
+        Cmd::Server { cmd } => match cmd {
+            ServerCmd::Add { name, id, force } => {
+                let id: EndpointId = id.parse().context("parsing endpoint id")?;
+                secret_bunker_iroh::servers::add(&name, id, force)?;
+                println!("{name} -> {id}");
+            }
+            ServerCmd::Rm { name } => {
+                anyhow::ensure!(
+                    secret_bunker_iroh::servers::remove(&name)?,
+                    "no alias named '{name}'"
+                );
+                println!("removed {name}");
+            }
+            ServerCmd::Ls => {
+                for (name, id) in secret_bunker_iroh::servers::list()? {
+                    println!("{name}\t{id}");
+                }
+            }
+        },
         Cmd::Tui {
             key,
             server,
@@ -486,7 +530,7 @@ async fn main() -> Result<()> {
             );
             let secret = resolve_endpoint_key(key, KeyRole::Client)?;
             let my_id = secret.public().to_string();
-            let server_id: EndpointId = server.parse().context("parsing --server")?;
+            let server_id = secret_bunker_iroh::servers::resolve(server.as_deref())?;
             let addr = if server_addr.is_empty() {
                 EndpointAddr::new(server_id)
             } else {
@@ -506,7 +550,7 @@ async fn main() -> Result<()> {
             cmd,
         } => {
             let secret = resolve_endpoint_key(key, KeyRole::Client)?;
-            let server_id: EndpointId = server.parse().context("parsing --server")?;
+            let server_id = secret_bunker_iroh::servers::resolve(server.as_deref())?;
             let addr = if server_addr.is_empty() {
                 EndpointAddr::new(server_id)
             } else {

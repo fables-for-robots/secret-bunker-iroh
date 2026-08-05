@@ -156,14 +156,22 @@ fn cli_user_permission_lifecycle() {
     );
     let (_server_guard, port) = spawn_server(&server, &db, &root.join("serve.log"));
 
+    // Server aliases: both actors store the bunker under the "default"
+    // alias in their own XDG dir, so no invocation below needs --server.
+    // The user also registers a named alias, exercised at the end.
+    assert_eq!(
+        admin.expect_ok(&["server", "add", "default", &server_id], None),
+        format!("default -> {server_id}")
+    );
+    user.expect_ok(&["server", "add", "default", &server_id], None);
+    user.expect_ok(&["server", "add", "bunker", &server_id], None);
+    assert!(
+        user.expect_ok(&["server", "ls"], None)
+            .contains(&format!("bunker\t{server_id}"))
+    );
+
     let server_addr = format!("127.0.0.1:{port}");
-    let base = [
-        "client",
-        "--server",
-        &server_id,
-        "--server-addr",
-        &server_addr,
-    ];
+    let base = ["client", "--server-addr", &server_addr];
     let cmd =
         |rest: &[&str]| -> Vec<String> { base.iter().chain(rest).map(|s| s.to_string()).collect() };
 
@@ -371,4 +379,26 @@ fn cli_user_permission_lifecycle() {
             "2",
         ]),
     );
+
+    // --server still accepts a named alias and a raw EndpointId.
+    for server_arg in ["bunker", server_id.as_str()] {
+        assert_eq!(
+            user.expect_ok(
+                &[
+                    "client",
+                    "--server",
+                    server_arg,
+                    "--server-addr",
+                    &server_addr,
+                    "get",
+                    "--group",
+                    "team",
+                    "--name",
+                    "api-key",
+                ],
+                None,
+            ),
+            "secret-v2"
+        );
+    }
 }

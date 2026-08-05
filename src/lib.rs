@@ -3,5 +3,6 @@ pub mod crypto;
 pub mod keys;
 pub mod proto;
 pub mod server;
+pub mod servers;
 pub mod store;
 pub mod tui;

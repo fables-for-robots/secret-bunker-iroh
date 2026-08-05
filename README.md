@@ -63,11 +63,14 @@ secret-bunker-iroh init \
 secret-bunker-iroh serve --db bunker.sqlite      # prints the bunker's EndpointId
 ```
 
-Use it. With the default n0 relays and discovery, the bunker's EndpointId is
-all a client needs; add `--server-addr ip:port` to dial directly:
+Use it. With the default n0 relays and discovery, the bunker's EndpointId
+is all a client needs; add `--server-addr ip:port` to dial directly. Save
+the id under the `default` alias once and `--server` becomes optional
+everywhere:
 
 ```sh
-alias bunker='secret-bunker-iroh client --server <bunker EndpointId>'
+secret-bunker-iroh server add default <bunker EndpointId>
+alias bunker='secret-bunker-iroh client'
 
 bunker create-group prod
 echo -n "hunter2" | bunker put --group prod --name db-password
@@ -82,6 +85,9 @@ bunker rotate-dek --group prod
 bunker list-identities
 ```
 
+`server add <name> <id>` also stores named aliases (`server ls`, `server
+rm`), and every `--server` flag accepts an alias or a raw EndpointId.
+
 Writes are compare-and-set: `put` takes `--expected-version` (0 = create;
 otherwise the current version), and a mismatch fails with the current
 version instead of clobbering a concurrent write.
@@ -91,7 +97,7 @@ version instead of clobbering a concurrent write.
 `tui` opens an interactive, role-aware view of the bunker:
 
 ```sh
-secret-bunker-iroh tui --server <bunker EndpointId>   # --server-addr ip:port to dial directly
+secret-bunker-iroh tui   # uses the "default" alias; --server <id-or-alias> to override
 ```
 
 Everyone gets the two-pane browser — groups on the left (with your
