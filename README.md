@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.png" alt="secret-bunker logo: a bunker vault door with a glowing padlock — P2P secrets manager built on iroh" width="360">
+</p>
+
 # secret-bunker-iroh
 
 A small secrets service ("bunker") that stores secrets encrypted at rest and
