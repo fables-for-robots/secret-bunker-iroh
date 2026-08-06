@@ -169,6 +169,9 @@ enum ClientCmd {
         group: String,
         #[arg(long)]
         name: String,
+        /// Do not report the secret's version on stderr.
+        #[arg(long, short)]
+        quiet: bool,
     },
     /// Create (expected-version 0) or update a secret.
     Put {
@@ -681,8 +684,9 @@ async fn main() -> Result<()> {
                 EndpointAddr::from_parts(server_id, server_addr.into_iter().map(TransportAddr::Ip))
             };
             let client = Client::connect(secret, addr).await?;
+            let quiet = matches!(&cmd, ClientCmd::Get { quiet: true, .. });
             let req = match &cmd {
-                ClientCmd::Get { group, name } => Request::Get {
+                ClientCmd::Get { group, name, .. } => Request::Get {
                     group: group.clone(),
                     name: name.clone(),
                 },
@@ -763,7 +767,9 @@ async fn main() -> Result<()> {
             client.close().await;
             match response {
                 Response::Secret { mut value, version } => {
-                    eprintln!("version {version}");
+                    if !quiet {
+                        eprintln!("version {version}");
+                    }
                     std::io::stdout().write_all(&value)?;
                     value.zeroize();
                 }

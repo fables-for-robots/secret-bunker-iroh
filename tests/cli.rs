@@ -354,6 +354,29 @@ fn cli_user_permission_lifecycle() {
         user.expect_ok(&cmd(&["get", "--group", "team", "--name", "api-key"]), None),
         "secret-v2"
     );
+    // Plain get reports the version on stderr; --quiet suppresses it.
+    let out = user.run(&cmd(&["get", "--group", "team", "--name", "api-key"]), None);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("version 2"),
+        "get must report the version on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = user.run(
+        &cmd(&["get", "--quiet", "--group", "team", "--name", "api-key"]),
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "get --quiet failed (status {:?}): {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "secret-v2");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("version"),
+        "get --quiet must not report the version: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(
         user.expect_ok(&cmd(&["ls", "--group", "team"]), None),
         "api-key\tv2"
