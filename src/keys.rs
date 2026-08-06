@@ -27,6 +27,8 @@ pub enum KeyRole {
     Server,
     /// Age identity that wraps/unwraps group DEKs.
     Operational,
+    /// Age identity for disaster recovery; keep its secret half offline.
+    Backup,
 }
 
 impl KeyRole {
@@ -35,11 +37,12 @@ impl KeyRole {
             KeyRole::Client => "client.key",
             KeyRole::Server => "server.key",
             KeyRole::Operational => "operational.age",
+            KeyRole::Backup => "backup.age",
         }
     }
 
     pub fn is_age(self) -> bool {
-        matches!(self, KeyRole::Operational)
+        matches!(self, KeyRole::Operational | KeyRole::Backup)
     }
 }
 

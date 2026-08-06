@@ -517,3 +517,53 @@ fn cli_db_rescue_and_audit_verify() {
         "version 1"
     );
 }
+
+#[test]
+fn cli_init_autogenerates_backup_and_admin_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let db = root.join("bunker.sqlite");
+
+    // One actor plays operator and admin: bare init, no key flags at all.
+    let op = Actor::new(root, "xdg-op");
+    let out = op.run(&["init", "--db", db.to_str().unwrap()], None);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "bare init failed (status {:?}): {stderr}",
+        out.status.code()
+    );
+
+    // The backup identity was generated and its recipient announced.
+    assert!(
+        stderr.contains("age1"),
+        "no backup recipient in init output: {stderr}"
+    );
+    let show = op.expect_ok(&["key", "show"], None);
+    assert!(
+        show.contains("backup.age") && show.contains("age1"),
+        "key show does not list the backup key: {show}"
+    );
+
+    // The admin id defaulted to this actor's client key.
+    let client_id = op.expect_ok(&["key", "generate", "client"], None);
+    assert!(
+        stderr.contains(&client_id),
+        "init did not report client key {client_id} as admin: {stderr}"
+    );
+
+    // And that client really is the service admin: list-identities is
+    // admin-gated and must show it under the default name.
+    let server_id = op.expect_ok(&["key", "generate", "server"], None);
+    let (_guard, port) = spawn_server(&op, &db, &root.join("serve.log"));
+    op.expect_ok(&["server", "add", "default", &server_id], None);
+    let server_addr = format!("127.0.0.1:{port}");
+    let identities = op.expect_ok(
+        &["client", "--server-addr", &server_addr, "list-identities"],
+        None,
+    );
+    assert!(
+        identities.contains(&client_id) && identities.contains("admin"),
+        "unexpected identities: {identities}"
+    );
+}

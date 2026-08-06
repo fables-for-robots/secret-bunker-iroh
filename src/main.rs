@@ -56,11 +56,14 @@ enum Cmd {
         #[arg(long)]
         operational_key: Option<PathBuf>,
         /// Backup age public key (`age1...`); private half stays offline.
+        /// When omitted, a backup identity is generated in the XDG data
+        /// dir — export it and move it offline.
         #[arg(long)]
-        backup_pubkey: String,
-        /// EndpointId (hex) of the first service admin.
+        backup_pubkey: Option<String>,
+        /// EndpointId (hex) of the first service admin. Defaults to this
+        /// machine's client key, auto-generating it when missing.
         #[arg(long)]
-        admin_id: String,
+        admin_id: Option<String>,
         #[arg(long, default_value = "admin")]
         admin_name: String,
     },
@@ -328,14 +331,19 @@ fn resolve_operational_key(explicit: Option<PathBuf>) -> Result<age::x25519::Ide
 fn run_key_cmd(cmd: KeyCmd) -> Result<()> {
     match cmd {
         KeyCmd::Show => {
-            for role in [KeyRole::Client, KeyRole::Server, KeyRole::Operational] {
+            for role in [
+                KeyRole::Client,
+                KeyRole::Server,
+                KeyRole::Operational,
+                KeyRole::Backup,
+            ] {
                 let path = keys::default_key_path(role)?;
                 let status = if path.exists() {
                     keys::public_identifier(role, &path)?
                 } else {
                     "(not generated yet)".into()
                 };
-                println!("{:<12} {}  {}", role.filename(), path.display(), status);
+                println!("{:<16} {}  {}", role.filename(), path.display(), status);
             }
         }
         KeyCmd::Generate { role } => {
@@ -437,8 +445,42 @@ async fn main() -> Result<()> {
             admin_name,
         } => {
             let op = resolve_operational_key(operational_key)?;
-            let backup = keys::parse_age_recipient(&backup_pubkey)?;
-            let admin: EndpointId = admin_id.parse().context("parsing --admin-id")?;
+            let backup = match backup_pubkey {
+                Some(s) => keys::parse_age_recipient(&s)?,
+                None => {
+                    let path = keys::default_key_path(KeyRole::Backup)?;
+                    let (identity, generated) = keys::load_or_generate_age_identity(&path)?;
+                    let recipient = identity.to_public();
+                    if generated {
+                        eprintln!(
+                            "generated new backup key at {} (recipient: {})",
+                            path.display(),
+                            recipient
+                        );
+                        eprintln!(
+                            "IMPORTANT: the backup key is your disaster-recovery key. Move it \
+                             OFFLINE: `key export backup --out <file>`, store the file safely, \
+                             then delete {} from this machine.",
+                            path.display()
+                        );
+                    } else {
+                        eprintln!(
+                            "using existing backup key at {} (recipient: {})",
+                            path.display(),
+                            recipient
+                        );
+                    }
+                    recipient
+                }
+            };
+            let admin: EndpointId = match admin_id {
+                Some(s) => s.parse().context("parsing --admin-id")?,
+                None => {
+                    let id = resolve_endpoint_key(None, KeyRole::Client)?.public();
+                    eprintln!("admin identity: {id} (this machine's client.key)");
+                    id
+                }
+            };
             let mut store = Store::open(&db)?;
             store.init(
                 &op.to_public().to_string(),

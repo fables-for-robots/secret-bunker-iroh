@@ -51,23 +51,31 @@ Private keys live under `$XDG_DATA_HOME/secret-bunker-iroh` (falling back
 to `~/.local/share/secret-bunker-iroh`) and are auto-generated on first
 use, so most commands need no key flags at all.
 
-On the admin's machine, create a client identity and note its EndpointId:
+Initialize the database (one-shot) and serve:
 
 ```sh
-secret-bunker-iroh key generate client
+secret-bunker-iroh init --db bunker.sqlite
+secret-bunker-iroh serve --db bunker.sqlite      # prints the bunker's EndpointId
 ```
 
-On the server, generate an offline backup key, initialize the database
-(one-shot), and serve — the endpoint and operational keys auto-generate:
+A bare `init` auto-generates everything: the operational key, a backup
+key (move it offline once set up: `key export backup --out <file>`, store
+the file safely, delete `backup.age`), and makes this machine's client
+key the first service admin.
+
+For production, keep the backup secret off the server and the admin on
+their own machine — generate each where it belongs and pass the public
+halves instead:
 
 ```sh
-secret-bunker-iroh keygen-age --out backup.age   # move this OFFLINE; note the age1... pubkey
+# on the admin's machine:                        # on an OFFLINE machine:
+secret-bunker-iroh key generate client           secret-bunker-iroh keygen-age --out backup.age
+
+# then on the server:
 secret-bunker-iroh init \
   --db bunker.sqlite \
   --backup-pubkey age1... \
   --admin-id <admin EndpointId>
-
-secret-bunker-iroh serve --db bunker.sqlite      # prints the bunker's EndpointId
 ```
 
 Use it. With the default n0 relays and discovery, the bunker's EndpointId
@@ -123,10 +131,12 @@ the UI holds no privileged state.
 
 ## Key management
 
-Three keys are managed in the XDG data directory: `client.key` (the
-`client` subcommand's identity), `server.key` (the bunker's identity), and
-`operational.age` (wraps the group DEKs). All are created mode 0600 in a
-0700 directory.
+Four keys are managed in the XDG data directory: `client.key` (the
+`client` subcommand's identity), `server.key` (the bunker's identity),
+`operational.age` (wraps the group DEKs), and `backup.age` (the
+disaster-recovery key, only present when a bare `init` generated it —
+export it and move it offline). All are created mode 0600 in a 0700
+directory.
 
 ```sh
 secret-bunker-iroh key show                        # paths + public identifiers
