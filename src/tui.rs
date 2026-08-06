@@ -26,6 +26,15 @@ use crate::proto::{GroupInfo, IdentityInfo, Request, Response, parse_perms, perm
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 
+/// Identities eligible for a new grant: all registered names minus those
+/// already on the group's ACL.
+fn grant_candidates(names: Vec<String>, acl: &[(String, u8)]) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|name| !acl.iter().any(|(member, _)| member == name))
+        .collect()
+}
+
 pub fn run(handle: Handle, client: Client, my_id: String) -> Result<()> {
     let mut terminal = ratatui::init();
     let result = App::new(handle, client, my_id).run(&mut terminal);
@@ -51,6 +60,9 @@ enum Mode {
     Confirm(ConfirmAction),
     Identities,
     Acl,
+    /// Pick an identity to grant on `acl_group` from the names not yet on
+    /// its ACL.
+    GrantPicker,
 }
 
 enum ConfirmAction {
@@ -102,6 +114,8 @@ struct App {
     acl: Vec<(String, u8)>,
     asel: usize,
     acl_group: String,
+    candidates: Vec<String>,
+    csel: usize,
     focus: Focus,
     mode: Mode,
     status: String,
@@ -124,6 +138,8 @@ impl App {
             acl: Vec::new(),
             asel: 0,
             acl_group: String::new(),
+            candidates: Vec::new(),
+            csel: 0,
             focus: Focus::Groups,
             mode: Mode::Normal,
             status: String::from("connected — press ? for help"),
@@ -232,6 +248,7 @@ impl App {
             Mode::Form(_) => self.on_key_form(key),
             Mode::Identities => self.on_key_identities(key),
             Mode::Acl => self.on_key_acl(key),
+            Mode::GrantPicker => self.on_key_grant_picker(key),
         }
     }
 
@@ -603,12 +620,57 @@ impl App {
                 self.refresh_acl();
                 self.refresh_groups();
             }
-            KeyCode::Char('n') => {
-                self.mode = Mode::Form(Form::new(
-                    FormKind::GrantEntry,
-                    &format!("grant on '{}'", self.acl_group),
-                    &[("identity", ""), ("perms (r/rw/rwa/none)", "r")],
-                ));
+            KeyCode::Char('n') => self.open_grant_picker(),
+            _ => {}
+        }
+    }
+
+    fn open_grant_picker(&mut self) {
+        match self.req(Request::ListIdentityNames {
+            group: self.acl_group.clone(),
+        }) {
+            Some(Response::IdentityNames(names)) => {
+                self.candidates = grant_candidates(names, &self.acl);
+                if self.candidates.is_empty() {
+                    self.status =
+                        format!("every identity already has a grant on '{}'", self.acl_group);
+                } else {
+                    self.csel = 0;
+                    self.mode = Mode::GrantPicker;
+                }
+            }
+            // Server predates ListIdentityNames (or denied it): fall back
+            // to typing the name.
+            Some(_) => self.open_grant_form(""),
+            None => {}
+        }
+    }
+
+    fn open_grant_form(&mut self, identity: &str) {
+        let mut form = Form::new(
+            FormKind::GrantEntry,
+            &format!("grant on '{}'", self.acl_group),
+            &[("identity", identity), ("perms (r/rw/rwa/none)", "r")],
+        );
+        if !identity.is_empty() {
+            form.focus = 1; // identity picked; jump straight to perms
+        }
+        self.mode = Mode::Form(form);
+    }
+
+    fn on_key_grant_picker(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Acl,
+            KeyCode::Down | KeyCode::Char('j') if !self.candidates.is_empty() => {
+                self.csel = (self.csel + 1) % self.candidates.len();
+            }
+            KeyCode::Up | KeyCode::Char('k') if !self.candidates.is_empty() => {
+                self.csel = (self.csel + self.candidates.len() - 1) % self.candidates.len();
+            }
+            KeyCode::Enter => {
+                if let Some(identity) = self.candidates.get(self.csel).cloned() {
+                    self.open_grant_form(&identity);
+                }
             }
             _ => {}
         }
@@ -663,6 +725,7 @@ impl App {
             Mode::Form(form) => self.draw_form(frame, form),
             Mode::Confirm(action) => self.draw_confirm(frame, action),
             Mode::Acl => self.draw_acl(frame),
+            Mode::GrantPicker => self.draw_grant_picker(frame),
             _ => {}
         }
     }
@@ -791,6 +854,7 @@ impl App {
             },
             Mode::Identities => "j/k move  n register  d remove  esc back",
             Mode::Acl => "j/k move  r/w/a toggle perm  x revoke  n add grant  esc back",
+            Mode::GrantPicker => "j/k move  enter pick identity  esc back",
             Mode::Form(_) => "enter next/submit  tab field  esc cancel",
             Mode::Confirm(_) => "y confirm  n cancel",
             Mode::Help | Mode::ViewSecret { .. } => "esc close",
@@ -832,7 +896,7 @@ impl App {
             Line::from("I identities (service admin): n register, d remove"),
             Line::from(""),
             Line::from("acl view: r/w/a toggle permission bits, x revoke,"),
-            Line::from("          n grant to an identity by name"),
+            Line::from("          n grant — pick an identity from the list"),
             Line::from(""),
             Line::from("Permissions: r read, w write (add/update/delete), a admin."),
             Line::from("The server enforces everything; 'denied' means the bunker"),
@@ -913,5 +977,38 @@ impl App {
             inner,
             &mut state,
         );
+    }
+
+    fn draw_grant_picker(&self, frame: &mut Frame) {
+        let inner = self.popup(
+            frame,
+            48,
+            (self.candidates.len() as u16 + 3).max(5),
+            &format!("grant on '{}': pick identity", self.acl_group),
+        );
+        let items: Vec<ListItem> = self
+            .candidates
+            .iter()
+            .map(|name| ListItem::new(Line::from(name.as_str())))
+            .collect();
+        let mut state = ListState::default();
+        state.select((!self.candidates.is_empty()).then_some(self.csel));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::new().bg(ACCENT).fg(Color::Black)),
+            inner,
+            &mut state,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grant_candidates;
+
+    #[test]
+    fn grant_candidates_excludes_existing_acl_members() {
+        let names = vec!["admin".to_string(), "bob".to_string(), "carol".to_string()];
+        let acl = vec![("admin".to_string(), 7u8), ("carol".to_string(), 1)];
+        assert_eq!(grant_candidates(names, &acl), vec!["bob".to_string()]);
     }
 }

@@ -69,6 +69,12 @@ pub enum Request {
     GroupAcl {
         group: String,
     },
+    /// The names of all registered identities, so a group admin can pick
+    /// grant targets; requires `admin` on `group`. Unlike ListIdentities
+    /// it exposes neither endpoint ids nor service-admin flags.
+    ListIdentityNames {
+        group: String,
+    },
 }
 
 impl Request {
@@ -87,6 +93,7 @@ impl Request {
             Request::RotateDek { .. } => "rotate-dek",
             Request::ListGroups => "list-groups",
             Request::GroupAcl { .. } => "group-acl",
+            Request::ListIdentityNames { .. } => "list-identity-names",
         }
     }
 
@@ -98,7 +105,8 @@ impl Request {
             | Request::Delete { group, name, .. } => format!("{group}/{name}"),
             Request::List { group }
             | Request::RotateDek { group }
-            | Request::GroupAcl { group } => group.clone(),
+            | Request::GroupAcl { group }
+            | Request::ListIdentityNames { group } => group.clone(),
             Request::CreateGroup { name } => name.clone(),
             Request::AddIdentity { name, .. } | Request::RemoveIdentity { name } => name.clone(),
             Request::ListIdentities | Request::ListGroups => String::new(),
@@ -138,6 +146,8 @@ pub enum Response {
     },
     /// Reply to GroupAcl: (identity name, permission bitmask) pairs.
     Acl(Vec<(String, u8)>),
+    /// Reply to ListIdentityNames.
+    IdentityNames(Vec<String>),
     /// Operation failed after authorization succeeded. Never sent to
     /// unauthorized callers (they get `Denied`), so the reason may be
     /// informative.
@@ -235,6 +245,14 @@ mod tests {
                 })
                 .unwrap(),
                 "a1654772616e74a36567726f75706167686964656e74697479626964657065726d7307",
+            ),
+            (
+                encode(&Request::ListIdentityNames { group: "g".into() }).unwrap(),
+                "a1714c6973744964656e746974794e616d6573a16567726f75706167",
+            ),
+            (
+                encode(&Response::IdentityNames(vec!["a".into()])).unwrap(),
+                "a16d4964656e746974794e616d6573816161",
             ),
             (encode(&Response::Denied).unwrap(), "6644656e696564"),
             (

@@ -148,6 +148,7 @@ impl Bunker {
             Request::RotateDek { group } => Self::rotate_dek(inner, store, &ident, group),
             Request::ListGroups => Self::list_groups(store, &ident),
             Request::GroupAcl { group } => Self::group_acl(store, &ident, group),
+            Request::ListIdentityNames { group } => Self::list_identity_names(store, &ident, group),
         }
     }
 
@@ -177,6 +178,18 @@ impl Bunker {
         };
         match store.group_acl_entries(group_id) {
             Ok(entries) => Response::Acl(entries),
+            Err(_) => Response::Failed {
+                reason: "internal error".into(),
+            },
+        }
+    }
+
+    fn list_identity_names(store: &Store, ident: &Identity, group: &str) -> Response {
+        if Self::authorize_group(store, ident, group, PERM_ADMIN).is_none() {
+            return Response::Denied;
+        }
+        match store.list_identities() {
+            Ok(ids) => Response::IdentityNames(ids.into_iter().map(|i| i.name).collect()),
             Err(_) => Response::Failed {
                 reason: "internal error".into(),
             },
@@ -684,6 +697,70 @@ mod tests {
                 }
             ),
             Response::Ok
+        );
+    }
+
+    #[test]
+    fn group_admins_can_list_identity_names_without_service_admin() {
+        let (bunker, admin) = test_bunker();
+        let bob = iroh::SecretKey::generate().public().to_string();
+        let carol = iroh::SecretKey::generate().public().to_string();
+        for (name, endpoint_id) in [("bob", &bob), ("carol", &carol)] {
+            assert_eq!(
+                bunker.handle(
+                    &admin,
+                    &Request::AddIdentity {
+                        name: name.into(),
+                        endpoint_id: endpoint_id.clone(),
+                        service_admin: false,
+                    }
+                ),
+                Response::Ok
+            );
+        }
+        assert_eq!(
+            bunker.handle(&admin, &Request::CreateGroup { name: "g".into() }),
+            Response::Ok
+        );
+        for (identity, perms) in [
+            ("bob", PERM_READ | PERM_WRITE | PERM_ADMIN),
+            ("carol", PERM_READ),
+        ] {
+            assert_eq!(
+                bunker.handle(
+                    &admin,
+                    &Request::Grant {
+                        group: "g".into(),
+                        identity: identity.into(),
+                        perms,
+                    }
+                ),
+                Response::Ok
+            );
+        }
+        // The full identity listing stays service-admin only...
+        assert_eq!(
+            bunker.handle(&bob, &Request::ListIdentities),
+            Response::Denied
+        );
+        // ...but a group admin can list candidate names for granting.
+        assert_eq!(
+            bunker.handle(&bob, &Request::ListIdentityNames { group: "g".into() }),
+            Response::IdentityNames(vec!["admin".into(), "bob".into(), "carol".into()])
+        );
+        // Non-admin members and unknown groups are denied.
+        assert_eq!(
+            bunker.handle(&carol, &Request::ListIdentityNames { group: "g".into() }),
+            Response::Denied
+        );
+        assert_eq!(
+            bunker.handle(
+                &bob,
+                &Request::ListIdentityNames {
+                    group: "nope".into()
+                }
+            ),
+            Response::Denied
         );
     }
 

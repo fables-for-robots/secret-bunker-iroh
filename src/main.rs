@@ -784,6 +784,11 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+                Response::IdentityNames(names) => {
+                    for name in names {
+                        println!("{name}");
+                    }
+                }
                 Response::Identities(ids) => {
                     for i in ids {
                         let admin = if i.service_admin {

@@ -121,7 +121,8 @@ Everyone gets the two-pane browser — groups on the left (with your
 permission flags), secrets on the right — with popups to view (`enter`),
 create (`n`), edit (`e`), and delete (`d`) secrets. Group admins manage a
 group's ACL from `a` (toggle `r`/`w`/`a` bits per identity, `x` revokes,
-`n` grants to a new identity) and rotate its DEK with `R`. Service admins
+`n` picks an identity to grant from the list of registered names) and
+rotate its DEK with `R`. Service admins
 additionally create groups and manage registered identities (`I`). Press
 `?` for the full key reference.
 
