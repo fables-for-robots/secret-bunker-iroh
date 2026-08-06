@@ -31,6 +31,11 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
+    # audit-check reports its results as a check run, which needs an
+    # explicitly granted write scope on the default read-only token.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v5
 
