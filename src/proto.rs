@@ -75,6 +75,12 @@ pub enum Request {
     ListIdentityNames {
         group: String,
     },
+    /// Grant or revoke the service-admin flag on an identity. Requires
+    /// service admin; revoking the last service admin is refused.
+    SetServiceAdmin {
+        name: String,
+        service_admin: bool,
+    },
 }
 
 impl Request {
@@ -94,6 +100,7 @@ impl Request {
             Request::ListGroups => "list-groups",
             Request::GroupAcl { .. } => "group-acl",
             Request::ListIdentityNames { .. } => "list-identity-names",
+            Request::SetServiceAdmin { .. } => "set-service-admin",
         }
     }
 
@@ -108,7 +115,9 @@ impl Request {
             | Request::GroupAcl { group }
             | Request::ListIdentityNames { group } => group.clone(),
             Request::CreateGroup { name } => name.clone(),
-            Request::AddIdentity { name, .. } | Request::RemoveIdentity { name } => name.clone(),
+            Request::AddIdentity { name, .. }
+            | Request::RemoveIdentity { name }
+            | Request::SetServiceAdmin { name, .. } => name.clone(),
             Request::ListIdentities | Request::ListGroups => String::new(),
             Request::Grant {
                 group, identity, ..
@@ -249,6 +258,14 @@ mod tests {
             (
                 encode(&Request::ListIdentityNames { group: "g".into() }).unwrap(),
                 "a1714c6973744964656e746974794e616d6573a16567726f75706167",
+            ),
+            (
+                encode(&Request::SetServiceAdmin {
+                    name: "bob".into(),
+                    service_admin: false,
+                })
+                .unwrap(),
+                "a16f5365745365727669636541646d696ea2646e616d6563626f626d736572766963655f61646d696ef4",
             ),
             (
                 encode(&Response::IdentityNames(vec!["a".into()])).unwrap(),

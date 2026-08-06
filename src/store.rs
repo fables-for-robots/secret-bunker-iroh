@@ -247,6 +247,15 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Set or clear the service-admin flag; false when no such identity.
+    pub fn set_service_admin(&self, name: &str, service_admin: bool) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE identity SET service_admin = ?2 WHERE name = ?1",
+            params![name, service_admin as i64],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn list_identities(&self) -> Result<Vec<Identity>> {
         let mut stmt = self
             .conn
@@ -711,6 +720,17 @@ mod tests {
         )
         .unwrap();
         s.group_id(name).unwrap().unwrap()
+    }
+
+    #[test]
+    fn set_service_admin_flips_the_flag() {
+        let s = store();
+        s.add_identity("bob", "endpoint-bob", false).unwrap();
+        assert!(s.set_service_admin("bob", true).unwrap());
+        assert!(s.identity_by_name("bob").unwrap().unwrap().service_admin);
+        assert!(s.set_service_admin("bob", false).unwrap());
+        assert!(!s.identity_by_name("bob").unwrap().unwrap().service_admin);
+        assert!(!s.set_service_admin("nope", true).unwrap());
     }
 
     #[test]

@@ -98,6 +98,11 @@ bunker grant --group prod --identity ci --perms r
 # maintenance
 bunker rotate-dek --group prod
 bunker list-identities
+
+# service admins hold implicit read|write|admin on every group;
+# revoking the flag drops that access to all secrets immediately
+bunker set-service-admin --identity ci --admin true
+bunker set-service-admin --identity ci --admin false
 ```
 
 `server add <name> <id>` also stores named aliases (`server ls`, `server
@@ -122,9 +127,10 @@ permission flags), secrets on the right — with popups to view (`enter`),
 create (`n`), edit (`e`), and delete (`d`) secrets. Group admins manage a
 group's ACL from `a` (toggle `r`/`w`/`a` bits per identity, `x` revokes,
 `n` picks an identity to grant from the list of registered names) and
-rotate its DEK with `R`. Service admins
-additionally create groups and manage registered identities (`I`). Press
-`?` for the full key reference.
+rotate its DEK with `R`. Service admins — who implicitly hold full
+access to every group — additionally create groups and manage registered
+identities (`I`: `n` register, `s` grant/revoke service admin, `d`
+remove). Press `?` for the full key reference.
 
 The TUI is only a lens on the protocol: every action is a normal request,
 authorized server-side, and a "denied" status means the bunker refused —

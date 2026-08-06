@@ -217,6 +217,15 @@ enum ClientCmd {
     RemoveIdentity {
         name: String,
     },
+    /// Grant or revoke the service-admin flag (with it, full access to
+    /// every group's secrets) on an identity.
+    SetServiceAdmin {
+        #[arg(long)]
+        identity: String,
+        /// "true" grants, "false" revokes.
+        #[arg(long, action = clap::ArgAction::Set)]
+        admin: bool,
+    },
     ListIdentities,
     /// Set permissions ("r", "rw", "rwa", or "none") for an identity on a group.
     Grant {
@@ -732,6 +741,10 @@ async fn main() -> Result<()> {
                 ClientCmd::RemoveIdentity { name } => {
                     Request::RemoveIdentity { name: name.clone() }
                 }
+                ClientCmd::SetServiceAdmin { identity, admin } => Request::SetServiceAdmin {
+                    name: identity.clone(),
+                    service_admin: *admin,
+                },
                 ClientCmd::ListIdentities => Request::ListIdentities,
                 ClientCmd::Grant {
                     group,

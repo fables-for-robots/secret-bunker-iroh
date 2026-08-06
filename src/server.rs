@@ -149,6 +149,10 @@ impl Bunker {
             Request::ListGroups => Self::list_groups(store, &ident),
             Request::GroupAcl { group } => Self::group_acl(store, &ident, group),
             Request::ListIdentityNames { group } => Self::list_identity_names(store, &ident, group),
+            Request::SetServiceAdmin {
+                name,
+                service_admin,
+            } => Self::set_service_admin(store, &ident, name, *service_admin),
         }
     }
 
@@ -163,7 +167,16 @@ impl Bunker {
                 service_admin: ident.service_admin,
                 groups: groups
                     .into_iter()
-                    .map(|(name, perms)| crate::proto::GroupInfo { name, perms })
+                    .map(|(name, perms)| crate::proto::GroupInfo {
+                        name,
+                        // Report effective perms: service admins hold
+                        // every bit on every group.
+                        perms: if ident.service_admin {
+                            PERM_READ | PERM_WRITE | PERM_ADMIN
+                        } else {
+                            perms
+                        },
+                    })
                     .collect(),
             },
             Err(_) => Response::Failed {
@@ -197,8 +210,12 @@ impl Bunker {
     }
 
     /// Resolve a group and check that `ident` holds all bits in `needed`.
+    /// Service admins implicitly hold every bit on every group.
     fn authorize_group(store: &Store, ident: &Identity, group: &str, needed: u8) -> Option<i64> {
         let group_id = store.group_id(group).ok()??;
+        if ident.service_admin {
+            return Some(group_id);
+        }
         let perms = store.perms(ident.id, group_id).ok()?;
         (perms & needed == needed).then_some(group_id)
     }
@@ -464,6 +481,46 @@ impl Bunker {
                     })
                     .collect(),
             ),
+            Err(_) => Response::Failed {
+                reason: "internal error".into(),
+            },
+        }
+    }
+
+    fn set_service_admin(
+        store: &Store,
+        ident: &Identity,
+        name: &str,
+        service_admin: bool,
+    ) -> Response {
+        if !ident.service_admin {
+            return Response::Denied;
+        }
+        match store.identity_by_name(name) {
+            Ok(Some(target)) => {
+                // Same lockout guard as RemoveIdentity: a bunker without a
+                // service admin cannot be administered over the wire.
+                if target.service_admin && !service_admin {
+                    let admins = store
+                        .list_identities()
+                        .map(|ids| ids.iter().filter(|i| i.service_admin).count())
+                        .unwrap_or(0);
+                    if admins <= 1 {
+                        return Response::Failed {
+                            reason: "cannot revoke the last service admin".into(),
+                        };
+                    }
+                }
+                match store.set_service_admin(name, service_admin) {
+                    Ok(true) => Response::Ok,
+                    _ => Response::Failed {
+                        reason: "internal error".into(),
+                    },
+                }
+            }
+            Ok(None) => Response::Failed {
+                reason: format!("no identity named '{name}'"),
+            },
             Err(_) => Response::Failed {
                 reason: "internal error".into(),
             },
@@ -762,6 +819,214 @@ mod tests {
             ),
             Response::Denied
         );
+    }
+
+    #[test]
+    fn service_admins_implicitly_access_all_groups() {
+        let (bunker, admin) = test_bunker();
+        assert_eq!(
+            bunker.handle(&admin, &Request::CreateGroup { name: "g".into() }),
+            Response::Ok
+        );
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::Put {
+                    group: "g".into(),
+                    name: "s".into(),
+                    value: b"v".to_vec(),
+                    expected_version: 0,
+                }
+            ),
+            Response::Version { version: 1 }
+        );
+        // A second service admin with no explicit grant on "g" can still
+        // read its secrets and manage its ACL.
+        let root = iroh::SecretKey::generate().public().to_string();
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::AddIdentity {
+                    name: "root".into(),
+                    endpoint_id: root.clone(),
+                    service_admin: true,
+                }
+            ),
+            Response::Ok
+        );
+        assert_eq!(
+            bunker.handle(
+                &root,
+                &Request::Get {
+                    group: "g".into(),
+                    name: "s".into(),
+                }
+            ),
+            Response::Secret {
+                value: b"v".to_vec(),
+                version: 1,
+            }
+        );
+        assert!(matches!(
+            bunker.handle(&root, &Request::GroupAcl { group: "g".into() }),
+            Response::Acl(_)
+        ));
+        // ListGroups reports the effective (full) bitmask.
+        let Response::Groups { groups, .. } = bunker.handle(&root, &Request::ListGroups) else {
+            panic!("expected Groups");
+        };
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].perms, PERM_READ | PERM_WRITE | PERM_ADMIN);
+        // A nonexistent group is still a uniform denial, not an oracle.
+        assert_eq!(
+            bunker.handle(
+                &root,
+                &Request::Get {
+                    group: "nope".into(),
+                    name: "s".into(),
+                }
+            ),
+            Response::Denied
+        );
+    }
+
+    #[test]
+    fn revoking_service_admin_removes_implicit_access() {
+        let (bunker, admin) = test_bunker();
+        assert_eq!(
+            bunker.handle(&admin, &Request::CreateGroup { name: "g".into() }),
+            Response::Ok
+        );
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::Put {
+                    group: "g".into(),
+                    name: "s".into(),
+                    value: b"v".to_vec(),
+                    expected_version: 0,
+                }
+            ),
+            Response::Version { version: 1 }
+        );
+        let root = iroh::SecretKey::generate().public().to_string();
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::AddIdentity {
+                    name: "root".into(),
+                    endpoint_id: root.clone(),
+                    service_admin: true,
+                }
+            ),
+            Response::Ok
+        );
+        assert!(matches!(
+            bunker.handle(
+                &root,
+                &Request::Get {
+                    group: "g".into(),
+                    name: "s".into(),
+                }
+            ),
+            Response::Secret { .. }
+        ));
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::SetServiceAdmin {
+                    name: "root".into(),
+                    service_admin: false,
+                }
+            ),
+            Response::Ok
+        );
+        // The flag is gone: no secret access, no service operations.
+        assert_eq!(
+            bunker.handle(
+                &root,
+                &Request::Get {
+                    group: "g".into(),
+                    name: "s".into(),
+                }
+            ),
+            Response::Denied
+        );
+        assert_eq!(
+            bunker.handle(&root, &Request::ListIdentities),
+            Response::Denied
+        );
+        // And it can be granted back.
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::SetServiceAdmin {
+                    name: "root".into(),
+                    service_admin: true,
+                }
+            ),
+            Response::Ok
+        );
+        assert!(matches!(
+            bunker.handle(
+                &root,
+                &Request::Get {
+                    group: "g".into(),
+                    name: "s".into(),
+                }
+            ),
+            Response::Secret { .. }
+        ));
+    }
+
+    #[test]
+    fn set_service_admin_authorization_and_guards() {
+        let (bunker, admin) = test_bunker();
+        let bob = iroh::SecretKey::generate().public().to_string();
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::AddIdentity {
+                    name: "bob".into(),
+                    endpoint_id: bob.clone(),
+                    service_admin: false,
+                }
+            ),
+            Response::Ok
+        );
+        // Only service admins may toggle the flag.
+        assert_eq!(
+            bunker.handle(
+                &bob,
+                &Request::SetServiceAdmin {
+                    name: "bob".into(),
+                    service_admin: true,
+                }
+            ),
+            Response::Denied
+        );
+        // The last service admin cannot revoke itself.
+        assert!(matches!(
+            bunker.handle(
+                &admin,
+                &Request::SetServiceAdmin {
+                    name: "admin".into(),
+                    service_admin: false,
+                }
+            ),
+            Response::Failed { .. }
+        ));
+        // Unknown identities fail informatively (caller is authorized).
+        assert!(matches!(
+            bunker.handle(
+                &admin,
+                &Request::SetServiceAdmin {
+                    name: "nope".into(),
+                    service_admin: true,
+                }
+            ),
+            Response::Failed { .. }
+        ));
     }
 
     #[test]

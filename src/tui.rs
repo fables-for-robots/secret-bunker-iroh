@@ -69,6 +69,7 @@ enum ConfirmAction {
     DeleteSecret { name: String, version: u64 },
     RemoveIdentity { name: String },
     RotateDek { group: String },
+    SetServiceAdmin { name: String, service_admin: bool },
 }
 
 enum FormKind {
@@ -422,11 +423,27 @@ impl App {
                             }
                         }
                     }
+                    ConfirmAction::SetServiceAdmin {
+                        name,
+                        service_admin,
+                    } => {
+                        if let Some(response) = self.req(Request::SetServiceAdmin {
+                            name,
+                            service_admin,
+                        }) {
+                            self.show_response(&response);
+                        }
+                        self.refresh_identities();
+                        self.mode = Mode::Identities;
+                    }
                 }
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.mode = match self.mode {
-                    Mode::Confirm(ConfirmAction::RemoveIdentity { .. }) => Mode::Identities,
+                    Mode::Confirm(
+                        ConfirmAction::RemoveIdentity { .. }
+                        | ConfirmAction::SetServiceAdmin { .. },
+                    ) => Mode::Identities,
                     _ => Mode::Normal,
                 }
             }
@@ -587,6 +604,14 @@ impl App {
                     });
                 }
             }
+            KeyCode::Char('s') => {
+                if let Some(identity) = self.identities.get(self.isel) {
+                    self.mode = Mode::Confirm(ConfirmAction::SetServiceAdmin {
+                        name: identity.name.clone(),
+                        service_admin: !identity.service_admin,
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -706,7 +731,9 @@ impl App {
             || matches!(&self.mode, Mode::Form(f) if matches!(f.kind, FormKind::AddIdentity))
             || matches!(
                 self.mode,
-                Mode::Confirm(ConfirmAction::RemoveIdentity { .. })
+                Mode::Confirm(
+                    ConfirmAction::RemoveIdentity { .. } | ConfirmAction::SetServiceAdmin { .. }
+                )
             )
         {
             self.draw_identities(frame, body);
@@ -852,7 +879,7 @@ impl App {
                     "tab panes  j/k move  enter view  n new  e edit  d delete  r refresh  ? help  q quit"
                 }
             },
-            Mode::Identities => "j/k move  n register  d remove  esc back",
+            Mode::Identities => "j/k move  n register  s toggle service-admin  d remove  esc back",
             Mode::Acl => "j/k move  r/w/a toggle perm  x revoke  n add grant  esc back",
             Mode::GrantPicker => "j/k move  enter pick identity  esc back",
             Mode::Form(_) => "enter next/submit  tab field  esc cancel",
@@ -893,7 +920,8 @@ impl App {
         let text = vec![
             Line::from("groups pane:  n new group   a manage acl   R rotate dek"),
             Line::from("secrets pane: enter view    n new secret   e edit   d delete"),
-            Line::from("I identities (service admin): n register, d remove"),
+            Line::from("I identities (service admin): n register, d remove,"),
+            Line::from("  s grant/revoke service admin (all-secrets access)"),
             Line::from(""),
             Line::from("acl view: r/w/a toggle permission bits, x revoke,"),
             Line::from("          n grant — pick an identity from the list"),
@@ -945,6 +973,14 @@ impl App {
             ConfirmAction::RotateDek { group } => {
                 format!("Rotate the DEK of group '{group}'?")
             }
+            ConfirmAction::SetServiceAdmin {
+                name,
+                service_admin: true,
+            } => format!("Make '{name}' a service admin (full access to all secrets)?"),
+            ConfirmAction::SetServiceAdmin {
+                name,
+                service_admin: false,
+            } => format!("Revoke service admin from '{name}' (drops access to all secrets)?"),
         };
         let inner = self.popup(frame, message.len() as u16 + 6, 4, "confirm");
         frame.render_widget(

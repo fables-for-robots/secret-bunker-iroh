@@ -266,12 +266,18 @@ bitmask:
 
 Identities may be members of multiple groups with different permissions in
 each. Service-level operations (creating groups, registering and removing
-identities) require the **service-admin** flag on the caller's identity;
-the first service admin is established at bootstrap. The service-admin
-flag carries *no* per-group permissions. Creating a group grants the
-creator `read|write|admin` on it in the same database transaction that
-creates the group, so every group has a group admin from the moment it
-exists.
+identities, toggling the service-admin flag) require the
+**service-admin** flag on the caller's identity; the first service admin
+is established at bootstrap. The flag also carries an implicit
+`read|write|admin` on every group: a service admin is root. Granting the
+flag (`AddIdentity` or `SetServiceAdmin`) therefore confers access to
+all secrets, and revoking it (`SetServiceAdmin`) removes that access on
+the target's next request; explicit ACL rows the identity holds survive
+the revocation. Revoking the last service admin is refused, mirroring
+the `RemoveIdentity` guard. Creating a group still grants the creator an
+explicit `read|write|admin` on it in the same database transaction, so
+every group keeps a group admin even if its creator later loses the
+service-admin flag.
 
 An *unregistered* identity — one the server has never seen — can do
 nothing except open a connection and collect uniform denials. Denials do
@@ -285,9 +291,11 @@ that uniformity, both scoped to already-authorized callers:
 - Within a group, the CAS feedback on writes (`VersionConflict` with the
   current version) is returned after the `write` check alone. `write`
   therefore implies visibility of secret existence and current versions in
-  that group; `read` gates values and listing. Similarly, `Grant` tells a
-  *group admin* whether the target identity name exists (identity names
-  share one namespace); full identity records remain service-admin-only.
+  that group; `read` gates values and listing. Similarly, a *group
+  admin* may list registered identity names (`ListIdentityNames`) to
+  pick grant targets, and `Grant` confirms whether a target name exists;
+  full identity records (endpoint ids, service-admin flags) remain
+  service-admin-only.
 
 ACL changes are themselves requests and require `admin` permission on the
 target group. Because DEKs are wrapped only to the operational and backup
@@ -296,8 +304,9 @@ ACL takes effect immediately without re-wrapping. A subsequent DEK rotation
 provides defense-in-depth against any plaintext the removed identity
 captured before revocation.
 
-A `Grant` that would leave a group with no `admin` holder is refused: an
-ACL edit is never urgent, and an admin-less group would be unmanageable.
+A `Grant` that would leave a group with no explicit `admin` holder is
+refused: an ACL edit is never urgent, and the guard keeps every group
+manageable by its own admins without service-admin intervention.
 Removing an *identity* is never blocked, though — revoking a compromised
 key always wins, even when that orphans a group's ACL. The recovery path
 for an orphaned group is the local `db grant` command, run by the operator
@@ -343,11 +352,11 @@ rare, announced migration.
 **Client identity.** The holder generates a new iroh keypair; a service
 admin registers it as a new identity, group admins re-grant, and the old
 identity is removed. There is deliberately no "replace the EndpointId on
-an existing identity row" operation: it would let a service admin assume
-any identity — and with it that identity's group permissions — which the
-model otherwise denies them. Grants do not carry across the swap for the
-same reason. No re-encryption is needed at any point because DEKs are
-never wrapped to client identities.
+an existing identity row" operation: it would let a service admin
+silently assume an existing identity, corrupting the audit trail's
+attribution of every subsequent request. Grants do not carry across the
+swap for the same reason. No re-encryption is needed at any point
+because DEKs are never wrapped to client identities.
 
 ### Revocation
 

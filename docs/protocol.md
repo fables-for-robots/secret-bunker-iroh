@@ -120,8 +120,10 @@ existed — the reply would have been the seven bytes of `"Denied"`:
 
 Permissions are per-group bitmasks: `read` (1), `write` (2), `admin` (4).
 Service-level operations require the caller's identity to carry the
-**service-admin** flag. "→" lists the success responses; every request can
-also produce `Denied` or `Failed` (section 6).
+**service-admin** flag. Service admins additionally hold an implicit
+`read|write|admin` on every group, so every "on the group" requirement
+below is also satisfied by the flag. "→" lists the success responses;
+every request can also produce `Denied` or `Failed` (section 6).
 
 ### Secrets
 
@@ -182,18 +184,26 @@ command.
 
 ### Identities
 
-All three require service admin.
+All four require service admin.
 
 ```
-{"AddIdentity":    {"name": "ci",
-                    "endpoint_id": "1a984b…(64 hex chars)…27b6",
-                    "service_admin": false}}
-{"RemoveIdentity": {"name": "ci"}}
+{"AddIdentity":     {"name": "ci",
+                     "endpoint_id": "1a984b…(64 hex chars)…27b6",
+                     "service_admin": false}}
+{"RemoveIdentity":  {"name": "ci"}}
+{"SetServiceAdmin": {"name": "ci", "service_admin": false}}
 "ListIdentities"
 ```
 
 EndpointIds are the 64-character lowercase-hex encoding of the ed25519
 public key.
+
+`SetServiceAdmin` grants or revokes the service-admin flag. Because the
+flag carries implicit access to every group, granting it confers access
+to all secrets and revoking it removes that access on the target's next
+request; explicit per-group grants the identity holds are untouched.
+Revoking the last service admin is refused (`Failed`) — a bunker without
+one cannot be administered over the wire.
 
 ## 6. Responses
 
@@ -228,8 +238,8 @@ Notes:
   implies seeing which secrets exist there and at what version, even
   without `read`; `read` gates values and `List`.
 - `Groups.service_admin` reports the *caller's* role; each entry's
-  `perms` is the caller's own bitmask on that group (service admins see
-  all groups, including ones where their bitmask is 0).
+  `perms` is the caller's effective bitmask on that group (service
+  admins see every group, always with the full implicit `7`).
 - `Version` answers a successful `Put`; `Ok` answers the other mutations.
 
 ## 7. Compatibility
