@@ -7,11 +7,12 @@
 //! (`Response::Denied`). See design/crypto-design.md sections 5 and 7.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::Result;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
+use zeroize::Zeroize;
 
 use crate::crypto;
 use crate::proto::{self, IdentityInfo, Request, Response};
@@ -62,11 +63,40 @@ impl Bunker {
         })))
     }
 
+    /// Lock the store, recovering from poisoning: a panicked request must
+    /// not brick every later one, and SQLite transactions roll back when
+    /// dropped mid-panic, so the store itself stays consistent.
+    fn lock_store(&self) -> MutexGuard<'_, Store> {
+        self.0.store.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Decode and handle one raw request frame from an authenticated peer.
+    /// Frames that fail to decode get the uniform denial and an audit entry.
+    pub fn handle_raw(&self, remote: &str, bytes: &[u8]) -> Response {
+        match proto::decode::<Request>(bytes) {
+            Ok(mut req) => {
+                let response = self.handle(remote, &req);
+                // Best-effort scrub of the plaintext copy decode made.
+                if let Request::Put { value, .. } = &mut req {
+                    value.zeroize();
+                }
+                response
+            }
+            Err(_) => {
+                let store = self.lock_store();
+                if let Err(err) = store.audit(remote, "malformed", "", "denied") {
+                    tracing::error!(%err, "audit append failed");
+                }
+                Response::Denied
+            }
+        }
+    }
+
     /// Handle one decoded request from an authenticated peer. Synchronous:
     /// the store lock is never held across an await point.
     pub fn handle(&self, remote: &str, req: &Request) -> Response {
         let inner = &*self.0;
-        let mut store = inner.store.lock().expect("store lock poisoned");
+        let mut store = self.lock_store();
         let outcome = Self::dispatch(inner, &mut store, remote, req);
         let audit_outcome = match &outcome {
             Response::Denied => "denied",
@@ -222,8 +252,15 @@ impl Bunker {
         };
         // The CAS inside put_secret is authoritative; new_version here is
         // only used to bind the AAD, and equals current+1 exactly when the
-        // CAS succeeds (expected_version == current).
-        if expected_version + 1 != new_version && expected_version != 0 {
+        // CAS succeeds (expected_version == current). checked_add: the wire
+        // can carry u64::MAX, which must be a conflict, not an overflow
+        // panic (debug builds) while the store lock is held.
+        let Some(target_version) = expected_version.checked_add(1) else {
+            return Response::VersionConflict {
+                current: new_version - 1,
+            };
+        };
+        if target_version != new_version && expected_version != 0 {
             // Fast-path conflict; the store would reject it anyway.
             return Response::VersionConflict {
                 current: new_version - 1,
@@ -232,7 +269,7 @@ impl Bunker {
         let encrypted = crypto::unwrap_dek(&wrapped.wrapped_operational, &inner.op_identity)
             .map_err(|e| anyhow::anyhow!(e))
             .and_then(|dek| {
-                let aad = crypto::secret_aad(group, name, expected_version + 1, wrapped.version);
+                let aad = crypto::secret_aad(group, name, target_version, wrapped.version);
                 crypto::encrypt_secret(&dek, &aad, value)
             });
         let (nonce, ciphertext) = match encrypted {
@@ -326,19 +363,16 @@ impl Bunker {
                 };
             }
         };
-        if let Err(err) = store.create_group(name, &wrapped_op, &wrapped_backup) {
+        // Every group needs a group admin from the start: the creator,
+        // granted in the same transaction that creates the group.
+        if let Err(err) = store.create_group(
+            name,
+            &wrapped_op,
+            &wrapped_backup,
+            ident.id,
+            PERM_READ | PERM_WRITE | PERM_ADMIN,
+        ) {
             tracing::error!(%err, name, "failed to create group");
-            return Response::Failed {
-                reason: "internal error".into(),
-            };
-        }
-        // Every group needs a group admin from the start: the creator.
-        let grant = store
-            .group_id(name)
-            .ok()
-            .flatten()
-            .map(|gid| store.set_perms(ident.id, gid, PERM_READ | PERM_WRITE | PERM_ADMIN));
-        if !matches!(grant, Some(Ok(()))) {
             return Response::Failed {
                 reason: "internal error".into(),
             };
@@ -433,12 +467,38 @@ impl Bunker {
             };
         }
         match store.identity_by_name(identity) {
-            Ok(Some(target)) => match store.set_perms(target.id, group_id, perms) {
-                Ok(()) => Response::Ok,
-                Err(_) => Response::Failed {
-                    reason: "internal error".into(),
-                },
-            },
+            Ok(Some(target)) => {
+                // Refuse to leave the group without any admin: an ACL edit
+                // is never urgent the way removing a compromised identity
+                // is, and an admin-less group is unmanageable without local
+                // database surgery (`db grant`).
+                let Ok(current) = store.perms(target.id, group_id) else {
+                    return Response::Failed {
+                        reason: "internal error".into(),
+                    };
+                };
+                if current & PERM_ADMIN != 0 && perms & PERM_ADMIN == 0 {
+                    match store.admin_count(group_id) {
+                        Ok(admins) if admins <= 1 => {
+                            return Response::Failed {
+                                reason: format!("cannot remove the last admin of group '{group}'"),
+                            };
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            return Response::Failed {
+                                reason: "internal error".into(),
+                            };
+                        }
+                    }
+                }
+                match store.set_perms(target.id, group_id, perms) {
+                    Ok(()) => Response::Ok,
+                    Err(_) => Response::Failed {
+                        reason: "internal error".into(),
+                    },
+                }
+            }
             Ok(None) => Response::Failed {
                 reason: format!("no identity named '{identity}'"),
             },
@@ -486,20 +546,224 @@ impl ProtocolHandler for Bunker {
                 Ok(pair) => pair,
                 Err(_) => break, // peer closed (or connection error): done
             };
-            let response = match recv.read_to_end(proto::MAX_MSG).await {
-                Ok(bytes) => match proto::decode::<Request>(&bytes) {
-                    Ok(req) => self.handle(&remote, &req),
-                    Err(_) => Response::Denied,
-                },
+            let mut response = match recv.read_to_end(proto::MAX_MSG).await {
+                Ok(mut bytes) => {
+                    let response = self.handle_raw(&remote, &bytes);
+                    bytes.zeroize(); // may hold a Put plaintext
+                    response
+                }
                 Err(_) => break,
             };
-            let encoded =
+            let mut encoded =
                 proto::encode(&response).map_err(|e| std::io::Error::other(e.to_string()))?;
-            send.write_all(&encoded)
-                .await
-                .map_err(std::io::Error::other)?;
+            // Best-effort scrub of plaintext copies once encoded/sent.
+            if let Response::Secret { value, .. } = &mut response {
+                value.zeroize();
+            }
+            let sent = send.write_all(&encoded).await;
+            encoded.zeroize();
+            sent.map_err(std::io::Error::other)?;
             send.finish()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bunker over an in-memory store with one service admin, plus that
+    /// admin's EndpointId (a real one, so AddIdentity targets parse).
+    fn test_bunker() -> (Bunker, String) {
+        let mut store = Store::open_in_memory().unwrap();
+        let op = age::x25519::Identity::generate();
+        let backup = age::x25519::Identity::generate();
+        let admin_id = iroh::SecretKey::generate().public().to_string();
+        store
+            .init(
+                &op.to_public().to_string(),
+                &backup.to_public().to_string(),
+                &admin_id,
+                "admin",
+            )
+            .unwrap();
+        (Bunker::new(store, op).unwrap(), admin_id)
+    }
+
+    #[test]
+    fn put_with_max_expected_version_is_a_conflict_not_a_panic() {
+        let (bunker, admin) = test_bunker();
+        assert_eq!(
+            bunker.handle(&admin, &Request::CreateGroup { name: "g".into() }),
+            Response::Ok
+        );
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::Put {
+                    group: "g".into(),
+                    name: "s".into(),
+                    value: b"v".to_vec(),
+                    expected_version: 0,
+                }
+            ),
+            Response::Version { version: 1 }
+        );
+        // u64::MAX + 1 must not overflow-panic (which would poison the store
+        // lock); it is just an unmatchable precondition.
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::Put {
+                    group: "g".into(),
+                    name: "s".into(),
+                    value: b"v2".to_vec(),
+                    expected_version: u64::MAX,
+                }
+            ),
+            Response::VersionConflict { current: 1 }
+        );
+    }
+
+    #[test]
+    fn grant_cannot_drop_the_last_group_admin() {
+        let (bunker, admin) = test_bunker();
+        assert_eq!(
+            bunker.handle(&admin, &Request::CreateGroup { name: "g".into() }),
+            Response::Ok
+        );
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::AddIdentity {
+                    name: "bob".into(),
+                    endpoint_id: iroh::SecretKey::generate().public().to_string(),
+                    service_admin: false,
+                }
+            ),
+            Response::Ok
+        );
+        // The creator is the sole group admin: neither downgrading nor
+        // revoking it may leave the group without an admin.
+        for perms in [PERM_READ | PERM_WRITE, 0] {
+            assert!(
+                matches!(
+                    bunker.handle(
+                        &admin,
+                        &Request::Grant {
+                            group: "g".into(),
+                            identity: "admin".into(),
+                            perms,
+                        }
+                    ),
+                    Response::Failed { .. }
+                ),
+                "dropping the last group admin (perms {perms}) must be refused"
+            );
+        }
+        // With a second admin in place, stepping down is fine.
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::Grant {
+                    group: "g".into(),
+                    identity: "bob".into(),
+                    perms: PERM_READ | PERM_WRITE | PERM_ADMIN,
+                }
+            ),
+            Response::Ok
+        );
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::Grant {
+                    group: "g".into(),
+                    identity: "admin".into(),
+                    perms: PERM_READ,
+                }
+            ),
+            Response::Ok
+        );
+    }
+
+    #[test]
+    fn malformed_requests_are_denied_and_audited() {
+        use crate::store::AuditVerification;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bunker.sqlite");
+        let op = age::x25519::Identity::generate();
+        let backup = age::x25519::Identity::generate();
+        let remote = iroh::SecretKey::generate().public().to_string();
+        let mut store = Store::open(&db).unwrap();
+        store
+            .init(
+                &op.to_public().to_string(),
+                &backup.to_public().to_string(),
+                &remote,
+                "admin",
+            )
+            .unwrap();
+        let bunker = Bunker::new(store, op).unwrap();
+        assert_eq!(
+            bunker.handle_raw(&remote, b"\xffnot-cbor"),
+            Response::Denied
+        );
+        drop(bunker);
+        let verified = Store::open(&db).unwrap().verify_audit_chain().unwrap();
+        assert!(
+            matches!(verified, AuditVerification::Valid { entries: 1, .. }),
+            "expected one audit entry for the malformed frame, got {verified:?}"
+        );
+    }
+
+    #[test]
+    fn removing_an_identity_is_never_blocked_by_group_admin_status() {
+        // Revocation of a (possibly compromised) identity always wins over
+        // lockout protection; the recovery path is `db grant` on the server.
+        let (bunker, admin) = test_bunker();
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::AddIdentity {
+                    name: "bob".into(),
+                    endpoint_id: iroh::SecretKey::generate().public().to_string(),
+                    service_admin: false,
+                }
+            ),
+            Response::Ok
+        );
+        assert_eq!(
+            bunker.handle(&admin, &Request::CreateGroup { name: "g".into() }),
+            Response::Ok
+        );
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::Grant {
+                    group: "g".into(),
+                    identity: "bob".into(),
+                    perms: PERM_READ | PERM_WRITE | PERM_ADMIN,
+                }
+            ),
+            Response::Ok
+        );
+        // Admin steps down; bob is now the sole group admin.
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::Grant {
+                    group: "g".into(),
+                    identity: "admin".into(),
+                    perms: 0,
+                }
+            ),
+            Response::Ok
+        );
+        assert_eq!(
+            bunker.handle(&admin, &Request::RemoveIdentity { name: "bob".into() }),
+            Response::Ok,
+            "removing a sole group admin identity must stay possible"
+        );
     }
 }

@@ -182,6 +182,27 @@ secret-bunker-iroh recover \
 
 Restart `serve` with the new operational key; the old one is rejected.
 
+## Database maintenance
+
+Two commands operate directly on the SQLite file (stop the server first):
+
+```sh
+# Verify the audit log hash chain; record the printed head externally —
+# the chain proves in-place integrity, only an external anchor detects
+# truncation.
+secret-bunker-iroh db audit-verify --db bunker.sqlite
+
+# Restore access to a group whose last admin identity was removed. The
+# protocol refuses a `grant` that would drop a group's last admin, but
+# removing a (compromised) identity is never blocked, so a group can end
+# up admin-less on purpose:
+secret-bunker-iroh db grant --db bunker.sqlite \
+  --group prod --identity alice --perms rwa
+```
+
+`db grant` bypasses the wire ACL checks — local database access is
+operator access — and is audited like any other mutation.
+
 ## Embedding
 
 The crate is also a library: `secret_bunker_iroh::client::Client` speaks the

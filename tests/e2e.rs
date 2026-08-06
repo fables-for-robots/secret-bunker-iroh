@@ -392,17 +392,16 @@ async fn recovery_rewraps_deks() {
     // Phase 2: offline recovery with the backup key (what `recover` does).
     let new_op = age::x25519::Identity::generate();
     {
-        let store = Store::open(&db).unwrap();
+        let mut store = Store::open(&db).unwrap();
+        let mut rewrapped = Vec::new();
         for (group_id, dek_row) in store.all_deks().unwrap() {
             let dek =
                 secret_bunker_iroh::crypto::unwrap_dek(&dek_row.wrapped_backup, &backup).unwrap();
             let wrapped = secret_bunker_iroh::crypto::wrap_dek(&dek, &new_op.to_public()).unwrap();
-            store
-                .replace_wrapped_operational(group_id, dek_row.version, &wrapped)
-                .unwrap();
+            rewrapped.push((group_id, dek_row.version, wrapped));
         }
         store
-            .meta_set("operational_pubkey", &new_op.to_public().to_string())
+            .apply_recovery(&rewrapped, &new_op.to_public().to_string())
             .unwrap();
     }
 

@@ -63,6 +63,12 @@ hostile operator.
 - A hostile server operator. The operational private key is online and the
   server decrypts secrets in memory to serve reads, so the operator can in
   principle read all secrets.
+- *Write* access to the database file (as opposed to theft of a copy).
+  The associated data binding stops ciphertext transplantation, but the
+  current-version pointers and the recorded backup pubkey are plain
+  unauthenticated rows: a writer can silently roll a secret back to an
+  older retained version, or redirect future DEK wrapping to a key they
+  hold. Whoever can write the SQLite file is the operator.
 - Compromise of an authorized client's iroh secret key prior to revocation.
   Anything that client could fetch, the attacker can fetch.
 - Side-channel attacks on the host running the service.
@@ -194,12 +200,17 @@ Server-side processing order for every stream:
 
 1. Read the authenticated EndpointId from the connection (already verified
    by the handshake; no parsing of attacker-controlled identity material).
-2. Parse the request.
+2. Parse the request. A frame that fails to decode is answered with the
+   same uniform `denied` response and audited (op `malformed`).
 3. Look up the identity and check the ACL for the requested operation.
    Unknown identity, insufficient permission, and nonexistent target all
    produce the same `denied` response.
 4. (Writes) Check the version precondition. Reject on mismatch.
 5. Apply the operation and append to the audit log.
+
+Uniformity of denials is a property of response *content*, not timing: the
+denied paths do differing amounts of database work and no attempt is made
+to normalize response latency (see Non-Goals).
 
 What this removes relative to `secret-bunker`: `sshsig` envelopes,
 canonical JSON, signing namespaces, timestamp windows, and the
@@ -226,7 +237,11 @@ used, forwards ciphertext it cannot open. Consequently:
 
 Plaintext secret values exist only in the memory of the two endpoint
 processes. On the server, plaintext exists for the duration of one request
-and is not logged.
+and is not logged. DEKs are zeroized on drop, and the request/response
+buffers that carry plaintext (`Put` values, `Secret` responses) are
+scrubbed after use on both server and client — best-effort hygiene, not a
+guarantee: intermediate copies inside the CBOR and age libraries, and
+whatever the consumer does with a fetched value, are out of reach.
 
 The server obtains a secret's plaintext by:
 
@@ -252,13 +267,27 @@ bitmask:
 Identities may be members of multiple groups with different permissions in
 each. Service-level operations (creating groups, registering and removing
 identities) require the **service-admin** flag on the caller's identity;
-the first service admin is established at bootstrap. Creating a group
-grants the creator `read|write|admin` on it, so every group has a group
-admin from the moment it exists.
+the first service admin is established at bootstrap. The service-admin
+flag carries *no* per-group permissions. Creating a group grants the
+creator `read|write|admin` on it in the same database transaction that
+creates the group, so every group has a group admin from the moment it
+exists.
 
-An identity with no ACL rows and no service-admin flag — including one the
-server has never seen — can do nothing except open a connection and collect
-uniform denials. Denials do not reveal whether a group or secret exists.
+An *unregistered* identity — one the server has never seen — can do
+nothing except open a connection and collect uniform denials. Denials do
+not reveal whether a group or secret exists. Two deliberate refinements to
+that uniformity, both scoped to already-authorized callers:
+
+- A registered identity may always call `ListGroups` and receives its own
+  (possibly empty) group list, so a key holder can confirm its own
+  registration status. Nothing about other identities or ungranted groups
+  is revealed.
+- Within a group, the CAS feedback on writes (`VersionConflict` with the
+  current version) is returned after the `write` check alone. `write`
+  therefore implies visibility of secret existence and current versions in
+  that group; `read` gates values and listing. Similarly, `Grant` tells a
+  *group admin* whether the target identity name exists (identity names
+  share one namespace); full identity records remain service-admin-only.
 
 ACL changes are themselves requests and require `admin` permission on the
 target group. Because DEKs are wrapped only to the operational and backup
@@ -266,6 +295,16 @@ pubkeys — never to client identities — removing an identity from a group's
 ACL takes effect immediately without re-wrapping. A subsequent DEK rotation
 provides defense-in-depth against any plaintext the removed identity
 captured before revocation.
+
+A `Grant` that would leave a group with no `admin` holder is refused: an
+ACL edit is never urgent, and an admin-less group would be unmanageable.
+Removing an *identity* is never blocked, though — revoking a compromised
+key always wins, even when that orphans a group's ACL. The recovery path
+for an orphaned group is the local `db grant` command, run by the operator
+directly against the database (with the service stopped); it bypasses the
+wire ACL checks, which is consistent with the trust model — local database
+access is operator access — and it appends to the audit log like any other
+mutation.
 
 ## 8. Key Lifecycle
 
@@ -301,10 +340,14 @@ the new id (out of band, or via a signed announcement from the old key
 while it is still trusted). The database is unaffected. Plan this as a
 rare, announced migration.
 
-**Client identity.** The holder generates a new iroh keypair and an admin
-replaces the EndpointId on the identity row (a service-admin operation).
-No re-encryption is needed because DEKs are never wrapped to client
-identities.
+**Client identity.** The holder generates a new iroh keypair; a service
+admin registers it as a new identity, group admins re-grant, and the old
+identity is removed. There is deliberately no "replace the EndpointId on
+an existing identity row" operation: it would let a service admin assume
+any identity — and with it that identity's group permissions — which the
+model otherwise denies them. Grants do not carry across the swap for the
+same reason. No re-encryption is needed at any point because DEKs are
+never wrapped to client identities.
 
 ### Revocation
 
@@ -343,12 +386,21 @@ The server holds two online secrets: the endpoint secret key and the
 operational age private key. Outside Kubernetes, both (and the client's
 endpoint key) default to `$XDG_DATA_HOME/secret-bunker-iroh` (falling back
 to `~/.local/share/secret-bunker-iroh`), created mode 0700 with key files
-mode 0600, and are auto-generated on first use. Auto-generation applies
-only to these default paths: an explicitly supplied key path that does not
-exist is an error, because silently minting a key there (e.g. on a typo'd
-path) would change the endpoint's identity. The `key
+mode 0600, and are auto-generated on first use. Key files are 0600 from
+the moment they exist (`O_CREAT|O_EXCL` with the mode set at open) — there
+is no create-then-chmod window in which another local user could read
+them — and loading a key whose mode admits group/other access logs a
+warning. The SQLite database is likewise forced to mode 0600 on every
+open (SQLite's own default is 0644): it holds no plaintext secrets, but
+its metadata — group and secret names, identity names and EndpointIds,
+ACLs, the audit log — is not for other local users either. Auto-generation
+applies only to these default paths: an explicitly supplied key path that
+does not exist is an error, because silently minting a key there (e.g. on
+a typo'd path) would change the endpoint's identity. The `key
 show|generate|export|import` commands manage these files; exported material
-is the raw secret and must be transported accordingly.
+is the raw secret and must be transported accordingly. `client put
+--value` warns that argv is visible to the local process list; pipe values
+via stdin instead.
 
 In Kubernetes, mount both server secrets and protect them as follows:
 
@@ -393,6 +445,15 @@ The following are explicitly not provided:
   an endpoint with that id is online. With mDNS enabled (the default),
   anyone on the same network segment sees the bunker's EndpointId and
   addresses announced; run with `--no-mdns` where that matters.
-- **Audit-log integrity beyond append-only hash chaining.** A privileged
-  operator can rewrite history if the log lives in the same SQLite file as
-  the data. Ship the log to an external sink where this matters.
+- **Timing-uniform denials.** The `denied` response is byte-identical
+  across its causes, but the paths that produce it do different amounts of
+  database work, so a patient network observer may distinguish them
+  statistically. No latency normalization is attempted.
+- **Audit-log integrity beyond append-only hash chaining.** The chain
+  detects in-place edits, but not truncation from the tail (a shortened
+  chain still verifies), and appends are best-effort — an operation is not
+  rolled back if its audit insert fails. A privileged operator can rewrite
+  history if the log lives in the same SQLite file as the data. `db
+  audit-verify` checks the chain and prints the head `(seq, hash)`; record
+  that head externally (or ship the log to an external sink) where
+  truncation matters.

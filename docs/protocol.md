@@ -166,7 +166,12 @@ transport replay is already impossible at the QUIC layer.
 
 `Grant` sets the full bitmask (`perms: 0` revokes). Creating a group
 grants the creator `read|write|admin` on it, so every group has a group
-admin from the moment it exists.
+admin from the moment it exists. A `Grant` that would strip the `admin`
+bit from a group's only admin fails (`Failed`), so a group can never be
+left unmanageable through the protocol; `RemoveIdentity` is deliberately
+*not* guarded this way — revoking a compromised identity always works,
+and an orphaned group is recovered with the server-local `db grant`
+command.
 
 ### Identities
 
@@ -207,8 +212,13 @@ Notes:
   permission, and nonexistent group/secret are indistinguishable, so a
   connected-but-unauthorized peer cannot enumerate anything, and even an
   authorized reader cannot distinguish "deleted" from "never existed".
+  A frame that does not decode as a `Request` gets the same `Denied`.
 - **`Failed` is only sent after authorization succeeded**, so its
   `reason` may be informative. Unauthorized callers never see it.
+- **`VersionConflict` is sent after only the `write` check**, and it
+  reports the current version. Holding `write` on a group therefore
+  implies seeing which secrets exist there and at what version, even
+  without `read`; `read` gates values and `List`.
 - `Groups.service_admin` reports the *caller's* role; each entry's
   `perms` is the caller's own bitmask on that group (service admins see
   all groups, including ones where their bitmask is 0).

@@ -111,6 +111,30 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // The bundled SQLite creates database files 0644; the metadata in
+        // here (names, ACLs, EndpointIds, audit log) is not for other local
+        // users. Create the file 0600 before SQLite touches it, and repair
+        // pre-existing files (the WAL/SHM sidecars inherit the main file's
+        // mode, but stale ones from earlier versions need fixing too).
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating database {}", path.display()))?;
+        let restrict = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, restrict.clone())?;
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let sidecar = std::path::PathBuf::from(sidecar);
+            if sidecar.exists() {
+                std::fs::set_permissions(&sidecar, restrict.clone())?;
+            }
+        }
         let conn = Connection::open(path)
             .with_context(|| format!("opening database {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -249,12 +273,16 @@ impl Store {
             .optional()?)
     }
 
-    /// Creates a group along with its first wrapped DEK (version 1).
+    /// Creates a group, its first wrapped DEK (version 1), and the
+    /// creator's ACL entry in one transaction, so a group can never exist
+    /// without an admin.
     pub fn create_group(
         &mut self,
         name: &str,
         wrapped_op: &[u8],
         wrapped_backup: &[u8],
+        creator_identity_id: i64,
+        creator_perms: u8,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -265,6 +293,10 @@ impl Store {
         tx.execute(
             "INSERT INTO group_dek (group_id, version, wrapped_operational, wrapped_backup, created_at) VALUES (?1, 1, ?2, ?3, ?4)",
             params![group_id, wrapped_op, wrapped_backup, now()],
+        )?;
+        tx.execute(
+            "INSERT INTO group_acl (identity_id, group_id, perms) VALUES (?1, ?2, ?3)",
+            params![creator_identity_id, group_id, creator_perms as i64],
         )?;
         tx.commit()?;
         Ok(())
@@ -281,6 +313,16 @@ impl Store {
             )
             .optional()?;
         Ok(perms.unwrap_or(0) as u8)
+    }
+
+    /// How many identities hold the admin bit on a group.
+    pub fn admin_count(&self, group_id: i64) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM group_acl WHERE group_id = ?1 AND (perms & ?2) != 0",
+            params![group_id, PERM_ADMIN as i64],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
     }
 
     pub fn set_perms(&self, identity_id: i64, group_id: i64, perms: u8) -> Result<()> {
@@ -399,16 +441,29 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    pub fn replace_wrapped_operational(
-        &self,
-        group_id: i64,
-        version: u64,
-        wrapped_op: &[u8],
+    /// Apply an offline recovery in one transaction: replace the wrapped
+    /// operational DEK for every listed `(group_id, dek_version, wrapped)`
+    /// and record the new operational pubkey. All-or-nothing, so a failure
+    /// can never leave the database half re-wrapped.
+    pub fn apply_recovery(
+        &mut self,
+        rewrapped: &[(i64, u64, Vec<u8>)],
+        new_operational_pubkey: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE group_dek SET wrapped_operational = ?3 WHERE group_id = ?1 AND version = ?2",
-            params![group_id, version as i64, wrapped_op],
+        let tx = self.conn.transaction()?;
+        for (group_id, version, wrapped_op) in rewrapped {
+            let n = tx.execute(
+                "UPDATE group_dek SET wrapped_operational = ?3 WHERE group_id = ?1 AND version = ?2",
+                params![group_id, *version as i64, wrapped_op],
+            )?;
+            anyhow::ensure!(n == 1, "no DEK row for group {group_id} version {version}");
+        }
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('operational_pubkey', ?1)
+             ON CONFLICT (key) DO UPDATE SET value = ?1",
+            [new_operational_pubkey],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -567,11 +622,13 @@ impl Store {
         Ok(())
     }
 
-    pub fn verify_audit_chain(&self) -> Result<bool> {
+    /// Verify the hash chain. Detects in-place edits, not truncation from
+    /// the tail — record the returned head externally to detect that.
+    pub fn verify_audit_chain(&self) -> Result<AuditVerification> {
         let mut stmt = self.conn.prepare(
-            "SELECT ts, endpoint_id, op, target, outcome, prev_hash, hash FROM audit_log ORDER BY seq",
+            "SELECT seq, ts, endpoint_id, op, target, outcome, prev_hash, hash FROM audit_log ORDER BY seq",
         )?;
-        type AuditRow = (i64, String, String, String, String, Vec<u8>, Vec<u8>);
+        type AuditRow = (i64, i64, String, String, String, String, Vec<u8>, Vec<u8>);
         let rows: Vec<AuditRow> = stmt
             .query_map([], |r| {
                 Ok((
@@ -582,13 +639,16 @@ impl Store {
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             })?
             .collect::<std::result::Result<_, _>>()?;
+        let mut entries = 0u64;
         let mut prev = vec![0u8; 32];
-        for (ts, endpoint_id, op, target, outcome, prev_hash, hash) in rows {
+        let mut head = None;
+        for (seq, ts, endpoint_id, op, target, outcome, prev_hash, hash) in rows {
             if prev_hash != prev {
-                return Ok(false);
+                return Ok(AuditVerification::Broken { seq });
             }
             let mut hasher = Sha256::new();
             hasher.update(&prev);
@@ -598,11 +658,13 @@ impl Store {
                 hasher.update(field.as_bytes());
             }
             if hasher.finalize().as_slice() != hash {
-                return Ok(false);
+                return Ok(AuditVerification::Broken { seq });
             }
-            prev = hash;
+            prev = hash.clone();
+            head = Some((seq, hash));
+            entries += 1;
         }
-        Ok(true)
+        Ok(AuditVerification::Valid { entries, head })
     }
 }
 
@@ -610,6 +672,19 @@ impl Store {
 pub enum CasOutcome {
     Applied { new_version: u64 },
     Conflict { current: u64 },
+}
+
+/// Result of [`Store::verify_audit_chain`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuditVerification {
+    /// Chain is internally consistent; `head` is the last `(seq, hash)`,
+    /// suitable for anchoring outside the database.
+    Valid {
+        entries: u64,
+        head: Option<(i64, Vec<u8>)>,
+    },
+    /// The entry at `seq` does not match the chain.
+    Broken { seq: i64 },
 }
 
 #[cfg(test)]
@@ -623,6 +698,36 @@ mod tests {
         s
     }
 
+    /// Create a group with the bootstrap admin as its creator; returns the
+    /// group id.
+    fn create_group(s: &mut Store, name: &str) -> i64 {
+        let admin = s.identity_by_endpoint("endpoint-admin").unwrap().unwrap();
+        s.create_group(
+            name,
+            b"op",
+            b"bk",
+            admin.id,
+            PERM_READ | PERM_WRITE | PERM_ADMIN,
+        )
+        .unwrap();
+        s.group_id(name).unwrap().unwrap()
+    }
+
+    #[test]
+    fn open_creates_database_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bunker.sqlite");
+        let _s = Store::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "database must not be world-readable");
+        // Pre-existing databases get fixed on open too.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _s = Store::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
     #[test]
     fn init_is_one_shot() {
         let mut s = store();
@@ -631,22 +736,29 @@ mod tests {
     }
 
     #[test]
-    fn unknown_endpoint_has_no_identity_and_no_perms() {
+    fn create_group_grants_only_the_creator() {
         let mut s = store();
         assert!(s.identity_by_endpoint("stranger").unwrap().is_none());
-        s.create_group("g", b"op", b"bk").unwrap();
-        let gid = s.group_id("g").unwrap().unwrap();
+        s.add_identity("alice", "endpoint-alice", false).unwrap();
+        let gid = create_group(&mut s, "g");
         let admin = s.identity_by_endpoint("endpoint-admin").unwrap().unwrap();
-        // Even the service admin has no per-group perms until granted.
-        assert_eq!(s.perms(admin.id, gid).unwrap(), 0);
+        let alice = s.identity_by_name("alice").unwrap().unwrap();
+        // The creator's grant is part of the same transaction as the group;
+        // nobody else gets anything (the service-admin flag carries no
+        // per-group permissions).
+        assert_eq!(
+            s.perms(admin.id, gid).unwrap(),
+            PERM_READ | PERM_WRITE | PERM_ADMIN
+        );
+        assert_eq!(s.perms(alice.id, gid).unwrap(), 0);
+        assert_eq!(s.admin_count(gid).unwrap(), 1);
     }
 
     #[test]
     fn acl_grant_and_revoke() {
         let mut s = store();
         s.add_identity("alice", "endpoint-alice", false).unwrap();
-        s.create_group("g", b"op", b"bk").unwrap();
-        let gid = s.group_id("g").unwrap().unwrap();
+        let gid = create_group(&mut s, "g");
         let alice = s.identity_by_name("alice").unwrap().unwrap();
         s.set_perms(alice.id, gid, PERM_READ | PERM_WRITE).unwrap();
         assert_eq!(s.perms(alice.id, gid).unwrap(), PERM_READ | PERM_WRITE);
@@ -655,11 +767,23 @@ mod tests {
     }
 
     #[test]
+    fn admin_count_tracks_admin_bit_holders() {
+        let mut s = store();
+        s.add_identity("alice", "endpoint-alice", false).unwrap();
+        let gid = create_group(&mut s, "g");
+        let alice = s.identity_by_name("alice").unwrap().unwrap();
+        assert_eq!(s.admin_count(gid).unwrap(), 1);
+        s.set_perms(alice.id, gid, PERM_READ | PERM_ADMIN).unwrap();
+        assert_eq!(s.admin_count(gid).unwrap(), 2);
+        s.set_perms(alice.id, gid, PERM_READ).unwrap();
+        assert_eq!(s.admin_count(gid).unwrap(), 1);
+    }
+
+    #[test]
     fn removing_identity_cascades_acl() {
         let mut s = store();
         s.add_identity("alice", "endpoint-alice", false).unwrap();
-        s.create_group("g", b"op", b"bk").unwrap();
-        let gid = s.group_id("g").unwrap().unwrap();
+        let gid = create_group(&mut s, "g");
         let alice = s.identity_by_name("alice").unwrap().unwrap();
         s.set_perms(alice.id, gid, PERM_READ).unwrap();
         assert!(s.remove_identity("alice").unwrap());
@@ -669,8 +793,7 @@ mod tests {
     #[test]
     fn put_secret_cas() {
         let mut s = store();
-        s.create_group("g", b"op", b"bk").unwrap();
-        let gid = s.group_id("g").unwrap().unwrap();
+        let gid = create_group(&mut s, "g");
         // Create requires expected_version 0.
         assert_eq!(
             s.put_secret(gid, "tok", 0, 1, b"n", b"ct", "admin")
@@ -703,8 +826,7 @@ mod tests {
     #[test]
     fn delete_secret_cas() {
         let mut s = store();
-        s.create_group("g", b"op", b"bk").unwrap();
-        let gid = s.group_id("g").unwrap().unwrap();
+        let gid = create_group(&mut s, "g");
         s.put_secret(gid, "tok", 0, 1, b"n", b"ct", "admin")
             .unwrap();
         assert_eq!(
@@ -721,14 +843,44 @@ mod tests {
     #[test]
     fn dek_versioning() {
         let mut s = store();
-        s.create_group("g", b"op1", b"bk1").unwrap();
-        let gid = s.group_id("g").unwrap().unwrap();
+        let gid = create_group(&mut s, "g");
         assert_eq!(s.current_dek(gid).unwrap().version, 1);
         let v = s.add_dek(gid, b"op2", b"bk2").unwrap();
         assert_eq!(v, 2);
         assert_eq!(s.current_dek(gid).unwrap().version, 2);
         // Old DEK still retrievable for historical versions.
-        assert_eq!(s.dek(gid, 1).unwrap().wrapped_operational, b"op1");
+        assert_eq!(s.dek(gid, 1).unwrap().wrapped_operational, b"op");
+    }
+
+    #[test]
+    fn apply_recovery_rewraps_and_records_pubkey_atomically() {
+        let mut s = store();
+        let g1 = create_group(&mut s, "g1");
+        let g2 = create_group(&mut s, "g2");
+        s.apply_recovery(
+            &[(g1, 1, b"new-op-1".to_vec()), (g2, 1, b"new-op-2".to_vec())],
+            "age1new",
+        )
+        .unwrap();
+        assert_eq!(s.dek(g1, 1).unwrap().wrapped_operational, b"new-op-1");
+        assert_eq!(s.dek(g2, 1).unwrap().wrapped_operational, b"new-op-2");
+        assert_eq!(
+            s.meta_get("operational_pubkey").unwrap().unwrap(),
+            "age1new"
+        );
+        // A bad row aborts the whole batch: nothing is applied.
+        assert!(
+            s.apply_recovery(
+                &[(g1, 1, b"newer".to_vec()), (g2, 99, b"missing".to_vec())],
+                "age1newer",
+            )
+            .is_err()
+        );
+        assert_eq!(s.dek(g1, 1).unwrap().wrapped_operational, b"new-op-1");
+        assert_eq!(
+            s.meta_get("operational_pubkey").unwrap().unwrap(),
+            "age1new"
+        );
     }
 
     #[test]
@@ -736,13 +888,55 @@ mod tests {
         let s = store();
         s.audit("endpoint-a", "get", "g/tok", "ok").unwrap();
         s.audit("endpoint-b", "put", "g/tok", "denied").unwrap();
-        assert!(s.verify_audit_chain().unwrap());
+        let verified = s.verify_audit_chain().unwrap();
+        assert!(
+            matches!(
+                verified,
+                AuditVerification::Valid {
+                    entries: 2,
+                    head: Some((2, _))
+                }
+            ),
+            "unexpected verification: {verified:?}"
+        );
         s.conn
             .execute(
                 "UPDATE audit_log SET outcome = 'ok' WHERE outcome = 'denied'",
                 [],
             )
             .unwrap();
-        assert!(!s.verify_audit_chain().unwrap());
+        assert_eq!(
+            s.verify_audit_chain().unwrap(),
+            AuditVerification::Broken { seq: 2 }
+        );
+    }
+
+    #[test]
+    fn audit_chain_cannot_detect_tail_truncation_hence_head_export() {
+        // Pins the documented limitation: deleting from the tail leaves a
+        // chain that still verifies, with a different head — which is why
+        // the head is surfaced for external anchoring.
+        let s = store();
+        s.audit("endpoint-a", "get", "g/tok", "ok").unwrap();
+        s.audit("endpoint-b", "put", "g/tok", "denied").unwrap();
+        let AuditVerification::Valid {
+            head: Some((_, full_head)),
+            ..
+        } = s.verify_audit_chain().unwrap()
+        else {
+            panic!("chain must verify");
+        };
+        s.conn
+            .execute("DELETE FROM audit_log WHERE seq = 2", [])
+            .unwrap();
+        let truncated = s.verify_audit_chain().unwrap();
+        let AuditVerification::Valid {
+            entries: 1,
+            head: Some((_, truncated_head)),
+        } = truncated
+        else {
+            panic!("truncated chain still verifies, got {truncated:?}");
+        };
+        assert_ne!(full_head, truncated_head);
     }
 }

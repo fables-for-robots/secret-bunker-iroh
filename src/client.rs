@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
+use zeroize::Zeroize;
 
 use crate::proto::{self, Request, Response};
 
@@ -35,22 +36,27 @@ impl Client {
         Ok(Client { endpoint, conn })
     }
 
-    /// One request per bidirectional stream.
+    /// One request per bidirectional stream. The encode/decode buffers may
+    /// carry secret plaintext (Put and Secret), so they are scrubbed once
+    /// used.
     pub async fn request(&self, req: &Request) -> Result<Response> {
         let (mut send, mut recv) = self
             .conn
             .open_bi()
             .await
             .context("opening request stream")?;
-        send.write_all(&proto::encode(req)?)
-            .await
-            .context("sending request")?;
+        let mut encoded = proto::encode(req)?;
+        let sent = send.write_all(&encoded).await;
+        encoded.zeroize();
+        sent.context("sending request")?;
         send.finish().context("finishing request stream")?;
-        let bytes = recv
+        let mut bytes = recv
             .read_to_end(proto::MAX_MSG)
             .await
             .context("reading response")?;
-        proto::decode(&bytes).context("decoding response")
+        let response = proto::decode(&bytes).context("decoding response");
+        bytes.zeroize();
+        response
     }
 
     pub async fn close(self) {

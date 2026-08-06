@@ -13,8 +13,9 @@ use secret_bunker_iroh::client::Client;
 use secret_bunker_iroh::keys::KeyRole;
 use secret_bunker_iroh::proto::{Request, Response};
 use secret_bunker_iroh::server::Bunker;
-use secret_bunker_iroh::store::{PERM_ADMIN, PERM_READ, PERM_WRITE, Store};
+use secret_bunker_iroh::store::{AuditVerification, PERM_ADMIN, PERM_READ, PERM_WRITE, Store};
 use secret_bunker_iroh::{crypto, keys};
+use zeroize::Zeroize;
 
 #[derive(Parser)]
 #[command(
@@ -98,6 +99,12 @@ enum Cmd {
     Server {
         #[command(subcommand)]
         cmd: ServerCmd,
+    },
+    /// Local database maintenance, run directly against the SQLite file
+    /// (stop the server first).
+    Db {
+        #[command(subcommand)]
+        cmd: DbCmd,
     },
     /// Interactive terminal UI (role-aware: user, group admin, service admin).
     Tui {
@@ -220,6 +227,30 @@ enum ClientCmd {
     RotateDek {
         #[arg(long)]
         group: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbCmd {
+    /// Set permissions directly in the database, bypassing the wire ACL
+    /// checks: the recovery path for a group whose last admin is gone.
+    Grant {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        identity: String,
+        /// "r", "rw", "rwa", or "none".
+        #[arg(long)]
+        perms: String,
+    },
+    /// Verify the audit log hash chain and print the head entry. Record
+    /// the head externally: the chain proves in-place integrity, but only
+    /// an external anchor detects truncation.
+    AuditVerify {
+        #[arg(long)]
+        db: PathBuf,
     },
 }
 
@@ -481,9 +512,12 @@ async fn main() -> Result<()> {
         } => {
             let backup = keys::load_age_identity(&backup_key)?;
             let new_op = keys::parse_age_recipient(&new_operational_pubkey)?;
-            let store = Store::open(&db)?;
+            let mut store = Store::open(&db)?;
             anyhow::ensure!(store.is_initialized()?, "database is not initialized");
-            let mut rewrapped = 0usize;
+            // Re-wrap everything in memory first, then apply in one
+            // transaction: a failure part-way must not leave a database
+            // that is half old-key, half new-key.
+            let mut rewrapped = Vec::new();
             for (group_id, dek_row) in store.all_deks()? {
                 let dek =
                     crypto::unwrap_dek(&dek_row.wrapped_backup, &backup).with_context(|| {
@@ -492,13 +526,52 @@ async fn main() -> Result<()> {
                             dek_row.version
                         )
                     })?;
-                let wrapped_op = crypto::wrap_dek(&dek, &new_op)?;
-                store.replace_wrapped_operational(group_id, dek_row.version, &wrapped_op)?;
-                rewrapped += 1;
+                rewrapped.push((group_id, dek_row.version, crypto::wrap_dek(&dek, &new_op)?));
             }
-            store.meta_set("operational_pubkey", &new_op.to_string())?;
-            println!("re-wrapped {rewrapped} DEK(s) to {new_op}");
+            let count = rewrapped.len();
+            store.apply_recovery(&rewrapped, &new_op.to_string())?;
+            println!("re-wrapped {count} DEK(s) to {new_op}");
         }
+        Cmd::Db { cmd } => match cmd {
+            DbCmd::Grant {
+                db,
+                group,
+                identity,
+                perms,
+            } => {
+                let store = Store::open(&db)?;
+                anyhow::ensure!(store.is_initialized()?, "database is not initialized");
+                let perms = parse_perms(&perms)?;
+                let gid = store
+                    .group_id(&group)?
+                    .with_context(|| format!("no group named '{group}'"))?;
+                let target = store
+                    .identity_by_name(&identity)?
+                    .with_context(|| format!("no identity named '{identity}'"))?;
+                store.set_perms(target.id, gid, perms)?;
+                store.audit("(local)", "db-grant", &format!("{group}:{identity}"), "ok")?;
+                println!(
+                    "granted [{}] on '{group}' to '{identity}'",
+                    secret_bunker_iroh::proto::perms_str(perms)
+                );
+            }
+            DbCmd::AuditVerify { db } => {
+                let store = Store::open(&db)?;
+                match store.verify_audit_chain()? {
+                    AuditVerification::Valid { entries, head } => match head {
+                        Some((seq, hash)) => println!(
+                            "ok: {entries} entries, head seq {seq} hash {}",
+                            data_encoding::HEXLOWER.encode(&hash)
+                        ),
+                        None => println!("ok: audit log is empty (nothing to verify, no head)"),
+                    },
+                    AuditVerification::Broken { seq } => {
+                        eprintln!("audit chain BROKEN at seq {seq}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
         Cmd::Server { cmd } => match cmd {
             ServerCmd::Add { name, id, force } => {
                 let id: EndpointId = id.parse().context("parsing endpoint id")?;
@@ -569,7 +642,12 @@ async fn main() -> Result<()> {
                     expected_version,
                 } => {
                     let value = match value {
-                        Some(v) => v.clone().into_bytes(),
+                        Some(v) => {
+                            eprintln!(
+                                "warning: --value exposes the secret to the local process list; prefer piping it via stdin"
+                            );
+                            v.clone().into_bytes()
+                        }
                         None => {
                             let mut buf = Vec::new();
                             std::io::stdin().read_to_end(&mut buf)?;
@@ -629,9 +707,10 @@ async fn main() -> Result<()> {
             let response = client.request(&req).await?;
             client.close().await;
             match response {
-                Response::Secret { value, version } => {
+                Response::Secret { mut value, version } => {
                     eprintln!("version {version}");
                     std::io::stdout().write_all(&value)?;
+                    value.zeroize();
                 }
                 Response::Version { version } => println!("version {version}"),
                 Response::Ok => println!("ok"),

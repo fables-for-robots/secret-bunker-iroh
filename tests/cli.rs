@@ -251,14 +251,19 @@ fn cli_user_permission_lifecycle() {
             "1",
         ]),
     );
-    assert_eq!(
-        user.expect_ok(
-            &cmd(&[
-                "put", "--group", "team", "--name", "scratch", "--value", "temp",
-            ]),
-            None
-        ),
-        "version 1"
+    // --value works but warns: the secret is visible in the process list.
+    let out = user.run(
+        &cmd(&[
+            "put", "--group", "team", "--name", "scratch", "--value", "temp",
+        ]),
+        None,
+    );
+    assert!(out.status.success(), "put --value failed");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "version 1");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("stdin"),
+        "expected a warning steering --value users toward stdin, got: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
         user.expect_ok(
@@ -401,4 +406,114 @@ fn cli_user_permission_lifecycle() {
             "secret-v2"
         );
     }
+}
+
+/// The local `db` commands: rescuing an orphaned group by granting directly
+/// in the database (server stopped), and verifying the audit hash chain.
+#[test]
+fn cli_db_rescue_and_audit_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let db = root.join("bunker.sqlite");
+    let db_str = db.to_str().unwrap();
+
+    let server = Actor::new(root, "xdg-server");
+    let admin = Actor::new(root, "xdg-admin");
+    let user = Actor::new(root, "xdg-user");
+
+    let admin_id = admin.expect_ok(&["key", "generate", "client"], None);
+    let user_id = user.expect_ok(&["key", "generate", "client"], None);
+    let server_id = server.expect_ok(&["key", "generate", "server"], None);
+
+    let backup_path = root.join("backup.age");
+    let backup_pub = server.expect_ok(
+        &["keygen-age", "--out", backup_path.to_str().unwrap()],
+        None,
+    );
+    server.expect_ok(
+        &[
+            "init",
+            "--db",
+            db_str,
+            "--backup-pubkey",
+            &backup_pub,
+            "--admin-id",
+            &admin_id,
+        ],
+        None,
+    );
+    admin.expect_ok(&["server", "add", "default", &server_id], None);
+    user.expect_ok(&["server", "add", "default", &server_id], None);
+
+    // Round 1: create a group and register the user, then stop the server.
+    {
+        let (_guard, port) = spawn_server(&server, &db, &root.join("serve1.log"));
+        let server_addr = format!("127.0.0.1:{port}");
+        admin.expect_ok(
+            &[
+                "client",
+                "--server-addr",
+                &server_addr,
+                "create-group",
+                "team",
+            ],
+            None,
+        );
+        admin.expect_ok(
+            &[
+                "client",
+                "--server-addr",
+                &server_addr,
+                "add-identity",
+                "--name",
+                "remote-user",
+                "--id",
+                &user_id,
+            ],
+            None,
+        );
+    }
+
+    // Offline: grant directly in the database and verify the audit chain.
+    let granted = server.expect_ok(
+        &[
+            "db",
+            "grant",
+            "--db",
+            db_str,
+            "--group",
+            "team",
+            "--identity",
+            "remote-user",
+            "--perms",
+            "rwa",
+        ],
+        None,
+    );
+    assert!(granted.contains("granted"), "unexpected output: {granted}");
+    let verified = server.expect_ok(&["db", "audit-verify", "--db", db_str], None);
+    assert!(
+        verified.starts_with("ok") && verified.contains("head"),
+        "unexpected output: {verified}"
+    );
+
+    // Round 2: the grant is live after a restart.
+    let (_guard, port) = spawn_server(&server, &db, &root.join("serve2.log"));
+    let server_addr = format!("127.0.0.1:{port}");
+    assert_eq!(
+        user.expect_ok(
+            &[
+                "client",
+                "--server-addr",
+                &server_addr,
+                "put",
+                "--group",
+                "team",
+                "--name",
+                "rescued",
+            ],
+            Some(b"it-works"),
+        ),
+        "version 1"
+    );
 }
