@@ -19,4 +19,12 @@
 
 /target
 
+# Bunker artifacts the README quickstart creates in the working directory:
+# databases and key material must never be committed.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.key
+*.age
+
 !.claude/settings.local.json

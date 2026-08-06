@@ -10,7 +10,7 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -63,19 +63,52 @@ pub fn default_key_path(role: KeyRole) -> Result<PathBuf> {
     Ok(data_dir()?.join(role.filename()))
 }
 
-fn ensure_parent(path: &Path) -> Result<()> {
+pub(crate) fn ensure_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        // Created 0700 from the start (mode applies to every new directory);
+        // the set_permissions repairs pre-existing lax directories.
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
 
+/// Write secret key material 0600 from the moment the file exists — never
+/// via a create-then-chmod window in which another local user could read
+/// it. Overwrites (import --force) recreate the file for the same reason.
 fn write_private(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
     ensure_parent(path)?;
-    fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true).mode(0o600);
+    let mut file = match opts.open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(path)?;
+            opts.open(path)
+        }
+        other => other,
+    }
+    .with_context(|| format!("writing {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// Warn when a key file is readable by group/others (à la OpenSSH).
+fn warn_if_lax_permissions(path: &Path) {
+    if let Ok(meta) = fs::metadata(path) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                "key file {} has mode {mode:03o}, readable by other users; consider chmod 600",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Generate an iroh endpoint secret key, write it hex-encoded, and return it.
@@ -91,6 +124,7 @@ pub fn encode_endpoint_key(secret: &SecretKey) -> String {
 }
 
 pub fn load_endpoint_key(path: &Path) -> Result<SecretKey> {
+    warn_if_lax_permissions(path);
     let contents = fs::read_to_string(path)
         .with_context(|| format!("reading endpoint key {}", path.display()))?;
     SecretKey::from_str(contents.trim())
@@ -117,6 +151,7 @@ pub fn generate_age_identity(path: &Path) -> Result<age::x25519::Identity> {
 }
 
 pub fn load_age_identity(path: &Path) -> Result<age::x25519::Identity> {
+    warn_if_lax_permissions(path);
     let contents = fs::read_to_string(path)
         .with_context(|| format!("reading age identity {}", path.display()))?;
     parse_age_identity(&contents)

@@ -19,7 +19,6 @@
           shellHook = ''
             # Set here the env vars you want to be available in the shell
           '';
-          hardeningDisable = [ "all" ];
 
           packages = with pkgs; [ rustc cargo rustfmt clippy rust-analyzer ];
         };

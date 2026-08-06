@@ -43,9 +43,7 @@ fn load_at(path: &Path) -> Result<Vec<(String, EndpointId)>> {
 }
 
 fn store_at(path: &Path, entries: &[(String, EndpointId)]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    keys::ensure_parent(path)?;
     let mut out = String::new();
     for (name, id) in entries {
         out.push_str(&format!("{name} {id}\n"));

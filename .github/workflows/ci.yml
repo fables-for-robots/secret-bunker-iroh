@@ -28,3 +28,13 @@ jobs:
 
       - name: Tests (unit + end-to-end over in-process iroh endpoints)
         run: cargo test
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Audit dependencies against the RustSec advisory database
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
