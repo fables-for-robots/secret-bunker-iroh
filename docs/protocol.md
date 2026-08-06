@@ -152,17 +152,24 @@ transport replay is already impossible at the QUIC layer.
 |---|---|---|
 | `ListGroups` | any registered identity | `Groups` |
 | `GroupAcl` | `admin` on the group | `Acl` |
+| `ListIdentityNames` | `admin` on the group | `IdentityNames` |
 | `Grant` | `admin` on the group | `Ok` |
 | `RotateDek` | `admin` on the group | `Ok` |
 | `CreateGroup` | service admin | `Ok` |
 
 ```
 "ListGroups"
-{"GroupAcl":    {"group": "prod"}}
-{"Grant":       {"group": "prod", "identity": "ci", "perms": 3}}
-{"RotateDek":   {"group": "prod"}}
-{"CreateGroup": {"name": "prod"}}
+{"GroupAcl":           {"group": "prod"}}
+{"ListIdentityNames":  {"group": "prod"}}
+{"Grant":              {"group": "prod", "identity": "ci", "perms": 3}}
+{"RotateDek":          {"group": "prod"}}
+{"CreateGroup":        {"name": "prod"}}
 ```
+
+`ListIdentityNames` exists so a group admin can pick `Grant` targets
+without service-admin rights: it returns every registered identity's
+name — and only the name, no endpoint ids or service-admin flags
+(contrast `ListIdentities`).
 
 `Grant` sets the full bitmask (`perms: 0` revokes). Creating a group
 grants the creator `read|write|admin` on it, so every group has a group
@@ -175,7 +182,7 @@ command.
 
 ### Identities
 
-All four require service admin.
+All three require service admin.
 
 ```
 {"AddIdentity":    {"name": "ci",
@@ -203,6 +210,7 @@ public key.
 {"Groups":          {"service_admin": false,
                      "groups": [{"name": "prod", "perms": 3}]}}
 {"Acl":             [["admin", 7], ["ci", 1]]}
+{"IdentityNames":   ["admin", "ci"]}
 {"Failed":          {"reason": "group 'prod' already exists"}}
 ```
 
