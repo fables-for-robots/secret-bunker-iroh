@@ -45,9 +45,22 @@ Consequences accepted:
   holders: it is decryptable by **any read-granted identity's key**. This is
   the cost of "any reader can be a replica" and must be documented in the
   threat model.
-- Revocation is no longer purely instant: the ACL denial is still instant on
-  the next request, but ciphertext + wraps a reader already synced cannot be
-  clawed back. Auto-rotation protects all post-revocation writes.
+- Revocation semantics split by node. At the **authoritative node** the ACL
+  denial is still instant on the next request, but ciphertext + wraps a
+  reader already synced cannot be clawed back; auto-rotation protects all
+  post-revocation writes. A **replica** enforces a revocation only after it
+  applies the sync carrying the ACL change — which cannot happen while the
+  authoritative node is down or the replica is partitioned. Until then a
+  revoked identity can still read its formerly-granted groups through any
+  replica granted on them. There is no staleness bound; this goes in the
+  threat model.
+- Sync widens metadata visibility. A sync-capable read grant delivers, per
+  readable group, the full ACL roster — identity names, endpoint ids, and
+  permission bits — data that on the client protocol is admin-gated
+  (`GroupAcl`, `ListIdentityNames`) or service-admin-gated (endpoint ids
+  via `ListIdentities`). A stolen replica database exposes the mirrored
+  rosters without any key. The replica needs this data to authorize its
+  own clients; the disclosure is accepted and documented.
 
 ## 3. Identities and at-rest cryptography
 
@@ -110,11 +123,15 @@ are deleted explicitly in the transactions that mutate ACLs (no FK to
   retained DEK version** with the operational identity and wrap to the
   grantee's derived recipient. Every version, because rotation does not
   re-encrypt: current ciphertexts may reference old DEK versions.
-- **Revoke read** (Grant clearing the read bit, or RemoveIdentity): in one
-  transaction per affected group — delete that identity's wrap rows (all
-  versions) and **auto-rotate**: append a new DEK version wrapped to
-  operational + backup + remaining readers. Both the ACL change and the
-  rotation get audit entries.
+- **Revoke read** (Grant clearing the read bit, or RemoveIdentity): in
+  **one transaction covering the ACL change and every affected group** —
+  delete that identity's wrap rows (all versions) and **auto-rotate**:
+  append a new DEK version wrapped to operational + backup + remaining
+  readers. RemoveIdentity touching several groups rotates them all in that
+  same transaction (single-connection SQLite makes this cheap), so a crash
+  can never leave a revocation half-applied. Both the ACL change and each
+  rotation get audit entries. Note rotation needs **no private key**: a new
+  DEK is generated and wrapped to public recipients only.
 - **RotateDek (manual):** unchanged semantics, but the new version wraps to
   operational + backup + all current readers.
 - **Service admins:** the implicit read of the service-admin flag remains an
@@ -124,15 +141,19 @@ are deleted explicitly in the transactions that mutate ACLs (no FK to
 - **recover:** same flow as today; `apply_recovery` now updates the
   `'operational'` recipient rows per DEK version. Reader and backup wraps
   are untouched by operational-key rotation.
-- **`db grant`:** granting read offline now also produces wrap rows, so the
-  command resolves the operational key (same defaulting as `serve`). It
+- **`db grant`:** granting read offline now also produces wrap rows, and
+  unwrapping existing DEKs requires the operational key, so the command
+  resolves it (same defaulting as `serve`) **for read grants only**. It
   already requires stopped-service access on the server machine, so no new
-  trust is introduced. Revoking read offline performs the same
-  delete-wraps + auto-rotate as the online path.
+  trust is introduced. Revoking read offline performs the same delete-wraps
+  + auto-rotate as the online path and needs no key material at all
+  (rotation wraps to public recipients).
 - **Backfill:** at `serve` startup (authoritative role only), create any
   missing `(group, dek_version, read-granted identity)` wrap rows
-  idempotently. A pre-existing database becomes fully wrapped on first boot
-  of the new binary.
+  idempotently, **before the sync ALPN starts accepting sessions** — a
+  replica must never receive a manifest with its own wraps still missing.
+  A pre-existing database becomes fully wrapped on first boot of the new
+  binary.
 
 ## 4. Sync protocol — `secret-bunker-sync/1`
 
@@ -140,10 +161,14 @@ are deleted explicitly in the transactions that mutate ACLs (no FK to
 
 - Second ALPN on the same iroh endpoint, its own `ProtocolHandler`
   registered alongside `secret-bunker/1`.
-- Framing: **4-byte big-endian length prefix + CBOR body**, 4 MiB cap per
-  message. This enables multi-message streams and server push; it is
-  deliberately different from the client protocol's one-blob-until-EOF
-  framing.
+- Framing: **4-byte big-endian length prefix + CBOR body**, **8 MiB cap
+  per message** — deliberately larger than the client protocol's 4 MiB
+  `MAX_MSG`, preserving the invariant that *every secret writable via
+  `secret-bunker/1` fits in one `SecretData` frame* (ciphertext = plaintext
+  + 16-byte AEAD tag, plus nonce and metadata). A frame that would exceed
+  the cap is a protocol error, never a silent omission. The framing enables
+  multi-message streams and server push; it is deliberately different from
+  the client protocol's one-blob-until-EOF framing.
 - Message enums use the same serde externally-tagged CBOR conventions and
   compatibility rules as the client protocol; breaking changes bump the ALPN
   to `secret-bunker-sync/2`. Golden-vector tests pin the wire bytes.
@@ -158,36 +183,77 @@ are deleted explicitly in the transactions that mutate ACLs (no FK to
 - Registered identity with zero readable groups → empty manifest
   (`ManifestDone` immediately). This mirrors the `ListGroups` precedent: a
   key holder may confirm its own registration, nothing else.
-- Sync never carries plaintext, unwrapped DEKs, or wraps addressed to anyone
-  but the caller: ciphertext, the caller's own wraps, and metadata only.
+- Sync never carries plaintext, unwrapped DEKs, or wraps addressed to
+  anyone but the caller: ciphertext, the caller's own wraps, and metadata
+  only. "Metadata" is spelled out because it exceeds what the same identity
+  can query on the client protocol: for every group in the caller's read
+  scope, sync delivers the full ACL roster (identity names, endpoint ids,
+  permission bits). See the accepted consequence in section 2.
 
 ### 4.3 Messages and lifecycle
 
 Session stream (one long-lived bidi stream, opened by the replica):
 
 - Replica sends `Hello{}`.
+- The server **subscribes to the change broadcast before taking the
+  manifest snapshot** (subscribe-then-snapshot), so every mutation
+  committed after the snapshot begins is observed either in the manifest
+  or as a buffered push event. Events arriving while the manifest streams
+  are held by the session's debouncer and delivered after `ManifestDone`.
 - Server streams the manifest, then holds the stream open for push:
-  - `Group{name, acl: [AclEntry{identity_name, endpoint_id, perms,
-    service_admin}], deks: [DekEntry{version, wrapped}]}` — `wrapped` is the
-    caller's own wrap; blobs are small (~200 B) and inline.
+  - `Group{name, acl: [AclEntry{identity_name, endpoint_id, perms}],
+    deks: [DekEntry{version, wrapped}]}` — `wrapped` is the caller's own
+    wrap; blobs are small (~200 B) and inline. Like `GroupSecrets`, the
+    `acl` and `deks` lists may be split across continuation frames to stay
+    under the message cap (the `deks` list grows monotonically with every
+    rotation). `AclEntry` deliberately carries **no service-admin flag**:
+    the replica never consults it (section 5.2), and no replica-local
+    identity row ever has it set.
   - `GroupSecrets{group, secrets: [SecretEntry{name, current_version,
-    dek_version}]}` — repeated/chunked to stay under the message cap.
+    dek_version, nonce}]}` — repeated/chunked to stay under the message
+    cap. `nonce` is the current version's encryption nonce and serves as
+    the change discriminator (see 4.4).
   - `ManifestDone{}` after the last group.
   - Push events, debounced: `Changed{group}` when any successful mutation
     touches a group in the caller's scope; `ScopeChanged{}` when the
     caller's own readable set changes, or when the server's broadcast
-    channel overflowed (full resync is always the safety net).
+    channel overflowed.
+- Each group's `Group` + `GroupSecrets` records are read under a **single
+  store-lock acquisition** (read into memory, release, then send), so every
+  per-group snapshot is internally consistent. The lock is never held
+  across sends.
 
 Fetch streams (one bidi stream per request, opened by the replica):
 
+- `FetchGroup{group}` → the same `Group` + `GroupSecrets` records as the
+  manifest, then `FetchDone{}`. This is how a live session refreshes one
+  group. Unauthorized or unknown group → uniform `SyncDenied`.
 - `FetchSecrets{group, names: [String]}` → stream of
   `SecretData{name, version, dek_version, nonce, ciphertext, created_at,
   created_by}`, then `FetchDone{}`. Unauthorized or unknown group → uniform
-  `SyncDenied`.
+  `SyncDenied`. A requested name that no longer exists is **silently
+  omitted** (`FetchDone` still terminates the stream); the replica treats
+  an omitted name as locally unchanged — the deletion propagates via the
+  next `Changed`-driven group sync or full resync.
+
+Replica reactions (normative):
+
+- On `Changed{group}`: issue `FetchGroup{group}` (+ `FetchSecrets` for the
+  differing names) and run the apply rules of 4.4 for that group in one
+  local transaction. If `FetchGroup` returns `SyncDenied` for a group the
+  replica currently holds (the change raced with group deletion or the
+  replica's own revocation), drop the group locally — mirroring the
+  absent-from-manifest rule.
+- On `ScopeChanged{}` (including the broadcast-overflow case): close the
+  session stream and open a fresh one (`Hello` → full manifest → apply),
+  preferably on the same QUIC connection, reconnect with backoff as the
+  fallback. **"Full resync" means exactly this session-stream cycle.**
+  Fetch streams belonging to the previous session generation are abandoned.
 
 Server-side push infrastructure: `Bunker` publishes `(group)` events to a
 tokio broadcast channel after each successful mutation; each sync session
-filters by its caller's scope and debounces.
+filters by its caller's scope (recomputed per event, so grants/revocations
+of the caller itself surface as `ScopeChanged`) and debounces.
 
 Reconnect: drop → retry with backoff → full resync on connect. Missed
 events are recovered by the resync, never lost silently.
@@ -195,21 +261,45 @@ events are recovered by the resync, never lost silently.
 ### 4.4 Replica-side apply rules
 
 Per group, in **one local transaction** (replica readers always see atomic
-group states), applied in dependency order:
+group states), against the **latest received manifest state for that
+group** (from the connect-time manifest or a later `FetchGroup`), applied
+in dependency order:
 
-1. Upsert identity rows referenced by the group's ACL (by `endpoint_id`,
-   taking the authoritative node's names and flags).
+1. Upsert identity rows referenced by the group's ACL, keyed by
+   `endpoint_id` and taking the authoritative node's names. Before each
+   upsert, delete any local identity row holding the incoming *name* with
+   a **different** endpoint id — names are unique upstream, so a local
+   collision is by definition stale, and without this delete a key
+   replacement (RemoveIdentity + AddIdentity under the same name)
+   livelocks the group's apply forever on the `UNIQUE(name)` constraint.
+   Plain `INSERT OR REPLACE` must **not** be used (its delete-and-reinsert
+   would cascade `group_acl` rows in unrelated groups and reassign
+   `identity.id`). Replica-local identity rows never have `service_admin`
+   set. Identity rows unreferenced by any `group_acl` are garbage-collected
+   at the end of each full resync.
 2. Replace the group's ACL rows wholesale.
-3. Insert missing `group_dek` version rows and the caller's `dek_wrap` rows;
-   delete local wraps absent from the manifest.
-4. Fetch and replace secrets whose `(current_version, dek_version)` differ
-   from the manifest; **any mismatch means replace** — this single rule also
-   handles delete-then-recreate version resets (versions restart at 1).
+3. Insert missing `group_dek` version rows and the caller's `dek_wrap`
+   rows; replace a local wrap whose blob differs from the manifest's
+   (wrap blobs are stable at rest, so a difference means the DEK version
+   was reissued, e.g. after an authoritative restore); delete local wraps
+   absent from the manifest.
+4. Fetch and replace secrets for which **any of `(current_version,
+   dek_version, nonce)` differs** from the manifest. The nonce is the
+   discriminator that makes delete-then-recreate detectable: a recreated
+   secret can land on the same `(version, dek_version)` tuple (versions
+   restart at 1 and deletion does not rotate), but every encryption draws
+   a fresh random nonce. (`created_at` is not a substitute — it has
+   one-second resolution.)
 5. Delete local secrets absent from the manifest.
 
-Groups absent from the manifest (revoked or deleted upstream) are dropped
-locally. Only **current** secret versions are synced in v1; history
-mirroring can be added later without protocol surgery (new fetch variant).
+A fetched `SecretData` referencing a `dek_version` the replica holds no
+wrap for (a rotation raced the fetch) is **not applied**; the replica
+re-runs that group's sync (`FetchGroup` again), which converges once the
+group state settles. Groups absent from the manifest (revoked or deleted
+upstream) are dropped locally — but only on a **completed** full resync
+(`ManifestDone` received), never on a partial stream. Only **current**
+secret versions are synced in v1; history mirroring can be added later
+without protocol surgery (new fetch variant).
 
 ## 5. Replica operation and serving
 
@@ -220,35 +310,57 @@ mirroring can be added later without protocol surgery (new fetch variant).
 - Key material: exactly one — the replica's own iroh endpoint key
   (auto-generated as today). The age identity is derived. No `init`, no
   operational key, no backup key.
-- First start records `meta.role = replica` and
-  `meta.authoritative = <endpoint-id>`. An authoritative `serve` refuses a
-  replica DB and vice versa; `--replica-of` pointing at a different
-  authoritative id than recorded is an error.
-- Operator flow: `key show server` on the replica host → `client
-  add-identity` + grants with read on the authoritative node → start the
-  replica.
+- First start records `meta.role = replica`, `meta.authoritative =
+  <endpoint-id>`, and `meta.replica_endpoint_id = <own endpoint id>`. An
+  authoritative `serve` refuses a replica DB and vice versa (the v2
+  migration and `init` stamp `meta.role = authoritative` on authoritative
+  databases, so the mutual refusal is well-defined for pre-existing DBs);
+  `--replica-of` pointing at a different authoritative id than recorded is
+  an error; starting a replica with an endpoint key that does not match
+  the recorded `replica_endpoint_id` is an error (the mirror's wraps are
+  useless to any other key).
+- Operator flow: `key generate server` (or a first `serve --replica-of`
+  run, which auto-generates it) then `key show server` on the replica
+  host → `client add-identity` + grants with read on the authoritative
+  node → start the replica. One identity key per replica instance:
+  sharing a key across replicas confuses audit attribution and is
+  unsupported.
 
 ### 5.2 Serving
 
 - The replica mounts `secret-bunker/1` and answers read-path requests from
   its mirror: `Get`, `List`, `ListGroups`, `GroupAcl`, `ListIdentityNames` —
-  same authorization code, same uniform `Denied` for strangers, missing
-  permissions, and unsynced groups.
+  with the same uniform `Denied` for strangers, missing permissions, and
+  unsynced groups.
+- **Authorization mechanism.** The explicit-ACL permission check is
+  extracted into a shared function; the service-admin implicit bypass
+  becomes a caller decision. The authoritative handler passes it; the
+  replica handler authorizes **strictly by explicit ACL rows** and never
+  consults `service_admin` (no replica-local identity row has it set —
+  section 4.4). Consequences, all documented: the replica's `ListGroups`
+  reply reports only explicitly granted groups with their explicit perms
+  and always `service_admin: false` (the authoritative `ListGroups` has
+  its own service-admin branch that does not apply here);
+  `ListIdentities`, being service-admin-gated, uniformly yields `Denied`
+  on a replica. `docs/protocol.md`'s note that "service admins see every
+  group, always with the full implicit 7" gets a replica carve-out.
 - `Get` unwraps the DEK with the replica's derived identity and returns
   plaintext. Clients are byte-for-byte oblivious to whether they talk to a
   replica or the authoritative node.
-- **Divergence (documented):** replicas authorize by explicit ACL rows only;
-  the service-admin implicit-read bypass does not apply (only the identity
-  subset referenced by synced ACLs exists locally, and a partial
-  implicit-root rule would be inconsistent).
-- Every mutating request (`Put`, `Delete`, `CreateGroup`, `Grant`,
-  `RotateDek`, `AddIdentity`, `RemoveIdentity`, `SetServiceAdmin`) receives
-  the new additive response variant `ReadOnlyReplica{authoritative:
-  <endpoint-id>}`. This is the **only** change to the client protocol. The
-  CLI prints it and exits with a new dedicated exit code (2 = CAS conflict
-  and 3 = denied are taken; use the next free code); the TUI renders it as a
-  status message. Old clients hit a decode error (generic failure) rather
-  than a misleading `Denied`.
+- **Mutating requests — check order matters.** The replica runs the same
+  identity-resolution-first dispatch as the authoritative node: an
+  **unregistered** peer receives the uniform `Denied` for *every* request,
+  mutations included (it must not learn the node's role or the
+  authoritative id). Only **registered** identities receive the new
+  additive response variant `ReadOnlyReplica{authoritative: <endpoint-id>}`
+  for mutating requests (`Put`, `Delete`, `CreateGroup`, `Grant`,
+  `RotateDek`, `AddIdentity`, `RemoveIdentity`, `SetServiceAdmin`) —
+  registration-gated, mirroring the `ListGroups` precedent that a
+  registered key may learn about its own server. This is the **only**
+  change to the client protocol. The CLI prints it and exits with code
+  **4** (1 = generic error, 2 = CAS conflict, 3 = denied are taken); the
+  TUI renders it as a status message. Old clients hit a decode error
+  (generic failure) rather than a misleading `Denied`.
 - Staleness is absorbed by the existing CAS flow: an edit based on a stale
   replica read hits `VersionConflict` at the authoritative node and
   refreshes.
@@ -288,8 +400,13 @@ Handle surface:
   optional composable piece. An embedder that only materializes secrets
   (e.g. into k8s `Secret` objects) does not mount it.
 
-`serve --replica-of` = `spawn()` + mount `protocol_handler()` + mount the
-sync handler, so the CLI and library paths cannot drift.
+`serve --replica-of` = `spawn()` + mount `protocol_handler()`, so the CLI
+and library paths cannot drift. The replica's sync role is purely
+client-side inside `spawn()` — dialing needs no accept handler, and the
+replica does **not** mount `secret-bunker-sync/1`: an inbound sync
+connection to a replica fails at ALPN negotiation (replica chaining is out
+of scope; it cannot work with the v1 mirror, which holds only the
+replica's own DEK wraps).
 
 Kubernetes consequence worth documenting: an operator pod needs only its own
 endpoint key as a mounted Secret; what it can mirror is enforced
@@ -304,7 +421,13 @@ cluster.
   two wrap columns into `dek_wrap` rows (`'operational'`, `'backup'`).
 - Reader wraps need the operational key, so they are backfilled at
   authoritative `serve` startup (idempotent), not in the SQL migration.
+- The migration also stamps `meta.role = authoritative` so the
+  replica/authoritative mutual-refusal check is defined for existing DBs.
 - No client migration. Old clients work against new servers unchanged.
+- Implementation should land in three phases, each keeping the full test
+  suite green: (1) migration machinery + `dek_wrap` + wrap lifecycle +
+  `agebridge`; (2) sync protocol + replica engine + replica serving;
+  (3) library API surface + CLI (`--replica-of`, exit code 4) + docs.
 
 ## 7. Testing
 
@@ -314,14 +437,26 @@ cluster.
   string.
 - **Store:** v1-fixture migration test; `dek_wrap` accessors; backfill
   idempotence; revoke deletes wraps + auto-rotates in one transaction.
-- **e2e (in-process, existing two-router pattern):** grant → wraps exist for
-  all retained DEK versions; revoke → auto-rotate and a previously-fetched
-  wrapped DEK cannot decrypt post-rotation writes; full replica flow — sync
-  a subset of groups, serve plaintext reads, authoritative down → replica
-  still serves, mutation → `ReadOnlyReplica`, revoke the replica's read →
-  group dropped locally + rotation upstream, delete/recreate propagation,
-  uniform denial on the replica; library API — event-after-commit ordering,
-  `get`, `status`.
+- **e2e (in-process, extending the existing single-Router harness to two
+  nodes):** grant → wraps exist for all retained DEK versions; revoke →
+  auto-rotate and a previously-fetched wrapped DEK cannot decrypt
+  post-rotation writes; full replica flow — sync a subset of groups, serve
+  plaintext reads, authoritative down → replica still serves, mutation →
+  `ReadOnlyReplica` (and, from an **unregistered** peer, plain `Denied`),
+  revoke the replica's read → group dropped locally + rotation upstream,
+  uniform denial on the replica; **delete/recreate ABA** — delete and
+  recreate a version-1 secret under the same DEK while the replica is
+  disconnected (or within one debounce window), then assert the replica
+  serves the new value after resync (this pins the nonce discriminator);
+  a mutation committed **while the initial manifest is streaming**
+  surfaces on the replica without a reconnect (pins
+  subscribe-then-snapshot); a secret at the client protocol's exact
+  maximum size syncs successfully (pins the 8 MiB sync cap invariant);
+  key replacement (RemoveIdentity + AddIdentity reusing the name)
+  converges on the replica (pins apply rule 1's stale-name delete);
+  revoked third-party client still reads from a partitioned replica until
+  it syncs (pins the documented revocation-lag semantics); library API —
+  event-after-commit ordering, `get`, `status`.
 - **CLI:** two-process `serve --replica-of` test reusing the `ServerGuard`
   harness; the new exit code. The existing CLI suite (plaintext stdout
   contract, exit codes 2/3, stdin puts, aliases, `db grant`, audit-verify)
@@ -334,14 +469,22 @@ cluster.
 
 - `design/crypto-design.md`: identities as derived recipients (Thormarker
   citation); `dek_wrap` model; revocation semantics (auto-rotate;
-  already-synced copies cannot be clawed back — explicit non-goal); stolen-
-  database guarantee now includes reader keys in the recipient set; replica
-  trust model (a replica is a reader: compromising it compromises exactly
-  the groups it can read); updated recover flow; k8s guidance (operator pod
-  needs only its endpoint key).
+  already-synced copies cannot be clawed back — explicit non-goal; the
+  existing "loses access immediately via ACL change" threat-model entry is
+  re-scoped to the authoritative node, with replica revocation lag called
+  out); stolen-database guarantee now includes reader keys in the
+  recipient set; sync's metadata-disclosure delta (a read grant reveals
+  the group's full roster — names, endpoint ids, perms — and a stolen
+  replica DB exposes mirrored rosters keylessly); replica trust model (a
+  replica is a reader: compromising it compromises exactly the groups it
+  can read); updated recover flow; k8s guidance (operator pod needs only
+  its endpoint key).
 - `docs/sync-protocol.md`: new, normative — framing, every message,
   versioning-by-ALPN, golden vectors.
-- `docs/protocol.md`: the `ReadOnlyReplica` response variant.
+- `docs/protocol.md`: the `ReadOnlyReplica` response variant (registration-
+  gated), the new exit code 4, and replica carve-outs for the `Groups`
+  response notes (service admins see every group on the authoritative node
+  only; replicas report explicit grants with `service_admin: false`).
 - `README.md`: replica quickstart and a library-embedding example.
 
 ## 9. Explicitly out of scope / unchanged
@@ -357,6 +500,8 @@ cluster.
   sync cursors/oplog, client-side failover across multiple servers
   (`servers.rs` stays 1:1 alias→id; issue #1's model is a local replica per
   node).
+- Replica chaining: a replica does not mount `secret-bunker-sync/1`, and a
+  v1 mirror could not serve it anyway (it holds only its own DEK wraps).
 
 ## 10. Success criteria
 
