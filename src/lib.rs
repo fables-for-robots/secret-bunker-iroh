@@ -1,3 +1,4 @@
+pub mod agebridge;
 pub mod client;
 pub mod crypto;
 pub mod keys;
