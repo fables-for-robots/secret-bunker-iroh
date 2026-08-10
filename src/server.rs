@@ -16,7 +16,10 @@ use zeroize::Zeroize;
 
 use crate::crypto;
 use crate::proto::{self, IdentityInfo, Request, Response};
-use crate::store::{CasOutcome, Identity, PERM_ADMIN, PERM_READ, PERM_WRITE, Store};
+use crate::store::{
+    CasOutcome, Identity, PERM_ADMIN, PERM_READ, PERM_WRITE, RECIPIENT_BACKUP,
+    RECIPIENT_OPERATIONAL, Store,
+};
 
 pub struct Bunker(Arc<Inner>);
 
@@ -226,8 +229,12 @@ impl Bunker {
         group_id: i64,
         version: u64,
     ) -> Result<crypto::Dek> {
-        let wrapped = store.dek(group_id, version)?;
-        crypto::unwrap_dek(&wrapped.wrapped_operational, &inner.op_identity)
+        let wrapped = store
+            .dek_wrap(group_id, version, RECIPIENT_OPERATIONAL)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no operational wrap for group {group_id} DEK v{version}")
+            })?;
+        crypto::unwrap_dek(&wrapped, &inner.op_identity)
     }
 
     fn get(inner: &Inner, store: &Store, ident: &Identity, group: &str, name: &str) -> Response {
@@ -267,10 +274,18 @@ impl Bunker {
         let Some(group_id) = Self::authorize_group(store, ident, group, PERM_WRITE) else {
             return Response::Denied;
         };
-        let Ok(wrapped) = store.current_dek(group_id) else {
+        let Ok(dek_version) = store.current_dek_version(group_id) else {
             return Response::Failed {
                 reason: "internal error".into(),
             };
+        };
+        let wrapped_op = match store.dek_wrap(group_id, dek_version, RECIPIENT_OPERATIONAL) {
+            Ok(Some(w)) => w,
+            _ => {
+                return Response::Failed {
+                    reason: "internal error".into(),
+                };
+            }
         };
         let new_version = match store.secret_version(group_id, name) {
             Ok(v) => v.unwrap_or(0) + 1,
@@ -296,10 +311,10 @@ impl Bunker {
                 current: new_version - 1,
             };
         }
-        let encrypted = crypto::unwrap_dek(&wrapped.wrapped_operational, &inner.op_identity)
+        let encrypted = crypto::unwrap_dek(&wrapped_op, &inner.op_identity)
             .map_err(|e| anyhow::anyhow!(e))
             .and_then(|dek| {
-                let aad = crypto::secret_aad(group, name, target_version, wrapped.version);
+                let aad = crypto::secret_aad(group, name, target_version, dek_version);
                 crypto::encrypt_secret(&dek, &aad, value)
             });
         let (nonce, ciphertext) = match encrypted {
@@ -315,7 +330,7 @@ impl Bunker {
             group_id,
             name,
             expected_version,
-            wrapped.version,
+            dek_version,
             &nonce,
             &ciphertext,
             &ident.name,
@@ -395,13 +410,13 @@ impl Bunker {
         };
         // Every group needs a group admin from the start: the creator,
         // granted in the same transaction that creates the group.
-        if let Err(err) = store.create_group(
-            name,
-            &wrapped_op,
-            &wrapped_backup,
-            ident.id,
-            PERM_READ | PERM_WRITE | PERM_ADMIN,
-        ) {
+        let wraps = vec![
+            (RECIPIENT_OPERATIONAL.to_string(), wrapped_op),
+            (RECIPIENT_BACKUP.to_string(), wrapped_backup),
+        ];
+        if let Err(err) =
+            store.create_group(name, &wraps, ident.id, PERM_READ | PERM_WRITE | PERM_ADMIN)
+        {
             tracing::error!(%err, name, "failed to create group");
             return Response::Failed {
                 reason: "internal error".into(),
@@ -586,15 +601,21 @@ impl Bunker {
         let wrapped = crypto::wrap_dek(&dek, &inner.op_recipient)
             .and_then(|op| crypto::wrap_dek(&dek, &inner.backup_recipient).map(|bk| (op, bk)));
         match wrapped {
-            Ok((op, bk)) => match store.add_dek(group_id, &op, &bk) {
-                Ok(_) => Response::Ok,
-                Err(err) => {
-                    tracing::error!(%err, group, "failed to store rotated DEK");
-                    Response::Failed {
-                        reason: "internal error".into(),
+            Ok((op, bk)) => {
+                let wraps = vec![
+                    (RECIPIENT_OPERATIONAL.to_string(), op),
+                    (RECIPIENT_BACKUP.to_string(), bk),
+                ];
+                match store.add_dek(group_id, &wraps) {
+                    Ok(_) => Response::Ok,
+                    Err(err) => {
+                        tracing::error!(%err, group, "failed to store rotated DEK");
+                        Response::Failed {
+                            reason: "internal error".into(),
+                        }
                     }
                 }
-            },
+            }
             Err(err) => {
                 tracing::error!(%err, group, "failed to wrap rotated DEK");
                 Response::Failed {

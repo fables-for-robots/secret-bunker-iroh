@@ -15,19 +15,17 @@ pub const PERM_READ: u8 = 1;
 pub const PERM_WRITE: u8 = 2;
 pub const PERM_ADMIN: u8 = 4;
 
+/// Well-known `dek_wrap.recipient` values. Reader identities use their
+/// lowercase-hex EndpointId (as stored in `identity.endpoint_id`) instead.
+pub const RECIPIENT_OPERATIONAL: &str = "operational";
+pub const RECIPIENT_BACKUP: &str = "backup";
+
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub id: i64,
     pub endpoint_id: String,
     pub name: String,
     pub service_admin: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct WrappedDek {
-    pub version: u64,
-    pub wrapped_operational: Vec<u8>,
-    pub wrapped_backup: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,12 +71,18 @@ CREATE TABLE IF NOT EXISTS group_acl (
   PRIMARY KEY (identity_id, group_id)
 );
 CREATE TABLE IF NOT EXISTS group_dek (
-  group_id            INTEGER NOT NULL REFERENCES secret_group(id) ON DELETE CASCADE,
-  version             INTEGER NOT NULL,
-  wrapped_operational BLOB NOT NULL,
-  wrapped_backup      BLOB NOT NULL,
-  created_at          INTEGER NOT NULL,
+  group_id   INTEGER NOT NULL REFERENCES secret_group(id) ON DELETE CASCADE,
+  version    INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
   PRIMARY KEY (group_id, version)
+);
+CREATE TABLE IF NOT EXISTS dek_wrap (
+  group_id    INTEGER NOT NULL REFERENCES secret_group(id) ON DELETE CASCADE,
+  dek_version INTEGER NOT NULL,
+  recipient   TEXT NOT NULL,
+  wrapped     BLOB NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY (group_id, dek_version, recipient)
 );
 CREATE TABLE IF NOT EXISTS secret (
   id              INTEGER PRIMARY KEY,
@@ -109,6 +113,70 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 "#;
 
+/// v1 → v2: group_dek's two wrap columns become dek_wrap rows.
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_old_columns: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('group_dek') WHERE name = 'wrapped_operational'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? != 0;
+    if has_old_columns {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            CREATE TABLE dek_wrap (
+              group_id    INTEGER NOT NULL REFERENCES secret_group(id) ON DELETE CASCADE,
+              dek_version INTEGER NOT NULL,
+              recipient   TEXT NOT NULL,
+              wrapped     BLOB NOT NULL,
+              created_at  INTEGER NOT NULL,
+              PRIMARY KEY (group_id, dek_version, recipient)
+            );
+            INSERT INTO dek_wrap SELECT group_id, version, 'operational', wrapped_operational, created_at FROM group_dek;
+            INSERT INTO dek_wrap SELECT group_id, version, 'backup', wrapped_backup, created_at FROM group_dek;
+            CREATE TABLE group_dek_v2 (
+              group_id   INTEGER NOT NULL REFERENCES secret_group(id) ON DELETE CASCADE,
+              version    INTEGER NOT NULL,
+              created_at INTEGER NOT NULL,
+              PRIMARY KEY (group_id, version)
+            );
+            INSERT INTO group_dek_v2 SELECT group_id, version, created_at FROM group_dek;
+            DROP TABLE group_dek;
+            ALTER TABLE group_dek_v2 RENAME TO group_dek;
+            INSERT INTO meta (key, value) VALUES ('schema_version', '2')
+              ON CONFLICT (key) DO UPDATE SET value = '2';
+            COMMIT;
+            "#,
+        )?;
+    }
+    // Stamp the role on any initialized database that predates roles. A
+    // brand-new database (nothing on disk yet, `open`/`open_in_memory`
+    // running before `execute_batch(SCHEMA)` has ever run) has no `meta`
+    // table at all, so guard the lookup instead of querying it directly.
+    let has_meta: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? != 0;
+    if has_meta {
+        let initialized: bool = conn
+            .query_row(
+                "SELECT 1 FROM meta WHERE key = 'operational_pubkey'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if initialized {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('role', 'authoritative') ON CONFLICT (key) DO NOTHING",
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -138,6 +206,11 @@ impl Store {
         let conn = Connection::open(path)
             .with_context(|| format!("opening database {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // The migration rebuilds group_dek, which secret_group and dek_wrap
+        // both reference; SQLite refuses to drop a table other tables
+        // reference unless foreign key enforcement is off for the duration.
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
+        migrate(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Store { conn })
@@ -146,6 +219,8 @@ impl Store {
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
+        migrate(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Store { conn })
@@ -167,7 +242,9 @@ impl Store {
         anyhow::ensure!(!self.is_initialized()?, "database is already initialized");
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO meta (key, value) VALUES ('operational_pubkey', ?1), ('backup_pubkey', ?2), ('schema_version', '1')",
+            "INSERT INTO meta (key, value) VALUES
+               ('operational_pubkey', ?1), ('backup_pubkey', ?2),
+               ('schema_version', '2'), ('role', 'authoritative')",
             params![operational_pubkey, backup_pubkey],
         )?;
         tx.execute(
@@ -282,14 +359,14 @@ impl Store {
             .optional()?)
     }
 
-    /// Creates a group, its first wrapped DEK (version 1), and the
-    /// creator's ACL entry in one transaction, so a group can never exist
+    /// Creates a group, its first wrapped DEK (version 1) with one
+    /// `dek_wrap` row per `(recipient, wrapped)` pair, and the creator's
+    /// ACL entry, all in one transaction, so a group can never exist
     /// without an admin.
     pub fn create_group(
         &mut self,
         name: &str,
-        wrapped_op: &[u8],
-        wrapped_backup: &[u8],
+        wraps: &[(String, Vec<u8>)],
         creator_identity_id: i64,
         creator_perms: u8,
     ) -> Result<()> {
@@ -300,9 +377,15 @@ impl Store {
         )?;
         let group_id = tx.last_insert_rowid();
         tx.execute(
-            "INSERT INTO group_dek (group_id, version, wrapped_operational, wrapped_backup, created_at) VALUES (?1, 1, ?2, ?3, ?4)",
-            params![group_id, wrapped_op, wrapped_backup, now()],
+            "INSERT INTO group_dek (group_id, version, created_at) VALUES (?1, 1, ?2)",
+            params![group_id, now()],
         )?;
+        for (recipient, wrapped) in wraps {
+            tx.execute(
+                "INSERT INTO dek_wrap (group_id, dek_version, recipient, wrapped, created_at) VALUES (?1, 1, ?2, ?3, ?4)",
+                params![group_id, recipient, wrapped, now()],
+            )?;
+        }
         tx.execute(
             "INSERT INTO group_acl (identity_id, group_id, perms) VALUES (?1, ?2, ?3)",
             params![creator_identity_id, group_id, creator_perms as i64],
@@ -389,63 +472,106 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    pub fn current_dek(&self, group_id: i64) -> Result<WrappedDek> {
+    /// The highest DEK version recorded for a group.
+    pub fn current_dek_version(&self, group_id: i64) -> Result<u64> {
         Ok(self.conn.query_row(
-            "SELECT version, wrapped_operational, wrapped_backup FROM group_dek
-             WHERE group_id = ?1 ORDER BY version DESC LIMIT 1",
+            "SELECT MAX(version) FROM group_dek WHERE group_id = ?1",
             [group_id],
-            |r| {
-                Ok(WrappedDek {
-                    version: r.get::<_, i64>(0)? as u64,
-                    wrapped_operational: r.get(1)?,
-                    wrapped_backup: r.get(2)?,
-                })
-            },
-        )?)
+            |r| r.get::<_, i64>(0),
+        )? as u64)
     }
 
-    pub fn dek(&self, group_id: i64, version: u64) -> Result<WrappedDek> {
-        Ok(self.conn.query_row(
-            "SELECT version, wrapped_operational, wrapped_backup FROM group_dek
-             WHERE group_id = ?1 AND version = ?2",
-            params![group_id, version as i64],
-            |r| {
-                Ok(WrappedDek {
-                    version: r.get::<_, i64>(0)? as u64,
-                    wrapped_operational: r.get(1)?,
-                    wrapped_backup: r.get(2)?,
-                })
-            },
-        )?)
+    /// All DEK versions recorded for a group, ascending.
+    pub fn dek_versions(&self, group_id: i64) -> Result<Vec<u64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT version FROM group_dek WHERE group_id = ?1 ORDER BY version")?;
+        let rows = stmt.query_map([group_id], |r| r.get::<_, i64>(0).map(|v| v as u64))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    pub fn add_dek(&self, group_id: i64, wrapped_op: &[u8], wrapped_backup: &[u8]) -> Result<u64> {
-        let next: i64 = self.conn.query_row(
+    /// The wrapped DEK for one `(group, version, recipient)`, or `None` if
+    /// no such wrap has been stored.
+    pub fn dek_wrap(
+        &self,
+        group_id: i64,
+        dek_version: u64,
+        recipient: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT wrapped FROM dek_wrap WHERE group_id = ?1 AND dek_version = ?2 AND recipient = ?3",
+                params![group_id, dek_version as i64, recipient],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records a new DEK version for a group with a full set of recipient
+    /// wraps, in one transaction. Returns the new version number.
+    pub fn add_dek(&mut self, group_id: i64, wraps: &[(String, Vec<u8>)]) -> Result<u64> {
+        let tx = self.conn.transaction()?;
+        let next: i64 = tx.query_row(
             "SELECT COALESCE(MAX(version), 0) + 1 FROM group_dek WHERE group_id = ?1",
             [group_id],
             |r| r.get(0),
         )?;
-        self.conn.execute(
-            "INSERT INTO group_dek (group_id, version, wrapped_operational, wrapped_backup, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![group_id, next, wrapped_op, wrapped_backup, now()],
+        tx.execute(
+            "INSERT INTO group_dek (group_id, version, created_at) VALUES (?1, ?2, ?3)",
+            params![group_id, next, now()],
         )?;
+        for (recipient, wrapped) in wraps {
+            tx.execute(
+                "INSERT INTO dek_wrap (group_id, dek_version, recipient, wrapped, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![group_id, next, recipient, wrapped, now()],
+            )?;
+        }
+        tx.commit()?;
         Ok(next as u64)
     }
 
-    /// All wrapped DEKs across all groups, for offline recovery re-wrapping.
-    pub fn all_deks(&self) -> Result<Vec<(i64, WrappedDek)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT group_id, version, wrapped_operational, wrapped_backup FROM group_dek",
+    /// Upserts a single recipient's wrap for an existing DEK version (e.g.
+    /// adding or refreshing a reader's wrap without touching the others).
+    pub fn add_dek_wrap(
+        &self,
+        group_id: i64,
+        dek_version: u64,
+        recipient: &str,
+        wrapped: &[u8],
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO dek_wrap (group_id, dek_version, recipient, wrapped, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (group_id, dek_version, recipient) DO UPDATE SET wrapped = ?4",
+            params![group_id, dek_version as i64, recipient, wrapped, now()],
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                WrappedDek {
-                    version: r.get::<_, i64>(1)? as u64,
-                    wrapped_operational: r.get(2)?,
-                    wrapped_backup: r.get(3)?,
-                },
-            ))
+        Ok(())
+    }
+
+    /// A recipient's wraps within one group, as `(dek_version, wrapped)`.
+    pub fn wraps_for_recipient(
+        &self,
+        group_id: i64,
+        recipient: &str,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dek_version, wrapped FROM dek_wrap WHERE group_id = ?1 AND recipient = ?2 ORDER BY dek_version",
+        )?;
+        let rows = stmt.query_map(params![group_id, recipient], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// A recipient's wraps across every group, for offline recovery
+    /// re-wrapping. `(group_id, dek_version, wrapped)`.
+    pub fn all_wraps_for_recipient(&self, recipient: &str) -> Result<Vec<(i64, u64, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, dek_version, wrapped FROM dek_wrap WHERE recipient = ?1 ORDER BY group_id, dek_version",
+        )?;
+        let rows = stmt.query_map([recipient], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -462,7 +588,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         for (group_id, version, wrapped_op) in rewrapped {
             let n = tx.execute(
-                "UPDATE group_dek SET wrapped_operational = ?3 WHERE group_id = ?1 AND version = ?2",
+                "UPDATE dek_wrap SET wrapped = ?3 WHERE group_id = ?1 AND dek_version = ?2 AND recipient = 'operational'",
                 params![group_id, *version as i64, wrapped_op],
             )?;
             anyhow::ensure!(n == 1, "no DEK row for group {group_id} version {version}");
@@ -713,8 +839,10 @@ mod tests {
         let admin = s.identity_by_endpoint("endpoint-admin").unwrap().unwrap();
         s.create_group(
             name,
-            b"op",
-            b"bk",
+            &[
+                (RECIPIENT_OPERATIONAL.into(), b"op".to_vec()),
+                (RECIPIENT_BACKUP.into(), b"bk".to_vec()),
+            ],
             admin.id,
             PERM_READ | PERM_WRITE | PERM_ADMIN,
         )
@@ -861,45 +989,137 @@ mod tests {
     }
 
     #[test]
-    fn dek_versioning() {
+    fn dek_wrap_rows_roundtrip() {
         let mut s = store();
         let gid = create_group(&mut s, "g");
-        assert_eq!(s.current_dek(gid).unwrap().version, 1);
-        let v = s.add_dek(gid, b"op2", b"bk2").unwrap();
+        assert_eq!(s.current_dek_version(gid).unwrap(), 1);
+        assert_eq!(s.dek_versions(gid).unwrap(), vec![1]);
+        assert_eq!(
+            s.dek_wrap(gid, 1, RECIPIENT_OPERATIONAL).unwrap().unwrap(),
+            b"op"
+        );
+        assert_eq!(
+            s.dek_wrap(gid, 1, RECIPIENT_BACKUP).unwrap().unwrap(),
+            b"bk"
+        );
+        assert!(s.dek_wrap(gid, 1, "aabbcc").unwrap().is_none());
+        // A reader wrap:
+        s.add_dek_wrap(gid, 1, "aabbcc", b"reader-wrap").unwrap();
+        assert_eq!(
+            s.dek_wrap(gid, 1, "aabbcc").unwrap().unwrap(),
+            b"reader-wrap"
+        );
+        assert_eq!(
+            s.wraps_for_recipient(gid, "aabbcc").unwrap(),
+            vec![(1, b"reader-wrap".to_vec())]
+        );
+        // New DEK version with a full wrap set:
+        let v = s
+            .add_dek(
+                gid,
+                &[
+                    (RECIPIENT_OPERATIONAL.into(), b"op2".to_vec()),
+                    (RECIPIENT_BACKUP.into(), b"bk2".to_vec()),
+                    ("aabbcc".into(), b"reader2".to_vec()),
+                ],
+            )
+            .unwrap();
         assert_eq!(v, 2);
-        assert_eq!(s.current_dek(gid).unwrap().version, 2);
-        // Old DEK still retrievable for historical versions.
-        assert_eq!(s.dek(gid, 1).unwrap().wrapped_operational, b"op");
+        assert_eq!(s.current_dek_version(gid).unwrap(), 2);
+        assert_eq!(
+            s.dek_wrap(gid, 1, RECIPIENT_OPERATIONAL).unwrap().unwrap(),
+            b"op"
+        );
     }
 
     #[test]
-    fn apply_recovery_rewraps_and_records_pubkey_atomically() {
+    fn migration_v1_to_v2_moves_wrap_columns_to_rows() {
+        // Build a real v1 database by hand, then open it through Store.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE identity (id INTEGER PRIMARY KEY, endpoint_id TEXT NOT NULL UNIQUE,
+                  name TEXT NOT NULL UNIQUE, service_admin INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+                CREATE TABLE secret_group (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
+                CREATE TABLE group_acl (identity_id INTEGER NOT NULL REFERENCES identity(id) ON DELETE CASCADE,
+                  group_id INTEGER NOT NULL REFERENCES secret_group(id) ON DELETE CASCADE,
+                  perms INTEGER NOT NULL, PRIMARY KEY (identity_id, group_id));
+                CREATE TABLE group_dek (group_id INTEGER NOT NULL REFERENCES secret_group(id) ON DELETE CASCADE,
+                  version INTEGER NOT NULL, wrapped_operational BLOB NOT NULL, wrapped_backup BLOB NOT NULL,
+                  created_at INTEGER NOT NULL, PRIMARY KEY (group_id, version));
+                CREATE TABLE secret (id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL REFERENCES secret_group(id) ON DELETE CASCADE,
+                  name TEXT NOT NULL, current_version INTEGER NOT NULL, UNIQUE (group_id, name));
+                CREATE TABLE secret_version (secret_id INTEGER NOT NULL REFERENCES secret(id) ON DELETE CASCADE,
+                  version INTEGER NOT NULL, dek_version INTEGER NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL,
+                  created_at INTEGER NOT NULL, created_by TEXT NOT NULL, PRIMARY KEY (secret_id, version));
+                CREATE TABLE audit_log (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                  endpoint_id TEXT NOT NULL, op TEXT NOT NULL, target TEXT NOT NULL, outcome TEXT NOT NULL,
+                  prev_hash BLOB NOT NULL, hash BLOB NOT NULL);
+                INSERT INTO meta VALUES ('operational_pubkey','age1op'),('backup_pubkey','age1bk'),('schema_version','1');
+                INSERT INTO identity (endpoint_id,name,service_admin,created_at) VALUES ('adminid','admin',1,0);
+                INSERT INTO secret_group (name,created_at) VALUES ('g',0);
+                INSERT INTO group_dek VALUES (1,1,x'0102',x'0304',0);
+                INSERT INTO group_dek VALUES (1,2,x'0506',x'0708',0);
+            "#,
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.meta_get("schema_version").unwrap().unwrap(), "2");
+        assert_eq!(s.meta_get("role").unwrap().unwrap(), "authoritative");
+        let gid = s.group_id("g").unwrap().unwrap();
+        assert_eq!(s.dek_versions(gid).unwrap(), vec![1, 2]);
+        assert_eq!(
+            s.dek_wrap(gid, 1, RECIPIENT_OPERATIONAL).unwrap().unwrap(),
+            vec![0x01, 0x02]
+        );
+        assert_eq!(
+            s.dek_wrap(gid, 2, RECIPIENT_BACKUP).unwrap().unwrap(),
+            vec![0x07, 0x08]
+        );
+        // Old columns are gone.
+        let cols: Vec<String> = {
+            let mut stmt = s
+                .conn
+                .prepare("SELECT name FROM pragma_table_info('group_dek')")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert!(!cols.contains(&"wrapped_operational".to_string()));
+        // Reopening is idempotent.
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.dek_versions(s.group_id("g").unwrap().unwrap()).unwrap(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn apply_recovery_updates_operational_wrap_rows() {
         let mut s = store();
         let g1 = create_group(&mut s, "g1");
-        let g2 = create_group(&mut s, "g2");
-        s.apply_recovery(
-            &[(g1, 1, b"new-op-1".to_vec()), (g2, 1, b"new-op-2".to_vec())],
-            "age1new",
-        )
-        .unwrap();
-        assert_eq!(s.dek(g1, 1).unwrap().wrapped_operational, b"new-op-1");
-        assert_eq!(s.dek(g2, 1).unwrap().wrapped_operational, b"new-op-2");
+        s.apply_recovery(&[(g1, 1, b"new-op".to_vec())], "age1new")
+            .unwrap();
+        assert_eq!(
+            s.dek_wrap(g1, 1, RECIPIENT_OPERATIONAL).unwrap().unwrap(),
+            b"new-op"
+        );
+        assert_eq!(s.dek_wrap(g1, 1, RECIPIENT_BACKUP).unwrap().unwrap(), b"bk");
         assert_eq!(
             s.meta_get("operational_pubkey").unwrap().unwrap(),
             "age1new"
         );
-        // A bad row aborts the whole batch: nothing is applied.
         assert!(
-            s.apply_recovery(
-                &[(g1, 1, b"newer".to_vec()), (g2, 99, b"missing".to_vec())],
-                "age1newer",
-            )
-            .is_err()
-        );
-        assert_eq!(s.dek(g1, 1).unwrap().wrapped_operational, b"new-op-1");
-        assert_eq!(
-            s.meta_get("operational_pubkey").unwrap().unwrap(),
-            "age1new"
+            s.apply_recovery(&[(g1, 99, b"x".to_vec())], "age1x")
+                .is_err()
         );
     }
 

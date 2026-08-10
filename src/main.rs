@@ -13,7 +13,9 @@ use secret_bunker_iroh::client::Client;
 use secret_bunker_iroh::keys::KeyRole;
 use secret_bunker_iroh::proto::{Request, Response};
 use secret_bunker_iroh::server::Bunker;
-use secret_bunker_iroh::store::{AuditVerification, PERM_ADMIN, PERM_READ, PERM_WRITE, Store};
+use secret_bunker_iroh::store::{
+    AuditVerification, PERM_ADMIN, PERM_READ, PERM_WRITE, RECIPIENT_BACKUP, Store,
+};
 use secret_bunker_iroh::{crypto, keys};
 use zeroize::Zeroize;
 
@@ -572,15 +574,13 @@ async fn main() -> Result<()> {
             // transaction: a failure part-way must not leave a database
             // that is half old-key, half new-key.
             let mut rewrapped = Vec::new();
-            for (group_id, dek_row) in store.all_deks()? {
-                let dek =
-                    crypto::unwrap_dek(&dek_row.wrapped_backup, &backup).with_context(|| {
-                        format!(
-                            "unwrapping DEK v{} of group {group_id} with backup key",
-                            dek_row.version
-                        )
-                    })?;
-                rewrapped.push((group_id, dek_row.version, crypto::wrap_dek(&dek, &new_op)?));
+            for (group_id, dek_version, wrapped_backup) in
+                store.all_wraps_for_recipient(RECIPIENT_BACKUP)?
+            {
+                let dek = crypto::unwrap_dek(&wrapped_backup, &backup).with_context(|| {
+                    format!("unwrapping DEK v{dek_version} of group {group_id} with backup key")
+                })?;
+                rewrapped.push((group_id, dek_version, crypto::wrap_dek(&dek, &new_op)?));
             }
             let count = rewrapped.len();
             store.apply_recovery(&rewrapped, &new_op.to_string())?;

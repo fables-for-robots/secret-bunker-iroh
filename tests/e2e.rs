@@ -10,7 +10,7 @@ use iroh::{Endpoint, SecretKey};
 use secret_bunker_iroh::client::Client;
 use secret_bunker_iroh::proto::{ALPN, Request, Response};
 use secret_bunker_iroh::server::Bunker;
-use secret_bunker_iroh::store::Store;
+use secret_bunker_iroh::store::{RECIPIENT_BACKUP, Store};
 
 async fn client_endpoint(secret: SecretKey) -> Endpoint {
     Endpoint::builder(presets::Minimal)
@@ -394,11 +394,12 @@ async fn recovery_rewraps_deks() {
     {
         let mut store = Store::open(&db).unwrap();
         let mut rewrapped = Vec::new();
-        for (group_id, dek_row) in store.all_deks().unwrap() {
-            let dek =
-                secret_bunker_iroh::crypto::unwrap_dek(&dek_row.wrapped_backup, &backup).unwrap();
+        for (group_id, dek_version, wrapped_backup) in
+            store.all_wraps_for_recipient(RECIPIENT_BACKUP).unwrap()
+        {
+            let dek = secret_bunker_iroh::crypto::unwrap_dek(&wrapped_backup, &backup).unwrap();
             let wrapped = secret_bunker_iroh::crypto::wrap_dek(&dek, &new_op.to_public()).unwrap();
-            rewrapped.push((group_id, dek_row.version, wrapped));
+            rewrapped.push((group_id, dek_version, wrapped));
         }
         store
             .apply_recovery(&rewrapped, &new_op.to_public().to_string())
