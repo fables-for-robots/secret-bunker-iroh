@@ -82,6 +82,10 @@ enum Cmd {
         /// auto-generating there when missing.
         #[arg(long)]
         operational_key: Option<PathBuf>,
+        /// Run as a read-only replica of this authoritative bunker
+        /// (EndpointId hex or a server alias). No operational key needed.
+        #[arg(long)]
+        replica_of: Option<String>,
         /// Disable relays (direct connections only).
         #[arg(long)]
         no_relay: bool,
@@ -346,6 +350,31 @@ fn resolve_operational_key(explicit: Option<PathBuf>) -> Result<age::x25519::Ide
             Ok(identity)
         }
     }
+}
+
+/// Bind the endpoint a `serve` process listens on, authoritative or
+/// replica alike: n0 presets publish to n0 pkarr/DNS and (unless
+/// `no_relay`) configure relays; hole punching is on by default, so
+/// clients behind NATs can dial the bare EndpointId. mDNS additionally
+/// announces on the local network for internet-free operation.
+async fn bind_serve_endpoint(
+    secret: iroh::SecretKey,
+    no_relay: bool,
+    no_mdns: bool,
+) -> Result<Endpoint> {
+    let mut builder = if no_relay {
+        Endpoint::builder(presets::N0DisableRelay)
+    } else {
+        Endpoint::builder(presets::N0)
+    }
+    .secret_key(secret);
+    if !no_mdns {
+        builder = builder.address_lookup(MdnsAddressLookup::builder());
+    }
+    builder
+        .bind()
+        .await
+        .map_err(|e| anyhow::anyhow!("binding endpoint: {e}"))
 }
 
 fn run_key_cmd(cmd: KeyCmd) -> Result<()> {
@@ -618,9 +647,47 @@ async fn main() -> Result<()> {
             db,
             endpoint_key,
             operational_key,
+            replica_of,
             no_relay,
             no_mdns,
         } => {
+            if let Some(target) = replica_of {
+                anyhow::ensure!(
+                    operational_key.is_none(),
+                    "--operational-key is meaningless with --replica-of"
+                );
+                let authoritative = secret_bunker_iroh::servers::resolve(Some(&target))?;
+                let secret = resolve_endpoint_key(endpoint_key, KeyRole::Server)?;
+                let endpoint = bind_serve_endpoint(secret.clone(), no_relay, no_mdns).await?;
+                eprintln!("replica endpoint id: {}", endpoint.id());
+                for addr in endpoint.bound_sockets() {
+                    eprintln!("bound: {addr}");
+                }
+                let replica = secret_bunker_iroh::replica::Replica::builder()
+                    .store_path(&db)
+                    .secret_key(secret)
+                    .authoritative(authoritative)
+                    .endpoint(endpoint.clone())
+                    .spawn()
+                    .await?;
+                let router = Router::builder(endpoint)
+                    .accept(secret_bunker_iroh::proto::ALPN, replica.protocol_handler())
+                    .spawn();
+                tokio::signal::ctrl_c().await?;
+                eprintln!("shutting down");
+                // `Router::shutdown` closes the endpoint it was built over
+                // (see iroh::protocol::Router::shutdown's docs), and that's
+                // the same endpoint the replica was handed — so
+                // `replica.shutdown()` must not close it again. It won't:
+                // a caller-supplied endpoint leaves the replica's internal
+                // `owned_endpoint` false, so its shutdown skips the close.
+                router
+                    .shutdown()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("router shutdown: {e}"))?;
+                replica.shutdown().await;
+                return Ok(());
+            }
             let secret = resolve_endpoint_key(endpoint_key, KeyRole::Server)?;
             let op = resolve_operational_key(operational_key)?;
             let store = Store::open(&db)?;
@@ -633,23 +700,7 @@ async fn main() -> Result<()> {
             if backfilled > 0 {
                 eprintln!("backfilled {backfilled} reader DEK wrap(s)");
             }
-            // N0 presets publish to n0 pkarr/DNS and (unless --no-relay)
-            // configure relays; hole punching is on by default, so clients
-            // behind NATs can dial the bare EndpointId. mDNS additionally
-            // announces on the local network for internet-free operation.
-            let mut builder = if no_relay {
-                Endpoint::builder(presets::N0DisableRelay)
-            } else {
-                Endpoint::builder(presets::N0)
-            }
-            .secret_key(secret);
-            if !no_mdns {
-                builder = builder.address_lookup(MdnsAddressLookup::builder());
-            }
-            let endpoint = builder
-                .bind()
-                .await
-                .map_err(|e| anyhow::anyhow!("binding endpoint: {e}"))?;
+            let endpoint = bind_serve_endpoint(secret, no_relay, no_mdns).await?;
             eprintln!("bunker endpoint id: {}", endpoint.id());
             for addr in endpoint.bound_sockets() {
                 eprintln!("bound: {addr}");

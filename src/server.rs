@@ -62,6 +62,10 @@ impl Bunker {
     /// Opens the bunker over an initialized store. Verifies that the
     /// supplied operational identity matches the pubkey recorded at init.
     pub fn new(store: Store, op_identity: age::x25519::Identity) -> Result<Self> {
+        anyhow::ensure!(
+            store.meta_get("role")?.as_deref() != Some("replica"),
+            "this database is a replica (serve it with --replica-of)"
+        );
         let recorded = store
             .meta_get("operational_pubkey")?
             .ok_or_else(|| anyhow::anyhow!("database is not initialized (run `init` first)"))?;
@@ -988,6 +992,10 @@ pub(crate) fn audit_outcome(response: &Response) -> &'static str {
         Response::Denied => "denied",
         Response::VersionConflict { .. } => "conflict",
         Response::Failed { .. } => "failed",
+        // The authoritative Bunker never constructs this variant (only
+        // ReplicaServer does); the arm exists so the replica's audit rows
+        // say "readonly" instead of the misleading "ok".
+        Response::ReadOnlyReplica { .. } => "readonly",
         _ => "ok",
     }
 }
@@ -1988,6 +1996,29 @@ mod tests {
             matches!(verified, AuditVerification::Valid { entries: 1, .. }),
             "expected one audit entry for the malformed frame, got {verified:?}"
         );
+    }
+
+    /// A database stamped as a replica mirror must never be served
+    /// authoritatively — that path skips the sync/ACL machinery entirely
+    /// and would let a caller with the right operational key write
+    /// straight into what should be a read-only mirror.
+    #[test]
+    fn new_refuses_a_replica_database() {
+        let mut store = Store::open_in_memory().unwrap();
+        let op = age::x25519::Identity::generate();
+        let backup = age::x25519::Identity::generate();
+        let admin_id = iroh::SecretKey::generate().public().to_string();
+        store
+            .init(
+                &op.to_public().to_string(),
+                &backup.to_public().to_string(),
+                &admin_id,
+                "admin",
+            )
+            .unwrap();
+        store.meta_set("role", "replica").unwrap();
+        let err = Bunker::new(store, op).unwrap_err().to_string();
+        assert!(err.contains("--replica-of"), "unhelpful error: {err}");
     }
 
     /// Grant of read wraps every retained DEK version to the grantee's
