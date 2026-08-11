@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-use crate::sync::{FetchedSecret, GroupSyncState};
+use crate::sync::{AclEntry, FetchedSecret, GroupSyncState};
 
 pub const PERM_READ: u8 = 1;
 pub const PERM_WRITE: u8 = 2;
@@ -932,6 +932,36 @@ impl Store {
         Ok(names)
     }
 
+    /// `acl` with every name and endpoint-id collision resolved in favour
+    /// of the last entry holding it — the list rules 1 and 2 actually
+    /// apply.
+    ///
+    /// An authoritative node cannot emit a collision (both columns are
+    /// UNIQUE upstream), but a malformed or hostile state must fail safe.
+    /// Applied naively, two entries sharing a name wedge the group
+    /// permanently: the second entry's stale-name delete (rule 1) removes
+    /// the row the first just upserted, so rule 2's lookup for the first
+    /// entry finds nothing, the whole apply rolls back — and every retry
+    /// rolls back identically, since the input never changes. Collapsing
+    /// the duplicates first makes the apply converge on the last entry,
+    /// which is what rule 1's delete already effectively picks.
+    fn effective_acl(acl: &[AclEntry]) -> Vec<&AclEntry> {
+        let mut names = BTreeSet::new();
+        let mut endpoints = BTreeSet::new();
+        // Last-wins, so scan backwards and keep the first sighting of each
+        // key; `&&` short-circuits deliberately — an entry dropped for a
+        // duplicate name must not also reserve its endpoint id.
+        let mut kept: Vec<&AclEntry> = acl
+            .iter()
+            .rev()
+            .filter(|e| {
+                names.insert(e.identity_name.as_str()) && endpoints.insert(e.endpoint_id.as_str())
+            })
+            .collect();
+        kept.reverse();
+        kept
+    }
+
     /// Converge the local mirror of one group onto `state` in ONE
     /// transaction — a replica reader never observes a half-applied group.
     /// Implements spec 4.4 rules 1–5 in dependency order and returns the
@@ -967,9 +997,13 @@ impl Store {
             |r| r.get(0),
         )?;
 
+        // Rules 1 and 2 both walk the ACL, and both must walk the *same*
+        // collision-free list (see `effective_acl`).
+        let acl = Self::effective_acl(&state.acl);
+
         // Rule 1: identity rows referenced by the ACL, keyed by endpoint
         // id, taking the authoritative node's names.
-        for entry in &state.acl {
+        for entry in &acl {
             // Names are unique upstream, so a local row holding this name
             // under a *different* endpoint id is by definition stale — a
             // key replacement (RemoveIdentity + AddIdentity under the same
@@ -996,14 +1030,15 @@ impl Store {
 
         // Rule 2: the ACL, wholesale.
         tx.execute("DELETE FROM group_acl WHERE group_id = ?1", [group_id])?;
-        for entry in &state.acl {
+        for entry in &acl {
             let identity_id: i64 = tx.query_row(
                 "SELECT id FROM identity WHERE endpoint_id = ?1",
                 [&entry.endpoint_id],
                 |r| r.get(0),
             )?;
-            // ON CONFLICT: a state repeating one endpoint id must not
-            // wedge this group's apply forever on the primary key.
+            // ON CONFLICT is belt and braces: `effective_acl` has already
+            // collapsed any repeated endpoint id, so no two entries here
+            // can resolve to the same identity row.
             tx.execute(
                 "INSERT INTO group_acl (identity_id, group_id, perms) VALUES (?1, ?2, ?3)
                  ON CONFLICT (identity_id, group_id) DO UPDATE SET perms = excluded.perms",
@@ -2329,6 +2364,54 @@ mod tests {
         );
     }
 
+    /// A malformed state — one identity name under two endpoint ids —
+    /// must converge, not wedge the group. Iterating rule 1 naively, the
+    /// second entry's stale-name delete erases the row the first entry
+    /// just upserted, and rule 2's lookup for that first entry then finds
+    /// nothing: the apply rolls back, and every identical retry rolls back
+    /// again. An authoritative node never emits such a state; a
+    /// misbehaving or malicious one must not be able to freeze a group.
+    #[test]
+    fn duplicate_acl_entries_converge_on_the_last_one() {
+        let mut s = replica();
+        let state = sync_state(
+            "g",
+            vec![
+                ("alice", "eid1", PERM_READ),
+                ("alice", "eid2", PERM_READ | PERM_WRITE),
+            ],
+            vec![(1, b"w")],
+            vec![],
+        );
+        s.apply_group_sync("myid", &state, &[]).unwrap();
+        let gid = s.group_id("g").unwrap().unwrap();
+        let alice = s.identity_by_name("alice").unwrap().unwrap();
+        assert_eq!(alice.endpoint_id, "eid2");
+        assert!(s.identity_by_endpoint("eid1").unwrap().is_none());
+        assert_eq!(
+            s.group_acl_entries(gid).unwrap(),
+            vec![("alice".to_string(), PERM_READ | PERM_WRITE)]
+        );
+        // And it stays converged: a retry is a no-op, not another rollback.
+        assert!(s.apply_group_sync("myid", &state, &[]).unwrap().is_empty());
+        assert_eq!(s.identity_by_name("alice").unwrap().unwrap().id, alice.id);
+
+        // The mirror image — one endpoint id under two names — converges
+        // on the last entry too.
+        let two_names = sync_state(
+            "g",
+            vec![("bob", "eid2", PERM_READ), ("carol", "eid2", PERM_ADMIN)],
+            vec![(1, b"w")],
+            vec![],
+        );
+        s.apply_group_sync("myid", &two_names, &[]).unwrap();
+        assert_eq!(
+            s.group_acl_entries(gid).unwrap(),
+            vec![("carol".to_string(), PERM_ADMIN)]
+        );
+        assert!(s.identity_by_name("bob").unwrap().is_none());
+    }
+
     /// service_admin never set locally even if upstream lies; ACL replaced
     /// wholesale.
     #[test]
@@ -2469,5 +2552,85 @@ mod tests {
         // Dropping a group that is not mirrored locally is not an error.
         assert!(!s.drop_group_local("g").unwrap());
         assert_eq!(s.replica_group_names().unwrap(), Vec::<String>::new());
+    }
+
+    /// One transaction per group, proven by fault injection: no legal
+    /// input can fail mid-apply (every statement is an upsert or a
+    /// delete), so the failure is manufactured with a trigger that aborts
+    /// the `secret_version` insert of rule 4 — after rules 1-3 have
+    /// already written. None of their writes may survive.
+    #[test]
+    fn a_failed_apply_rolls_the_whole_group_back() {
+        let mut s = replica();
+        let st1 = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w1")],
+            vec![("tok", 1, 1, b"n1"), ("old", 1, 1, b"n2")],
+        );
+        s.apply_group_sync(
+            "myid",
+            &st1,
+            &[
+                fetched_secret("tok", 1, 1, b"n1", b"c1"),
+                fetched_secret("old", 1, 1, b"n2", b"c2"),
+            ],
+        )
+        .unwrap();
+        let gid = s.group_id("g").unwrap().unwrap();
+        let alice = s.identity_by_name("alice").unwrap().unwrap();
+
+        s.conn
+            .execute_batch(
+                "CREATE TRIGGER injected BEFORE INSERT ON secret_version
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        // Touches every rule: new ACL member, new DEK version and wrap,
+        // a new secret version, and a secret dropped from the listing.
+        let st2 = sync_state(
+            "g",
+            vec![
+                ("alice", "eidalice", PERM_READ | PERM_WRITE),
+                ("bob", "eidbob", PERM_READ),
+            ],
+            vec![(2, b"w2")],
+            vec![("tok", 2, 2, b"n3")],
+        );
+        assert!(
+            s.apply_group_sync("myid", &st2, &[fetched_secret("tok", 2, 2, b"n3", b"c3")])
+                .is_err()
+        );
+
+        assert_eq!(
+            s.group_acl_entries(gid).unwrap(),
+            vec![("alice".to_string(), PERM_READ)]
+        );
+        assert_eq!(s.perms(alice.id, gid).unwrap(), PERM_READ);
+        assert!(s.identity_by_name("bob").unwrap().is_none());
+        assert_eq!(s.dek_versions(gid).unwrap(), vec![1]);
+        assert_eq!(s.dek_wrap(gid, 1, "myid").unwrap().unwrap(), b"w1");
+        assert!(s.dek_wrap(gid, 2, "myid").unwrap().is_none());
+        let cur = s.secret_current(gid, "tok").unwrap().unwrap();
+        assert_eq!((cur.version, cur.ciphertext), (1, b"c1".to_vec()));
+        assert!(s.secret_current(gid, "old").unwrap().is_some());
+
+        // With the fault gone the very same state applies cleanly.
+        s.conn.execute_batch("DROP TRIGGER injected").unwrap();
+        let changes = s
+            .apply_group_sync("myid", &st2, &[fetched_secret("tok", 2, 2, b"n3", b"c3")])
+            .unwrap();
+        assert_eq!(
+            changes,
+            vec![
+                AppliedChange::SecretChanged {
+                    name: "tok".into(),
+                    version: 2
+                },
+                AppliedChange::SecretDeleted { name: "old".into() },
+            ]
+        );
+        assert_eq!(s.dek_wrap(gid, 2, "myid").unwrap().unwrap(), b"w2");
+        assert!(s.identity_by_name("bob").unwrap().is_some());
     }
 }
