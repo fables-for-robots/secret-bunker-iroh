@@ -303,7 +303,11 @@ a later server may split them without a protocol break. Until it does, a
 tens of thousands of rows — is not truncated or partially sent: framing
 fails before a byte leaves, the stream dies, and the replica falls into the
 reconnect loop, where it fails identically. Splitting `Group` is the fix
-should such a group ever exist.
+should such a group ever exist. The `GroupSecrets` chunking above is
+row-count-based (1000 `SecretEntry` rows), not byte-budgeted, so it is
+subject to the same failure mode if secret names are pathologically
+long enough to push a single chunk over the frame cap; byte-budgeted
+chunking is the fix for both cases.
 
 **Push events, debounced.** After `ManifestDone` the server forwards
 mutations as they commit. Events are batched: the first event opens a

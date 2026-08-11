@@ -107,8 +107,11 @@ becomes the DEK-version registry. New table:
 group_dek(group_id, version, created_at, PK(group_id, version))
 dek_wrap(group_id, dek_version, recipient TEXT, wrapped BLOB, created_at,
          PK(group_id, dek_version, recipient),
-         FK(group_id, dek_version) REFERENCES group_dek ON DELETE CASCADE)
+         FK(group_id) REFERENCES secret_group(id) ON DELETE CASCADE)
 ```
+
+FK to `secret_group`: equivalent cascade, simpler migration; no code path
+deletes individual `group_dek` rows.
 
 `recipient` is `'operational'`, `'backup'`, or a reader's EndpointId
 (lowercase hex, same encoding as `identity.endpoint_id`). Reader wrap rows
