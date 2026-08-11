@@ -92,8 +92,11 @@ async fn main() -> anyhow::Result<()> {
         metrics.clone(),
     );
 
-    // Replica gauges: connected / last-sync / group count.
-    {
+    // Replica gauges: connected / last-sync / group count. The handle is kept
+    // (not discarded) so shutdown can abort this otherwise-infinite loop and
+    // await its Arc<Replica> clone actually being dropped — without that,
+    // Arc::try_unwrap(replica) below would never succeed.
+    let gauge_task = {
         let replica = replica.clone();
         let metrics = metrics.clone();
         tokio::spawn(async move {
@@ -109,8 +112,8 @@ async fn main() -> anyhow::Result<()> {
                     metrics.last_sync_ts.set(d.as_secs() as i64);
                 }
             }
-        });
-    }
+        })
+    };
 
     let state = Arc::new(AppState {
         metrics: metrics.clone(),
@@ -157,7 +160,27 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     tracing::info!("controller stopped; shutting down replica");
+
+    // Abort and await both background tasks so their Arc<Replica> clones
+    // (gauge_task's `replica`, http's `AppState.replica` via `router(state)`)
+    // are actually dropped before the try_unwrap below — abort() alone only
+    // requests cancellation, it doesn't guarantee the task's captured state
+    // has been released yet.
+    gauge_task.abort();
+    if let Err(e) = gauge_task.await
+        && !e.is_cancelled()
+    {
+        tracing::warn!(error = %e, "gauge ticker task panicked");
+    }
+
     http.abort();
+    match http.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "http server task exited with an error"),
+        Err(e) if e.is_cancelled() => {}
+        Err(e) => tracing::warn!(error = %e, "http server task panicked"),
+    }
+
     drop(ctx); // release the Context's Arc<Replica> holders
     match Arc::try_unwrap(replica) {
         Ok(r) => r.shutdown().await,
