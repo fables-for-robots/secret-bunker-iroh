@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -43,3 +44,29 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  e2e-kind:
+    # Manual-only heavyweight smoke test: run from the Actions tab.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Build operator container image
+        run: nix build .#operator-image
+
+      - uses: helm/kind-action@v1
+
+      - name: Load operator image into kind
+        run: |
+          docker load < result
+          kind load docker-image secret-bunker-operator:latest --name chart-testing
+
+      - name: Deploy CRD + operator
+        run: |
+          kubectl create secret generic secret-bunker-operator-identity \
+            --namespace default --from-literal=identity.key=placeholder || true
+          kubectl apply -f operator/deploy/crd.yaml
+          kubectl get crd bunkersecrets.bunker.fables-for-robots.ch
