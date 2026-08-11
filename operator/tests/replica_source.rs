@@ -69,25 +69,21 @@ async fn spawn_replica_loads_key_from_explicit_path() {
         "in-process bunker must expose an IP transport addr"
     );
 
+    let key = secret_bunker_iroh::keys::load_endpoint_key(&key_file).unwrap();
     let replica = spawn_replica(
         &bunker.addr.id.to_string(),
         &addrs,
-        &key_file,
+        key,
         &dir.path().join("mirror.sqlite"),
     )
     .await
     .unwrap();
     let got = common::await_mirrored(&replica, "g", "s").await;
     assert_eq!(got, b"v".to_vec());
-    // Missing key file must be a hard error (never auto-generate an identity).
-    let err = spawn_replica(
-        &bunker.addr.id.to_string(),
-        &addrs,
-        &dir.path().join("missing.key"),
-        &dir.path().join("mirror2.sqlite"),
-    )
-    .await
-    .unwrap_err();
+    // A missing key file is still a hard error at load time — file mode
+    // never auto-generates an identity.
+    let err =
+        secret_bunker_iroh::keys::load_endpoint_key(&dir.path().join("missing.key")).unwrap_err();
     assert!(err.to_string().contains("reading endpoint key"), "{err}");
 }
 
