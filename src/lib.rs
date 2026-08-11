@@ -6,4 +6,5 @@ pub mod proto;
 pub mod server;
 pub mod servers;
 pub mod store;
+pub mod sync;
 pub mod tui;
