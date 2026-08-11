@@ -208,6 +208,35 @@ mod tests {
         }
     }
 
+    /// One `AclEntry` and one `DekEntry`, the two struct types nested
+    /// inside a `Group` message that had no byte-level pin of their own.
+    fn golden_group() -> SyncMessage {
+        SyncMessage::Group {
+            name: "g".into(),
+            acl: vec![AclEntry {
+                identity_name: "a".into(),
+                endpoint_id: "e".into(),
+                perms: 1,
+            }],
+            deks: vec![DekEntry {
+                version: 1,
+                wrapped: vec![0xAB],
+            }],
+        }
+    }
+
+    fn golden_secret_data() -> SyncMessage {
+        SyncMessage::SecretData {
+            name: "n".into(),
+            version: 1,
+            dek_version: 1,
+            nonce: vec![0x01],
+            ciphertext: vec![0x02],
+            created_at: 5,
+            created_by: "c".into(),
+        }
+    }
+
     /// CBOR golden vectors pinning the sync wire format. A failure here
     /// means the format changed and every non-Rust implementation breaks.
     /// Self-contained for now: unlike `proto`'s vectors these have no
@@ -232,6 +261,14 @@ mod tests {
             (
                 proto::encode(&golden_group_secrets()).unwrap(),
                 "a16c47726f757053656372657473a26567726f75706167677365637265747381a4646e616d65616e6f63757272656e745f76657273696f6e016b64656b5f76657273696f6e02656e6f6e636543090909",
+            ),
+            (
+                proto::encode(&golden_group()).unwrap(),
+                "a16547726f7570a3646e616d6561676361636c81a36d6964656e746974795f6e616d6561616b656e64706f696e745f69646165657065726d73016464656b7381a26776657273696f6e01677772617070656441ab",
+            ),
+            (
+                proto::encode(&golden_secret_data()).unwrap(),
+                "a16a53656372657444617461a7646e616d65616e6776657273696f6e016b64656b5f76657273696f6e01656e6f6e636541016a6369706865727465787441026a637265617465645f6174056a637265617465645f62796163",
             ),
         ];
         for (bytes, expected) in cases {

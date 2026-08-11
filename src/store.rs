@@ -193,6 +193,21 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Every store — fresh, migrated, or a never-`init`ed replica mirror —
+/// ends up on schema v2 by the time `SCHEMA` has run. `migrate()` only
+/// stamps the row when it detects a v1 database to upgrade, and `init()`
+/// only stamps it for an authoritative node; a replica's local mirror
+/// never calls either, so without this it would have no `schema_version`
+/// row at all. `ON CONFLICT DO NOTHING` makes this a no-op wherever
+/// `migrate`/`init` already stamped it.
+fn stamp_schema_version(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', '2') ON CONFLICT (key) DO NOTHING",
+        [],
+    )?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -225,6 +240,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        stamp_schema_version(&conn)?;
         Ok(Store { conn })
     }
 
@@ -234,6 +250,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        stamp_schema_version(&conn)?;
         Ok(Store { conn })
     }
 
@@ -2115,6 +2132,9 @@ mod tests {
     #[test]
     fn apply_group_sync_creates_and_updates() {
         let mut s = Store::open_in_memory().unwrap(); // replica stores are never `init`ed
+        // A fresh replica mirror never runs `migrate`'s upgrade path or
+        // `init`'s stamp, yet still needs a schema_version row.
+        assert_eq!(s.meta_get("schema_version").unwrap().unwrap(), "2");
         let state = sync_state(
             "g",
             vec![("alice", "eidalice", 1)],

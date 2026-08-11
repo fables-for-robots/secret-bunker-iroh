@@ -16,6 +16,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use bech32::{ToBase32, Variant};
+use zeroize::Zeroize;
 
 /// Anyone can compute this from a public EndpointId.
 pub fn recipient_for_endpoint(id: &iroh::EndpointId) -> Result<age::x25519::Recipient> {
@@ -37,12 +38,20 @@ pub fn identity_from_secret(secret: &iroh::SecretKey) -> Result<age::x25519::Ide
     let signing = ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes());
     // The SHA-512-expanded scalar half; dalek documents it as the valid
     // X25519 StaticSecret for the converted public key (x25519 clamps
-    // during ECDH).
-    let scalar = signing.to_scalar_bytes();
-    let encoded = bech32::encode("age-secret-key-", scalar.to_base32(), Variant::Bech32)
-        .context("bech32-encoding derived identity")?
-        .to_uppercase();
-    age::x25519::Identity::from_str(&encoded).map_err(|e| anyhow::anyhow!("{e}"))
+    // during ECDH). Full age secret material — scrubbed once it has been
+    // encoded/parsed into the types below.
+    let mut scalar = signing.to_scalar_bytes();
+    let lower = bech32::encode("age-secret-key-", scalar.to_base32(), Variant::Bech32)
+        .context("bech32-encoding derived identity");
+    scalar.zeroize();
+    let mut lower = lower?;
+    // `to_uppercase()` allocates a second String holding the same secret
+    // material; both copies get scrubbed.
+    let mut upper = lower.to_uppercase();
+    lower.zeroize();
+    let identity = age::x25519::Identity::from_str(&upper).map_err(|e| anyhow::anyhow!("{e}"));
+    upper.zeroize();
+    identity
 }
 
 #[cfg(test)]
