@@ -710,6 +710,9 @@ impl App {
             }
             Response::Denied => "denied".into(),
             Response::Failed { reason } => format!("failed: {reason}"),
+            Response::ReadOnlyReplica { authoritative } => {
+                format!("read-only replica — write to {authoritative}")
+            }
             _ => return,
         };
     }

@@ -933,6 +933,10 @@ async fn main() -> Result<()> {
                     eprintln!("failed: {reason}");
                     std::process::exit(1);
                 }
+                Response::ReadOnlyReplica { authoritative } => {
+                    eprintln!("read-only replica; write to {authoritative}");
+                    std::process::exit(4);
+                }
             }
         }
     }
