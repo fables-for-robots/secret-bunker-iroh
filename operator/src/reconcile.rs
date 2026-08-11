@@ -423,8 +423,29 @@ async fn cleanup_target(secrets: &Api<Secret>, cr: &BunkerSecret, name: &str) ->
     Ok(())
 }
 
-/// The Cleanup arm of the finalizer — implemented in Task 9.
+/// The Cleanup arm of the finalizer: runs when the CR is being deleted.
+/// Delete policy: nothing to do — the ownerReference lets GC cascade.
+/// Retain policy: orphan the Secret by clearing its ownerReferences.
 pub async fn cleanup_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<Action, Error> {
-    let _ = (cr, ctx);
+    let ns = cr.namespace().unwrap_or_default();
+    ctx.metrics
+        .ready
+        .with_label_values(&[&ns, &cr.name_any()])
+        .set(0);
+    if cr.spec.deletion_policy == DeletionPolicy::Retain {
+        let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
+        let target = cr.target_name();
+        match secrets.get(&target).await {
+            Ok(existing) if owned_by(&existing, cr) => {
+                let patch = json!({"metadata": {"ownerReferences": null}});
+                secrets
+                    .patch(&target, &PatchParams::default(), &Patch::Merge(&patch))
+                    .await?;
+            }
+            Ok(_) => {}                                       // not ours — leave it
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {} // already gone
+            Err(e) => return Err(e.into()),
+        }
+    }
     Ok(Action::await_change())
 }
