@@ -655,7 +655,8 @@ async fn main() -> Result<()> {
                 eprintln!("bound: {addr}");
             }
             let router = Router::builder(endpoint)
-                .accept(secret_bunker_iroh::proto::ALPN, bunker)
+                .accept(secret_bunker_iroh::proto::ALPN, bunker.clone())
+                .accept(secret_bunker_iroh::sync::SYNC_ALPN, bunker.sync_handler())
                 .spawn();
             if !no_relay {
                 // Wait until at least one relay handshake completes, so the

@@ -33,6 +33,14 @@ pub struct Identity {
 /// DEK version that replaces the old one.
 pub type GroupRotation = (i64, String, Vec<(String, Vec<u8>)>);
 
+/// One row of a group's sync manifest listing:
+/// `(name, current_version, dek_version, nonce)`.
+pub type SecretEntryRow = (String, u64, u64, Vec<u8>);
+
+/// The full current-version row of one secret, as a sync fetch ships it:
+/// `(version, dek_version, nonce, ciphertext, created_at, created_by)`.
+pub type SecretDataRow = (u64, u64, Vec<u8>, Vec<u8>, i64, String);
+
 #[derive(Debug, Clone)]
 pub struct SecretVersion {
     pub version: u64,
@@ -802,6 +810,92 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    // ---- sync manifest queries ----
+
+    /// Groups where the identity holds an EXPLICIT read bit, as
+    /// `(group_id, group_name)` ordered by name. This is the whole sync
+    /// scope: the service-admin implicit read deliberately does not count
+    /// (sync only ever ships wraps addressed to the caller, and implicit
+    /// readers have none).
+    pub fn read_scope(&self, identity_id: i64) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.name FROM secret_group g
+             JOIN group_acl a ON a.group_id = g.id
+             WHERE a.identity_id = ?1 AND (a.perms & ?2) != 0 ORDER BY g.name",
+        )?;
+        let rows = stmt.query_map(params![identity_id, PERM_READ as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The full ACL of a group as `(identity_name, endpoint_id, perms)`
+    /// ordered by identity name — what a replica needs to enforce the ACL
+    /// itself.
+    pub fn acl_entries_full(&self, group_id: i64) -> Result<Vec<(String, String, u8)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.name, i.endpoint_id, a.perms FROM group_acl a
+             JOIN identity i ON i.id = a.identity_id
+             WHERE a.group_id = ?1 ORDER BY i.name",
+        )?;
+        let rows = stmt.query_map([group_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? as u8,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The current version of every secret in a group, as
+    /// `(name, current_version, dek_version, nonce)` ordered by name —
+    /// the manifest listing (no ciphertext).
+    pub fn secret_entries(&self, group_id: i64) -> Result<Vec<SecretEntryRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.name, s.current_version, sv.dek_version, sv.nonce
+             FROM secret s JOIN secret_version sv
+               ON sv.secret_id = s.id AND sv.version = s.current_version
+             WHERE s.group_id = ?1 ORDER BY s.name",
+        )?;
+        let rows = stmt.query_map([group_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+                r.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The full current-version row of one secret, as `(version,
+    /// dek_version, nonce, ciphertext, created_at, created_by)` — what a
+    /// sync fetch ships (still ciphertext; sync never decrypts).
+    pub fn secret_data_current(&self, group_id: i64, name: &str) -> Result<Option<SecretDataRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sv.version, sv.dek_version, sv.nonce, sv.ciphertext,
+                        sv.created_at, sv.created_by
+                 FROM secret s JOIN secret_version sv
+                   ON sv.secret_id = s.id AND sv.version = s.current_version
+                 WHERE s.group_id = ?1 AND s.name = ?2",
+                params![group_id, name],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, Vec<u8>>(2)?,
+                        r.get::<_, Vec<u8>>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
     // ---- secrets ----
 
     pub fn secret_current(&self, group_id: i64, name: &str) -> Result<Option<SecretVersion>> {
@@ -1136,6 +1230,60 @@ mod tests {
         s.set_perms(alice.id, gid, PERM_READ).unwrap();
         assert!(s.remove_identity("alice").unwrap());
         assert!(s.identity_by_endpoint("endpoint-alice").unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_manifest_queries_reflect_explicit_read_and_current_versions() {
+        let mut s = store();
+        let gid = create_group(&mut s, "g");
+        let gid2 = create_group(&mut s, "h");
+        s.add_identity("alice", "endpoint-alice", false).unwrap();
+        let admin = s.identity_by_endpoint("endpoint-admin").unwrap().unwrap();
+        let alice = s.identity_by_name("alice").unwrap().unwrap();
+        s.set_perms(alice.id, gid, PERM_READ | PERM_WRITE).unwrap();
+        // read_scope: only groups with the explicit read bit, by name.
+        assert_eq!(
+            s.read_scope(admin.id).unwrap(),
+            vec![(gid, "g".into()), (gid2, "h".into())]
+        );
+        assert_eq!(s.read_scope(alice.id).unwrap(), vec![(gid, "g".into())]);
+        s.set_perms(alice.id, gid, PERM_WRITE).unwrap();
+        assert_eq!(s.read_scope(alice.id).unwrap(), vec![]);
+        // acl_entries_full: every row, read bit or not, ordered by name.
+        assert_eq!(
+            s.acl_entries_full(gid).unwrap(),
+            vec![
+                (
+                    "admin".into(),
+                    "endpoint-admin".into(),
+                    PERM_READ | PERM_WRITE | PERM_ADMIN
+                ),
+                ("alice".into(), "endpoint-alice".into(), PERM_WRITE),
+            ]
+        );
+        // secret_entries: the current version of each secret, by name.
+        s.put_secret(gid, "b", 0, 1, b"nb", b"cb", "admin").unwrap();
+        s.put_secret(gid, "a", 0, 1, b"na1", b"ca1", "admin")
+            .unwrap();
+        s.put_secret(gid, "a", 1, 1, b"na2", b"ca2", "admin")
+            .unwrap();
+        assert_eq!(
+            s.secret_entries(gid).unwrap(),
+            vec![
+                ("a".into(), 2, 1, b"na2".to_vec()),
+                ("b".into(), 1, 1, b"nb".to_vec()),
+            ]
+        );
+        assert_eq!(s.secret_entries(gid2).unwrap(), vec![]);
+        // secret_data_current: the full current row, None when missing.
+        let (version, dek_version, nonce, ciphertext, created_at, created_by) =
+            s.secret_data_current(gid, "a").unwrap().unwrap();
+        assert_eq!((version, dek_version), (2, 1));
+        assert_eq!(nonce, b"na2");
+        assert_eq!(ciphertext, b"ca2");
+        assert!(created_at > 0);
+        assert_eq!(created_by, "admin");
+        assert!(s.secret_data_current(gid, "nope").unwrap().is_none());
     }
 
     #[test]

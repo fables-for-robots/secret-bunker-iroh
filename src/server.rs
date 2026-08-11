@@ -6,12 +6,15 @@
 //! missing permission, and nonexistent target are indistinguishable
 //! (`Response::Denied`). See design/crypto-design.md sections 5 and 7.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use anyhow::Result;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler};
+use tokio::sync::broadcast;
 use zeroize::Zeroize;
 
 use crate::crypto;
@@ -20,6 +23,7 @@ use crate::store::{
     CasOutcome, Identity, PERM_ADMIN, PERM_READ, PERM_WRITE, RECIPIENT_BACKUP,
     RECIPIENT_OPERATIONAL, Store,
 };
+use crate::sync::{self, SyncMessage, SyncRequest};
 
 pub struct Bunker(Arc<Inner>);
 
@@ -28,6 +32,18 @@ struct Inner {
     op_identity: age::x25519::Identity,
     op_recipient: age::x25519::Recipient,
     backup_recipient: age::x25519::Recipient,
+    /// Names of groups touched by successful mutations, fanned out to
+    /// live sync sessions. A session that falls behind the channel
+    /// capacity observes `Lagged` and resynchronizes via `ScopeChanged`,
+    /// so dropped events degrade to extra work, never to missed changes.
+    events: broadcast::Sender<String>,
+}
+
+impl Inner {
+    /// See [`Bunker::lock_store`]; shared with the sync handler.
+    fn lock_store(&self) -> MutexGuard<'_, Store> {
+        self.store.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl Clone for Bunker {
@@ -63,6 +79,7 @@ impl Bunker {
             op_identity,
             op_recipient,
             backup_recipient,
+            events: broadcast::channel(1024).0,
         })))
     }
 
@@ -70,7 +87,7 @@ impl Bunker {
     /// not brick every later one, and SQLite transactions roll back when
     /// dropped mid-panic, so the store itself stays consistent.
     pub(crate) fn lock_store(&self) -> MutexGuard<'_, Store> {
-        self.0.store.lock().unwrap_or_else(PoisonError::into_inner)
+        self.0.lock_store()
     }
 
     /// Create the reader wraps that grants made before per-reader
@@ -176,6 +193,19 @@ impl Bunker {
     pub fn handle(&self, remote: &str, req: &Request) -> Response {
         let inner = &*self.0;
         let mut store = self.lock_store();
+        // Groups a successful RemoveIdentity is about to touch (its ACL
+        // rows cascade away, its read-granted groups rotate): resolved
+        // before dispatch, published after — the identity is gone by then.
+        let removal_scope: Vec<String> = match req {
+            Request::RemoveIdentity { name } => match store.identity_by_name(name) {
+                Ok(Some(target)) => store
+                    .groups_for_identity(target.id)
+                    .map(|groups| groups.into_iter().map(|(name, _)| name).collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
         let outcome = Self::dispatch(inner, &mut store, remote, req);
         let audit_outcome = match &outcome {
             Response::Denied => "denied",
@@ -186,7 +216,41 @@ impl Bunker {
         if let Err(err) = store.audit(remote, req.op(), &req.target(), audit_outcome) {
             tracing::error!(%err, "audit append failed");
         }
+        if audit_outcome == "ok" {
+            for group in Self::touched_groups(req, removal_scope) {
+                // Err only means no live sync session is subscribed.
+                let _ = inner.events.send(group);
+            }
+        }
         outcome
+    }
+
+    /// The group names a successful `req` mutated, for the sync event
+    /// channel. Deliberately exhaustive: a new Request variant must decide
+    /// here what it touches. Over-notification only costs a session a
+    /// scope recheck; under-notification is a correctness bug.
+    fn touched_groups(req: &Request, removal_scope: Vec<String>) -> Vec<String> {
+        match req {
+            Request::Put { group, .. }
+            | Request::Delete { group, .. }
+            | Request::Grant { group, .. }
+            | Request::RotateDek { group } => vec![group.clone()],
+            Request::CreateGroup { name } => vec![name.clone()],
+            // Every group the removed identity held any row on: the
+            // read-granted ones rotated, and even write/admin-only rows
+            // change the ACL a replica mirrors.
+            Request::RemoveIdentity { .. } => removal_scope,
+            // Reads and identity-level ops touch no group data or ACL row
+            // (the service-admin flag carries no explicit-read scope).
+            Request::Get { .. }
+            | Request::List { .. }
+            | Request::ListGroups
+            | Request::GroupAcl { .. }
+            | Request::ListIdentities
+            | Request::ListIdentityNames { .. }
+            | Request::AddIdentity { .. }
+            | Request::SetServiceAdmin { .. } => Vec::new(),
+        }
     }
 
     fn dispatch(inner: &Inner, store: &mut Store, remote: &str, req: &Request) -> Response {
@@ -869,6 +933,359 @@ impl ProtocolHandler for Bunker {
     }
 }
 
+// ---- replication (`secret-bunker-sync/1`) ----
+
+/// How long a sync session keeps draining further events after the first
+/// one of a batch, before emitting the deduplicated result.
+const SYNC_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// Maximum `SecretEntry` rows per `GroupSecrets` message.
+const SYNC_SECRETS_CHUNK: usize = 1000;
+
+/// Handler for the replication ALPN, sharing the [`Bunker`]'s state. Sync
+/// scope is the caller's EXPLICIT read grants only — the service-admin
+/// implicit-read bypass never applies here, because sync only ever ships
+/// DEK wraps addressed to the caller and implicit readers have none.
+pub struct SyncServer(Arc<Inner>);
+
+impl Clone for SyncServer {
+    fn clone(&self) -> Self {
+        SyncServer(self.0.clone())
+    }
+}
+
+impl fmt::Debug for SyncServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SyncServer").finish_non_exhaustive()
+    }
+}
+
+impl Bunker {
+    /// The sync-ALPN handler backed by this bunker's store and event
+    /// channel.
+    pub fn sync_handler(&self) -> SyncServer {
+        SyncServer(self.0.clone())
+    }
+}
+
+impl ProtocolHandler for SyncServer {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let remote = connection.remote_id().to_string();
+        tracing::debug!(remote, "sync connection accepted");
+        // One task per stream, so a long-lived Hello session never blocks
+        // the fetch streams multiplexed on the same connection. The
+        // JoinSet aborts whatever still runs once the connection closes;
+        // aborts land only at await points and the store lock is never
+        // held across one, so an abort cannot strand the lock.
+        let mut streams = tokio::task::JoinSet::new();
+        loop {
+            let (mut send, mut recv) = match connection.accept_bi().await {
+                Ok(pair) => pair,
+                Err(_) => break, // peer closed (or connection error): done
+            };
+            let inner = self.0.clone();
+            let remote = remote.clone();
+            streams.spawn(async move {
+                if let Err(err) = handle_sync_stream(&inner, &remote, &mut send, &mut recv).await {
+                    tracing::debug!(%err, remote, "sync stream ended");
+                }
+                let _ = send.finish();
+            });
+        }
+        streams.shutdown().await;
+        Ok(())
+    }
+}
+
+/// One request per stream: read it, dispatch. `Ok(None)` (stream closed
+/// before any request) is a no-op, not an error.
+async fn handle_sync_stream(
+    inner: &Inner,
+    remote: &str,
+    send: &mut SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+) -> Result<()> {
+    let Some(req) = sync::read_msg::<SyncRequest>(recv).await? else {
+        return Ok(());
+    };
+    match req {
+        SyncRequest::Hello => sync_hello(inner, remote, send).await,
+        SyncRequest::FetchGroup { group } => sync_fetch_group(inner, remote, &group, send).await,
+        SyncRequest::FetchSecrets { group, names } => {
+            sync_fetch_secrets(inner, remote, &group, &names, send).await
+        }
+    }
+}
+
+/// Resolve `remote` and require the EXPLICIT read bit on `group`. This is
+/// sync's whole authorization: no service-admin bypass (deliberately not
+/// [`Bunker::authorize_group`]), and unknown identity, unknown group, and
+/// missing permission are indistinguishable (`None` → `SyncDenied`).
+fn sync_read_authorized(store: &Store, remote: &str, group: &str) -> Option<i64> {
+    let ident = store.identity_by_endpoint(remote).ok()??;
+    let group_id = store.group_id(group).ok()??;
+    let perms = store.perms(ident.id, group_id).ok()?;
+    (perms & PERM_READ != 0).then_some(group_id)
+}
+
+/// One group's manifest, snapshotted under the store lock so it can be
+/// sent without holding it.
+struct GroupSnapshot {
+    name: String,
+    acl: Vec<sync::AclEntry>,
+    deks: Vec<sync::DekEntry>,
+    secrets: Vec<sync::SecretEntry>,
+}
+
+/// Read one group's manifest. The DEK wraps are the caller's own and
+/// nothing else — sync never carries plaintext, unwrapped DEKs, or wraps
+/// addressed to another recipient. A version without a wrap for the
+/// caller (a revoke interleaved with this snapshot) is omitted.
+fn snapshot_group(store: &Store, group_id: i64, name: &str, remote: &str) -> Result<GroupSnapshot> {
+    let acl = store
+        .acl_entries_full(group_id)?
+        .into_iter()
+        .map(|(identity_name, endpoint_id, perms)| sync::AclEntry {
+            identity_name,
+            endpoint_id,
+            perms,
+        })
+        .collect();
+    let mut deks = Vec::new();
+    for version in store.dek_versions(group_id)? {
+        if let Some(wrapped) = store.dek_wrap(group_id, version, remote)? {
+            deks.push(sync::DekEntry { version, wrapped });
+        }
+    }
+    let secrets = store
+        .secret_entries(group_id)?
+        .into_iter()
+        .map(
+            |(name, current_version, dek_version, nonce)| sync::SecretEntry {
+                name,
+                current_version,
+                dek_version,
+                nonce,
+            },
+        )
+        .collect();
+    Ok(GroupSnapshot {
+        name: name.to_string(),
+        acl,
+        deks,
+        secrets,
+    })
+}
+
+/// Send one snapshot: `Group`, then the listing in `GroupSecrets` chunks.
+/// Always at least one `GroupSecrets`, so a group without secrets is an
+/// explicit empty listing rather than an absence.
+async fn send_group_snapshot(send: &mut SendStream, snap: GroupSnapshot) -> Result<()> {
+    let GroupSnapshot {
+        name,
+        acl,
+        deks,
+        secrets,
+    } = snap;
+    sync::write_msg(
+        send,
+        &SyncMessage::Group {
+            name: name.clone(),
+            acl,
+            deks,
+        },
+    )
+    .await?;
+    let chunks: Vec<&[sync::SecretEntry]> = if secrets.is_empty() {
+        vec![&[]]
+    } else {
+        secrets.chunks(SYNC_SECRETS_CHUNK).collect()
+    };
+    for chunk in chunks {
+        sync::write_msg(
+            send,
+            &SyncMessage::GroupSecrets {
+                group: name.clone(),
+                secrets: chunk.to_vec(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The caller's explicit-read scope as a set of group names, freshly
+/// resolved from the endpoint (a removed-and-re-registered identity gets
+/// a new row, so the id is never cached). Empty on unknown identity.
+fn current_scope_names(inner: &Inner, remote: &str) -> BTreeSet<String> {
+    let store = inner.lock_store();
+    store
+        .identity_by_endpoint(remote)
+        .ok()
+        .flatten()
+        .and_then(|ident| store.read_scope(ident.id).ok())
+        .map(|scope| scope.into_iter().map(|(_, name)| name).collect())
+        .unwrap_or_default()
+}
+
+/// The session stream: manifest, then live push until the peer goes away.
+async fn sync_hello(inner: &Inner, remote: &str, send: &mut SendStream) -> Result<()> {
+    // Subscribe BEFORE the snapshot: every mutation from here on is either
+    // in the snapshot or in the channel (or both — a duplicate Changed is
+    // wasted work, a lost one would be a hole), never in neither.
+    let mut events = inner.events.subscribe();
+    let scope = {
+        let store = inner.lock_store();
+        let scope = store
+            .identity_by_endpoint(remote)
+            .ok()
+            .flatten()
+            .and_then(|ident| store.read_scope(ident.id).ok());
+        let outcome = if scope.is_some() { "ok" } else { "denied" };
+        if let Err(err) = store.audit(remote, "sync-hello", "", outcome) {
+            tracing::error!(%err, "audit append failed");
+        }
+        scope
+    };
+    let Some(scope) = scope else {
+        sync::write_msg(send, &SyncMessage::SyncDenied).await?;
+        return Ok(());
+    };
+    let mut cached: BTreeSet<String> = scope.iter().map(|(_, name)| name.clone()).collect();
+    for (group_id, name) in &scope {
+        // One lock acquisition per group, released before every send.
+        let snap = {
+            let store = inner.lock_store();
+            snapshot_group(&store, *group_id, name, remote)?
+        };
+        send_group_snapshot(send, snap).await?;
+    }
+    sync::write_msg(send, &SyncMessage::ManifestDone).await?;
+
+    // Live push. Exits when the peer closes (a write fails, or the accept
+    // loop tears this task down with the connection) or the Bunker drops.
+    loop {
+        let mut lagged = false;
+        let mut batch: BTreeSet<String> = BTreeSet::new();
+        match events.recv().await {
+            Ok(group) => {
+                batch.insert(group);
+            }
+            // Events were dropped: only a full scope recheck is sound.
+            Err(broadcast::error::RecvError::Lagged(_)) => lagged = true,
+            // Sender gone: the Bunker was dropped, nothing changes again.
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+        // Debounce: keep draining until the channel stays quiet for the
+        // whole window, then emit one deduplicated batch.
+        loop {
+            match tokio::time::timeout(SYNC_DEBOUNCE, events.recv()).await {
+                Ok(Ok(group)) => {
+                    batch.insert(group);
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => lagged = true,
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_) => break, // window elapsed without another event
+            }
+        }
+        let scope = current_scope_names(inner, remote);
+        if lagged || scope != cached {
+            // The scope itself moved (or we cannot know): the session's
+            // manifest is stale as a whole, not just single groups.
+            cached = scope;
+            sync::write_msg(send, &SyncMessage::ScopeChanged).await?;
+        } else {
+            for group in batch.intersection(&cached) {
+                sync::write_msg(
+                    send,
+                    &SyncMessage::Changed {
+                        group: group.clone(),
+                    },
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+async fn sync_fetch_group(
+    inner: &Inner,
+    remote: &str,
+    group: &str,
+    send: &mut SendStream,
+) -> Result<()> {
+    let snap = {
+        let store = inner.lock_store();
+        let authorized = sync_read_authorized(&store, remote, group);
+        let outcome = if authorized.is_some() { "ok" } else { "denied" };
+        if let Err(err) = store.audit(remote, "sync-fetch-group", group, outcome) {
+            tracing::error!(%err, "audit append failed");
+        }
+        match authorized {
+            Some(group_id) => Some(snapshot_group(&store, group_id, group, remote)?),
+            None => None,
+        }
+    };
+    let Some(snap) = snap else {
+        sync::write_msg(send, &SyncMessage::SyncDenied).await?;
+        return Ok(());
+    };
+    send_group_snapshot(send, snap).await?;
+    sync::write_msg(send, &SyncMessage::FetchDone).await?;
+    Ok(())
+}
+
+async fn sync_fetch_secrets(
+    inner: &Inner,
+    remote: &str,
+    group: &str,
+    names: &[String],
+    send: &mut SendStream,
+) -> Result<()> {
+    let authorized = {
+        let store = inner.lock_store();
+        let authorized = sync_read_authorized(&store, remote, group);
+        let outcome = if authorized.is_some() { "ok" } else { "denied" };
+        if let Err(err) = store.audit(remote, "sync-fetch-secrets", group, outcome) {
+            tracing::error!(%err, "audit append failed");
+        }
+        authorized
+    };
+    let Some(group_id) = authorized else {
+        sync::write_msg(send, &SyncMessage::SyncDenied).await?;
+        return Ok(());
+    };
+    for name in names {
+        // One lock acquisition per secret: bounded memory for arbitrarily
+        // long fetch lists, and the lock is never held across a send.
+        let row = {
+            let store = inner.lock_store();
+            store.secret_data_current(group_id, name)?
+        };
+        // Names that (no longer) exist are skipped silently: the peer
+        // asked from a listing that may already be stale, which is
+        // exactly what the push channel will tell it about.
+        let Some((version, dek_version, nonce, ciphertext, created_at, created_by)) = row else {
+            continue;
+        };
+        sync::write_msg(
+            send,
+            &SyncMessage::SecretData {
+                name: name.clone(),
+                version,
+                dek_version,
+                nonce,
+                ciphertext,
+                created_at,
+                created_by,
+            },
+        )
+        .await?;
+    }
+    sync::write_msg(send, &SyncMessage::FetchDone).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,6 +1306,106 @@ mod tests {
             )
             .unwrap();
         (Bunker::new(store, op).unwrap(), admin_id)
+    }
+
+    /// Successful mutations publish the touched group name(s) on the
+    /// event channel; reads, failures, and denials publish nothing.
+    #[test]
+    fn successful_mutations_publish_events() {
+        let (bunker, admin) = test_bunker();
+        let mut rx = bunker.0.events.subscribe();
+        assert_eq!(
+            bunker.handle(&admin, &Request::CreateGroup { name: "g".into() }),
+            Response::Ok
+        );
+        assert_eq!(rx.try_recv().unwrap(), "g");
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::Put {
+                    group: "g".into(),
+                    name: "s".into(),
+                    value: b"v".to_vec(),
+                    expected_version: 0,
+                }
+            ),
+            Response::Version { version: 1 }
+        );
+        assert_eq!(rx.try_recv().unwrap(), "g");
+        // Reads publish nothing.
+        assert!(matches!(
+            bunker.handle(
+                &admin,
+                &Request::Get {
+                    group: "g".into(),
+                    name: "s".into(),
+                }
+            ),
+            Response::Secret { .. }
+        ));
+        assert!(rx.try_recv().is_err());
+        // Conflicted mutations publish nothing.
+        assert!(matches!(
+            bunker.handle(
+                &admin,
+                &Request::Put {
+                    group: "g".into(),
+                    name: "s".into(),
+                    value: b"v2".to_vec(),
+                    expected_version: 7,
+                }
+            ),
+            Response::VersionConflict { .. }
+        ));
+        assert!(rx.try_recv().is_err());
+        // Denied mutations publish nothing.
+        let stranger = iroh::SecretKey::generate().public().to_string();
+        assert_eq!(
+            bunker.handle(
+                &stranger,
+                &Request::Put {
+                    group: "g".into(),
+                    name: "s".into(),
+                    value: b"evil".to_vec(),
+                    expected_version: 1,
+                }
+            ),
+            Response::Denied
+        );
+        assert!(rx.try_recv().is_err());
+        // AddIdentity touches no group; Grant publishes its group.
+        let bob = iroh::SecretKey::generate().public().to_string();
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::AddIdentity {
+                    name: "bob".into(),
+                    endpoint_id: bob,
+                    service_admin: false,
+                }
+            ),
+            Response::Ok
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::Grant {
+                    group: "g".into(),
+                    identity: "bob".into(),
+                    perms: PERM_READ,
+                }
+            ),
+            Response::Ok
+        );
+        assert_eq!(rx.try_recv().unwrap(), "g");
+        // RemoveIdentity publishes every group the identity had a row on.
+        assert_eq!(
+            bunker.handle(&admin, &Request::RemoveIdentity { name: "bob".into() }),
+            Response::Ok
+        );
+        assert_eq!(rx.try_recv().unwrap(), "g");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
