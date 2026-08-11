@@ -1,6 +1,7 @@
 //! End-to-end test: a bunker and several clients as real iroh endpoints in
 //! one process (Minimal preset: no relays, no discovery).
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use iroh::endpoint::presets;
@@ -8,7 +9,7 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 
 use secret_bunker_iroh::client::Client;
-use secret_bunker_iroh::proto::{ALPN, GroupInfo, Request, Response};
+use secret_bunker_iroh::proto::{ALPN, GroupInfo, MAX_MSG, Request, Response};
 use secret_bunker_iroh::replica::{Replica, ReplicaEvent};
 use secret_bunker_iroh::server::Bunker;
 use secret_bunker_iroh::store::{AuditVerification, RECIPIENT_BACKUP, Store};
@@ -628,7 +629,18 @@ async fn list_groups_and_acl_visibility() {
 /// Authoritative router serving both the client ALPN and the sync ALPN.
 async fn spawn_authoritative(store: Store, op: age::x25519::Identity) -> (Router, EndpointAddr) {
     let bunker = Bunker::new(store, op).unwrap();
-    let endpoint = Endpoint::bind(presets::Minimal).await.unwrap();
+    spawn_authoritative_as(bunker, SecretKey::generate()).await
+}
+
+/// The same, over a caller-chosen endpoint key and an existing `Bunker`:
+/// lets a test restart the node under its old EndpointId (and over the
+/// same store) after taking it down.
+async fn spawn_authoritative_as(bunker: Bunker, secret: SecretKey) -> (Router, EndpointAddr) {
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .secret_key(secret)
+        .bind()
+        .await
+        .unwrap();
     let router = Router::builder(endpoint)
         .accept(ALPN, bunker.clone())
         .accept(SYNC_ALPN, bunker.sync_handler())
@@ -646,6 +658,23 @@ async fn sync_request(
     let (mut send, recv) = conn.open_bi().await.unwrap();
     sync::write_msg(&mut send, req).await.unwrap();
     (send, recv)
+}
+
+/// Drain a Hello manifest whose scope is a single group, returning that
+/// group's DEK wraps and secret listing.
+async fn single_group_manifest(
+    recv: &mut iroh::endpoint::RecvStream,
+) -> (Vec<sync::DekEntry>, Vec<sync::SecretEntry>) {
+    let (mut deks, mut secrets) = (Vec::new(), Vec::new());
+    loop {
+        match next_sync_msg(recv).await {
+            SyncMessage::Group { deks: d, .. } => deks.extend(d),
+            SyncMessage::GroupSecrets { secrets: s, .. } => secrets.extend(s),
+            SyncMessage::ManifestDone => break,
+            other => panic!("unexpected manifest message: {other:?}"),
+        }
+    }
+    (deks, secrets)
 }
 
 /// Read one sync message, failing loudly on timeout or stream end.
@@ -684,6 +713,24 @@ async fn next_replica_event(
         .await
         .expect("timed out waiting for a replica event")
         .expect("replica event channel closed")
+}
+
+/// Poll `req` until the answer is `want`. A replica converges
+/// asynchronously: its answer changes only once it has applied the sync
+/// carrying the change, and nothing announces that to its clients.
+async fn await_response(client: &Client, req: &Request, want: &Response) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let got = client.request(req).await.unwrap();
+        if got == *want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{req:?}: wanted {want:?}, still getting {got:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// Await `want`, skipping a bounded number of other events (some steps may
@@ -1802,5 +1849,902 @@ async fn sync_push_changed_and_scope_changed() {
     admin.close().await;
     conn.close(0u32.into(), b"done");
     reader_ep.close().await;
+    router.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_revoked_readers_wrap_cannot_open_later_writes() {
+    // Auto-rotation is what makes an already-synced copy harmless going
+    // forward: bob keeps the wrapped DEK he fetched while granted, and it
+    // opens nothing written after his read was revoked.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bunker.sqlite");
+
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+    let bob_secret = SecretKey::generate();
+    let carol_secret = SecretKey::generate();
+
+    let store = init_store(&db, &op, &backup, &admin_secret.public());
+    let (router, addr) = spawn_authoritative(store, op).await;
+
+    let admin = Client::with_endpoint(client_endpoint(admin_secret).await, addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        admin
+            .request(&Request::CreateGroup { name: "g".into() })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Put {
+                group: "g".into(),
+                name: "s".into(),
+                value: b"v1-plaintext".to_vec(),
+                expected_version: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Version { version: 1 }
+    );
+    for (name, secret) in [("bob", &bob_secret), ("carol", &carol_secret)] {
+        assert_eq!(
+            admin
+                .request(&Request::AddIdentity {
+                    name: name.into(),
+                    endpoint_id: secret.public().to_string(),
+                    service_admin: false,
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+        assert_eq!(
+            admin
+                .request(&Request::Grant {
+                    group: "g".into(),
+                    identity: name.into(),
+                    perms: 1,
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+    }
+
+    // --- bob syncs while granted and keeps the wrap ---
+    let bob_ep = client_endpoint(bob_secret.clone()).await;
+    let bob_conn = bob_ep.connect(addr.clone(), SYNC_ALPN).await.unwrap();
+    let (_bob_send, mut bob_recv) = sync_request(&bob_conn, &SyncRequest::Hello).await;
+    let (bob_deks, bob_secrets) = single_group_manifest(&mut bob_recv).await;
+    let [bob_dek_entry] = &bob_deks[..] else {
+        panic!("expected exactly one DEK wrap for bob, got {bob_deks:?}");
+    };
+    assert_eq!(bob_dek_entry.version, 1);
+    assert_eq!(bob_secrets[0].dek_version, 1);
+    let bob_age = secret_bunker_iroh::agebridge::identity_from_secret(&bob_secret).unwrap();
+    let bob_dek = secret_bunker_iroh::crypto::unwrap_dek(&bob_dek_entry.wrapped, &bob_age)
+        .expect("bob's wrap opens while he is granted");
+
+    // --- revoke bob (auto-rotates), then write a new value ---
+    assert_eq!(
+        admin
+            .request(&Request::Grant {
+                group: "g".into(),
+                identity: "bob".into(),
+                perms: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Put {
+                group: "g".into(),
+                name: "s".into(),
+                value: b"v2-plaintext".to_vec(),
+                expected_version: 1,
+            })
+            .await
+            .unwrap(),
+        Response::Version { version: 2 }
+    );
+
+    // --- carol, still granted, syncs the post-revocation state ---
+    let carol_ep = client_endpoint(carol_secret.clone()).await;
+    let carol_conn = carol_ep.connect(addr.clone(), SYNC_ALPN).await.unwrap();
+    let (_carol_send, mut carol_recv) = sync_request(&carol_conn, &SyncRequest::Hello).await;
+    let (carol_deks, carol_secrets) = single_group_manifest(&mut carol_recv).await;
+    let [entry] = &carol_secrets[..] else {
+        panic!("expected exactly one secret, got {carol_secrets:?}");
+    };
+    assert_eq!((entry.name.as_str(), entry.current_version), ("s", 2));
+    assert!(
+        entry.dek_version > bob_secrets[0].dek_version,
+        "revoking read must rotate the DEK: still on version {}",
+        entry.dek_version
+    );
+    let carol_wrap = carol_deks
+        .iter()
+        .find(|d| d.version == entry.dek_version)
+        .expect("carol keeps a wrap for the rotated DEK");
+
+    let (_fetch_send, mut fetch_recv) = sync_request(
+        &carol_conn,
+        &SyncRequest::FetchSecrets {
+            group: "g".into(),
+            names: vec!["s".into()],
+        },
+    )
+    .await;
+    let SyncMessage::SecretData {
+        version,
+        dek_version,
+        nonce,
+        ciphertext,
+        ..
+    } = next_sync_msg(&mut fetch_recv).await
+    else {
+        panic!("expected SecretData");
+    };
+    assert_eq!((version, dek_version), (2, entry.dek_version));
+
+    // The ciphertext really is readable — under the NEW wrap. Without
+    // this, the failure below would prove nothing.
+    let aad = secret_bunker_iroh::crypto::secret_aad("g", "s", version, dek_version);
+    let carol_age = secret_bunker_iroh::agebridge::identity_from_secret(&carol_secret).unwrap();
+    let carol_dek =
+        secret_bunker_iroh::crypto::unwrap_dek(&carol_wrap.wrapped, &carol_age).unwrap();
+    assert_eq!(
+        secret_bunker_iroh::crypto::decrypt_secret(&carol_dek, &aad, &nonce, &ciphertext).unwrap(),
+        b"v2-plaintext"
+    );
+    // Bob's retained DEK does not open it.
+    assert!(
+        secret_bunker_iroh::crypto::decrypt_secret(&bob_dek, &aad, &nonce, &ciphertext).is_err(),
+        "the revoked reader's old DEK must not decrypt a post-revocation write"
+    );
+
+    // And bob cannot fetch the new wrap either: registered, but out of
+    // scope, so his manifest is empty and the client protocol denies him.
+    let (_bob2_send, mut bob2_recv) = sync_request(&bob_conn, &SyncRequest::Hello).await;
+    assert_eq!(
+        next_sync_msg(&mut bob2_recv).await,
+        SyncMessage::ManifestDone
+    );
+    let bob_client = Client::with_endpoint(client_endpoint(bob_secret).await, addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        bob_client
+            .request(&Request::Get {
+                group: "g".into(),
+                name: "s".into(),
+            })
+            .await
+            .unwrap(),
+        Response::Denied
+    );
+
+    admin.close().await;
+    bob_client.close().await;
+    for conn in [bob_conn, carol_conn] {
+        conn.close(0u32.into(), b"done");
+    }
+    for ep in [bob_ep, carol_ep] {
+        ep.close().await;
+    }
+    router.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_maximum_size_secret_syncs_to_the_replica() {
+    // A secret filling the client protocol's message cap still fits a sync
+    // frame — ciphertext, nonce, provenance and CBOR framing included.
+    // That headroom is exactly why SYNC_MAX_MSG is twice MAX_MSG.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bunker.sqlite");
+    let replica_db = dir.path().join("replica.sqlite");
+
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+    let replica_secret = SecretKey::generate();
+
+    let store = init_store(&db, &op, &backup, &admin_secret.public());
+    let (router, addr) = spawn_authoritative(store, op).await;
+
+    let admin = Client::with_endpoint(client_endpoint(admin_secret).await, addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        admin
+            .request(&Request::CreateGroup { name: "g".into() })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::AddIdentity {
+                name: "replica".into(),
+                endpoint_id: replica_secret.public().to_string(),
+                service_admin: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Grant {
+                group: "g".into(),
+                identity: "replica".into(),
+                perms: 1,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+
+    // Exactly as large as a Put can be: the cap minus this request's own
+    // CBOR envelope. Sizing it to the byte is the whole point — the sync
+    // frame mirroring it is LARGER than any legal client message (AEAD
+    // tag, nonce, provenance and SecretData's own envelope on top), which
+    // is what SYNC_MAX_MSG's headroom over MAX_MSG is for.
+    let put = |value: Vec<u8>| Request::Put {
+        group: "g".into(),
+        name: "huge".into(),
+        value,
+        expected_version: 0,
+    };
+    let envelope = secret_bunker_iroh::proto::encode(&put(Vec::new()))
+        .unwrap()
+        .len();
+    // serde_bytes writes a 5-byte CBOR length header for a payload this
+    // size, against the 1 byte the empty vector above measured.
+    let value = vec![b'z'; MAX_MSG - envelope - 4];
+    assert_eq!(
+        secret_bunker_iroh::proto::encode(&put(value.clone()))
+            .unwrap()
+            .len(),
+        MAX_MSG,
+        "the Put must sit exactly on the client protocol's cap"
+    );
+    assert_eq!(
+        admin.request(&put(value.clone())).await.unwrap(),
+        Response::Version { version: 1 }
+    );
+    // The response side of the cap holds too (plaintext plus envelope).
+    assert!(
+        admin
+            .request(&Request::Get {
+                group: "g".into(),
+                name: "huge".into(),
+            })
+            .await
+            .unwrap()
+            == Response::Secret {
+                value: value.clone(),
+                version: 1,
+            },
+        "the authoritative node must serve back the maximum-size secret"
+    );
+
+    let ep = replica_endpoint(replica_secret.clone(), &addr).await;
+    let replica = Replica::builder()
+        .store_path(&replica_db)
+        .secret_key(replica_secret)
+        .authoritative(addr.id)
+        .endpoint(ep.clone())
+        .spawn()
+        .await
+        .unwrap();
+    let mut rx = replica.subscribe();
+    await_replica_event(
+        &mut rx,
+        &ReplicaEvent::SecretChanged {
+            group: "g".into(),
+            name: "huge".into(),
+            version: 1,
+        },
+    )
+    .await;
+    let mirrored = replica.get("g", "huge").unwrap();
+    assert!(
+        mirrored.as_slice() == value.as_slice(),
+        "the mirrored secret differs ({} bytes vs {} expected)",
+        mirrored.len(),
+        value.len()
+    );
+
+    replica.shutdown().await;
+    ep.close().await;
+    admin.close().await;
+    router.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_mutation_racing_the_initial_manifest_needs_no_reconnect() {
+    // The authoritative node subscribes to its own change stream BEFORE it
+    // snapshots the manifest, so a commit landing mid-stream is either in
+    // the manifest or in a Changed pushed after ManifestDone — never
+    // dropped, and never a protocol error that would cost a reconnect.
+    // The Put below is issued the instant `spawn` returns, while the
+    // replica is still dialling or streaming.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bunker.sqlite");
+    let replica_db = dir.path().join("replica.sqlite");
+
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+    let replica_secret = SecretKey::generate();
+
+    let store = init_store(&db, &op, &backup, &admin_secret.public());
+    let (router, addr) = spawn_authoritative(store, op).await;
+
+    let admin = Client::with_endpoint(client_endpoint(admin_secret).await, addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        admin
+            .request(&Request::CreateGroup { name: "g".into() })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::AddIdentity {
+                name: "replica".into(),
+                endpoint_id: replica_secret.public().to_string(),
+                service_admin: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Grant {
+                group: "g".into(),
+                identity: "replica".into(),
+                perms: 1,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Put {
+                group: "g".into(),
+                name: "before".into(),
+                value: b"before-plaintext".to_vec(),
+                expected_version: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Version { version: 1 }
+    );
+
+    let ep = replica_endpoint(replica_secret.clone(), &addr).await;
+    let replica = Replica::builder()
+        .store_path(&replica_db)
+        .secret_key(replica_secret)
+        .authoritative(addr.id)
+        .endpoint(ep.clone())
+        .spawn()
+        .await
+        .unwrap();
+    let mut rx = replica.subscribe();
+    // No awaiting anything replica-side first: this burst of writes races
+    // the sync task's dial, the Hello, and the manifest that follows it.
+    // A stream of them rather than one, so the writes straddle the
+    // manifest window instead of sampling one instant of it — some land
+    // in the snapshot, the rest have to arrive as pushes.
+    let racing: Vec<String> = (0..24).map(|i| format!("during-{i:02}")).collect();
+    for name in &racing {
+        assert_eq!(
+            admin
+                .request(&Request::Put {
+                    group: "g".into(),
+                    name: name.into(),
+                    value: format!("{name}-plaintext").into_bytes(),
+                    expected_version: 0,
+                })
+                .await
+                .unwrap(),
+            Response::Version { version: 1 }
+        );
+    }
+
+    // Every write surfaces — whether it made the manifest snapshot or
+    // arrived as a Changed after it — and the session never dropped.
+    let want: BTreeSet<String> = std::iter::once("before".to_string())
+        .chain(racing.iter().cloned())
+        .collect();
+    let mut seen = BTreeSet::new();
+    while seen != want {
+        match next_replica_event(&mut rx).await {
+            ReplicaEvent::SecretChanged {
+                group,
+                name,
+                version,
+            } => {
+                assert_eq!((group.as_str(), version), ("g", 1));
+                seen.insert(name);
+            }
+            ReplicaEvent::Disconnected => {
+                panic!("the session dropped: a mid-manifest commit must not cost a reconnect")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(&*replica.get("g", "before").unwrap(), b"before-plaintext");
+    for name in &racing {
+        assert_eq!(
+            &*replica.get("g", name).unwrap(),
+            format!("{name}-plaintext").as_bytes()
+        );
+    }
+
+    replica.shutdown().await;
+    ep.close().await;
+    admin.close().await;
+    router.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_commit_while_the_manifest_streams_is_pushed_after_it() {
+    // The same property as above, pinned without a race: a sync peer whose
+    // QUIC stream receive window is far smaller than the manifest, and
+    // which does not read, leaves the server blocked mid-stream — provably
+    // past its snapshot (taken before the first byte) and short of
+    // ManifestDone. A commit landing in exactly that window must still
+    // reach the peer, which it can only do if the server subscribed BEFORE
+    // it snapshotted.
+    const WINDOW: u32 = 2048;
+    const PADDING: usize = 64;
+    const SECRETS: usize = 96;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bunker.sqlite");
+
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+    let reader_secret = SecretKey::generate();
+
+    let store = init_store(&db, &op, &backup, &admin_secret.public());
+    let (router, addr) = spawn_authoritative(store, op).await;
+
+    let admin = Client::with_endpoint(client_endpoint(admin_secret).await, addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        admin
+            .request(&Request::CreateGroup { name: "g".into() })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::AddIdentity {
+                name: "reader".into(),
+                endpoint_id: reader_secret.public().to_string(),
+                service_admin: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Grant {
+                group: "g".into(),
+                identity: "reader".into(),
+                perms: 1,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    // Enough padded listing entries that the manifest is many times the
+    // window below — the server cannot possibly have finished writing it.
+    for i in 0..SECRETS {
+        assert_eq!(
+            admin
+                .request(&Request::Put {
+                    group: "g".into(),
+                    name: format!("{}-{i:03}", "p".repeat(PADDING)),
+                    value: b"v".to_vec(),
+                    expected_version: 0,
+                })
+                .await
+                .unwrap(),
+            Response::Version { version: 1 }
+        );
+    }
+
+    let reader_ep = Endpoint::builder(presets::Minimal)
+        .secret_key(reader_secret)
+        .transport_config(
+            iroh::endpoint::QuicTransportConfig::builder()
+                .stream_receive_window(iroh::endpoint::VarInt::from_u32(WINDOW))
+                .build(),
+        )
+        .bind()
+        .await
+        .unwrap();
+    let conn = reader_ep.connect(addr.clone(), SYNC_ALPN).await.unwrap();
+    let (_hello_send, mut hello_recv) = sync_request(&conn, &SyncRequest::Hello).await;
+
+    // Deliberately no reads: the server fills the window and parks there.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        admin
+            .request(&Request::Put {
+                group: "g".into(),
+                name: "committed-mid-manifest".into(),
+                value: b"late".to_vec(),
+                expected_version: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Version { version: 1 }
+    );
+
+    // Draining the manifest unblocks the server. Nothing may be
+    // interleaved into it (`single_group_manifest` panics on anything but
+    // Group/GroupSecrets), and the new secret cannot be in it.
+    let (_deks, secrets) = single_group_manifest(&mut hello_recv).await;
+    assert_eq!(
+        secrets.len(),
+        SECRETS,
+        "the manifest must list exactly the pre-existing secrets"
+    );
+    assert!(
+        !secrets.iter().any(|e| e.name == "committed-mid-manifest"),
+        "the write reached the snapshot; the manifest was not big enough to block on"
+    );
+    // The mutation was not lost with the manifest already snapshotted:
+    // it arrives as a push on the very same session.
+    assert_eq!(
+        next_sync_msg(&mut hello_recv).await,
+        SyncMessage::Changed { group: "g".into() }
+    );
+
+    admin.close().await;
+    conn.close(0u32.into(), b"done");
+    reader_ep.close().await;
+    router.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_revocation_reaches_a_replicas_clients_only_when_it_syncs() {
+    // The documented revocation lag: a replica enforces an ACL change only
+    // once it has applied the sync carrying it, and that cannot happen
+    // while the authoritative node is down. Carol keeps reading from the
+    // mirror right through the outage — including after the operator has
+    // revoked her upstream — and loses access when the replica resyncs.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bunker.sqlite");
+    let replica_db = dir.path().join("replica.sqlite");
+
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+    let auth_secret = SecretKey::generate();
+    let replica_secret = SecretKey::generate();
+    let carol_secret = SecretKey::generate();
+    let admin_hex = admin_secret.public().to_string();
+
+    let store = init_store(&db, &op, &backup, &admin_secret.public());
+    let bunker = Bunker::new(store, op).unwrap();
+    let (router, addr) = spawn_authoritative_as(bunker.clone(), auth_secret.clone()).await;
+
+    let admin = Client::with_endpoint(client_endpoint(admin_secret).await, addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        admin
+            .request(&Request::CreateGroup { name: "g".into() })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    for (name, secret) in [("replica", &replica_secret), ("carol", &carol_secret)] {
+        assert_eq!(
+            admin
+                .request(&Request::AddIdentity {
+                    name: name.into(),
+                    endpoint_id: secret.public().to_string(),
+                    service_admin: false,
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+        assert_eq!(
+            admin
+                .request(&Request::Grant {
+                    group: "g".into(),
+                    identity: name.into(),
+                    perms: 1,
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+    }
+    assert_eq!(
+        admin
+            .request(&Request::Put {
+                group: "g".into(),
+                name: "s".into(),
+                value: b"mirrored".to_vec(),
+                expected_version: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Version { version: 1 }
+    );
+
+    // The replica dials by EndpointId; a memory address book we keep a
+    // handle on stands in for discovery, so the restarted node's new
+    // address can be handed over below.
+    let lookup = iroh::address_lookup::MemoryLookup::from_endpoint_info([addr.clone()]);
+    let ep = Endpoint::builder(presets::Minimal)
+        .secret_key(replica_secret.clone())
+        .address_lookup(lookup.clone())
+        .bind()
+        .await
+        .unwrap();
+    let replica = Replica::builder()
+        .store_path(&replica_db)
+        .secret_key(replica_secret)
+        .authoritative(addr.id)
+        .endpoint(ep.clone())
+        .spawn()
+        .await
+        .unwrap();
+    let mut rx = replica.subscribe();
+    await_replica_event(
+        &mut rx,
+        &ReplicaEvent::SecretChanged {
+            group: "g".into(),
+            name: "s".into(),
+            version: 1,
+        },
+    )
+    .await;
+    let replica_router = Router::builder(ep.clone())
+        .accept(ALPN, replica.protocol_handler())
+        .spawn();
+    let replica_addr = replica_router.endpoint().addr();
+
+    let carol = Client::with_endpoint(client_endpoint(carol_secret).await, replica_addr.clone())
+        .await
+        .unwrap();
+    let read = Request::Get {
+        group: "g".into(),
+        name: "s".into(),
+    };
+    let plaintext = Response::Secret {
+        value: b"mirrored".to_vec(),
+        version: 1,
+    };
+    assert_eq!(carol.request(&read).await.unwrap(), plaintext);
+
+    // --- the authoritative node goes down; the replica is partitioned ---
+    admin.close().await;
+    router.shutdown().await.unwrap();
+    await_replica_event(&mut rx, &ReplicaEvent::Disconnected).await;
+    assert!(!replica.status().connected);
+
+    // The operator revokes carol on the offline node — the ordinary server
+    // path, with no session to push it to.
+    assert_eq!(
+        bunker.handle(
+            &admin_hex,
+            &Request::Grant {
+                group: "g".into(),
+                identity: "carol".into(),
+                perms: 0,
+            }
+        ),
+        Response::Ok
+    );
+    assert_eq!(
+        carol.request(&read).await.unwrap(),
+        plaintext,
+        "a revocation the replica cannot have synced must not be enforced by it"
+    );
+
+    // --- the node comes back under the same key, over the same store ---
+    let (router, addr) = spawn_authoritative_as(bunker, auth_secret).await;
+    lookup.set_endpoint_info(addr.clone());
+
+    // The replica reconnects on its backoff, resyncs, and applies the ACL
+    // wholesale — carol's row goes with it.
+    await_response(&carol, &read, &Response::Denied).await;
+    assert_eq!(
+        &*replica.get("g", "s").unwrap(),
+        b"mirrored",
+        "carol lost her grant, not the replica its group"
+    );
+
+    carol.close().await;
+    replica_router.shutdown().await.unwrap();
+    replica.shutdown().await;
+    ep.close().await;
+    router.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn replacing_an_identitys_key_converges_on_the_replica() {
+    // Rotating a client key is RemoveIdentity + AddIdentity under the same
+    // name. The mirror has to follow both halves: the new key reads, and
+    // the row the old key authenticated as is gone — the stale-name delete
+    // of the ACL apply rules, end to end.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bunker.sqlite");
+    let replica_db = dir.path().join("replica.sqlite");
+
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+    let replica_secret = SecretKey::generate();
+    let old_secret = SecretKey::generate();
+    let new_secret = SecretKey::generate();
+
+    let store = init_store(&db, &op, &backup, &admin_secret.public());
+    let (router, addr) = spawn_authoritative(store, op).await;
+
+    let admin = Client::with_endpoint(client_endpoint(admin_secret).await, addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        admin
+            .request(&Request::CreateGroup { name: "g".into() })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    for (name, secret) in [("replica", &replica_secret), ("carol", &old_secret)] {
+        assert_eq!(
+            admin
+                .request(&Request::AddIdentity {
+                    name: name.into(),
+                    endpoint_id: secret.public().to_string(),
+                    service_admin: false,
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+        assert_eq!(
+            admin
+                .request(&Request::Grant {
+                    group: "g".into(),
+                    identity: name.into(),
+                    perms: 1,
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+    }
+    assert_eq!(
+        admin
+            .request(&Request::Put {
+                group: "g".into(),
+                name: "s".into(),
+                value: b"mirrored".to_vec(),
+                expected_version: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Version { version: 1 }
+    );
+
+    let ep = replica_endpoint(replica_secret.clone(), &addr).await;
+    let replica = Replica::builder()
+        .store_path(&replica_db)
+        .secret_key(replica_secret)
+        .authoritative(addr.id)
+        .endpoint(ep.clone())
+        .spawn()
+        .await
+        .unwrap();
+    let mut rx = replica.subscribe();
+    await_replica_event(
+        &mut rx,
+        &ReplicaEvent::SecretChanged {
+            group: "g".into(),
+            name: "s".into(),
+            version: 1,
+        },
+    )
+    .await;
+    let replica_router = Router::builder(ep.clone())
+        .accept(ALPN, replica.protocol_handler())
+        .spawn();
+    let replica_addr = replica_router.endpoint().addr();
+
+    let read = Request::Get {
+        group: "g".into(),
+        name: "s".into(),
+    };
+    let plaintext = Response::Secret {
+        value: b"mirrored".to_vec(),
+        version: 1,
+    };
+    let old_key = Client::with_endpoint(client_endpoint(old_secret).await, replica_addr.clone())
+        .await
+        .unwrap();
+    await_response(&old_key, &read, &plaintext).await;
+
+    // --- key rotation upstream, same identity name ---
+    assert_eq!(
+        admin
+            .request(&Request::RemoveIdentity {
+                name: "carol".into()
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::AddIdentity {
+                name: "carol".into(),
+                endpoint_id: new_secret.public().to_string(),
+                service_admin: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Grant {
+                group: "g".into(),
+                identity: "carol".into(),
+                perms: 1,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+
+    // The mirror converges on the new key — including the DEK rotation
+    // that removing a reader triggered, without which it could not decrypt
+    // the secret at all.
+    let new_key = Client::with_endpoint(client_endpoint(new_secret).await, replica_addr.clone())
+        .await
+        .unwrap();
+    await_response(&new_key, &read, &plaintext).await;
+    assert_eq!(
+        old_key.request(&read).await.unwrap(),
+        Response::Denied,
+        "the replaced key must not survive as a stale row under the same name"
+    );
+
+    for client in [old_key, new_key] {
+        client.close().await;
+    }
+    replica_router.shutdown().await.unwrap();
+    replica.shutdown().await;
+    ep.close().await;
+    admin.close().await;
     router.shutdown().await.unwrap();
 }
