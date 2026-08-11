@@ -131,9 +131,44 @@ mod tests {
     use crate::crd::{BunkerSecret, BunkerSecretSpec};
     use crate::metrics::Metrics;
     use futures::StreamExt;
+    use prometheus::Encoder;
     use secret_bunker_iroh::replica::ReplicaEvent;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Renders the registry to Prometheus text format and returns it, so
+    /// tests can assert on exact `metric{label="value"} count` lines.
+    fn render_metrics(metrics: &Metrics) -> String {
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&metrics.registry.gather(), &mut buf)
+            .unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// Cooperatively yields (no wall-clock sleep) until `events_total{type =
+    /// label}` reaches `expected`, for synchronizing on events (Connected /
+    /// Disconnected) that don't produce a stream item to await instead.
+    /// Bounded by a 5s timeout so a real bug fails the test instead of
+    /// hanging it.
+    async fn wait_for_metric(metrics: &Metrics, label: &str, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if metrics.events_total.with_label_values(&[label]).get() == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for metric type=\"{label}\" to reach {expected}, currently {}",
+                metrics.events_total.with_label_values(&[label]).get()
+            )
+        });
+    }
 
     fn cr(name: &str, ns: &str, group: &str) -> Arc<BunkerSecret> {
         let spec: BunkerSecretSpec =
@@ -190,9 +225,13 @@ mod tests {
 
     #[tokio::test]
     async fn connected_updates_staleness_not_stream() {
+        // Two CRs in different groups: with a single-CR fixture, "reconcile
+        // just this CR" and "reconcile all CRs" are indistinguishable. Here,
+        // a wrongly-triggered reconcile-all would enqueue CR "b" as well as
+        // CR "a", which the assertions below would catch.
         let (tx, rx) = tokio::sync::broadcast::channel(16);
         let staleness = Arc::new(Staleness::new());
-        let crs = vec![cr("a", "ns1", "prod")];
+        let crs = vec![cr("a", "ns1", "prod"), cr("b", "ns2", "staging")];
         let mut stream = Box::pin(spawn_event_bridge(
             rx,
             Box::new(move || crs.clone()),
@@ -202,7 +241,19 @@ mod tests {
         ));
         assert!(staleness.disconnected_for().is_some());
         tx.send(ReplicaEvent::Connected).unwrap();
-        // Follow with a data event so the stream yields something deterministic.
+
+        // Connected alone must not push anything: wait on a bounded timeout
+        // that we *expect* to elapse. If Connected wrongly triggered
+        // reconcile-all, an item would already be queued on the (unbounded)
+        // output channel well within this window.
+        let got = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+        assert!(
+            got.is_err(),
+            "Connected must not push to the stream, got {got:?}"
+        );
+
+        // Now send a targeted event for group "prod" (CR "a" only) and
+        // confirm CR "a" — not CR "b" — is what arrives first.
         tx.send(ReplicaEvent::SecretChanged {
             group: "prod".into(),
             name: "x".into(),
@@ -214,6 +265,180 @@ mod tests {
             ("ns1".to_string(), "a".to_string())
         );
         assert_eq!(staleness.disconnected_for(), None);
+    }
+
+    #[tokio::test]
+    async fn each_event_type_increments_its_own_metric_label() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let crs = vec![cr("a", "ns1", "prod")];
+        let metrics = Metrics::new().unwrap();
+        let metrics_check = metrics.clone();
+        let mut stream = Box::pin(spawn_event_bridge(
+            rx,
+            Box::new(move || crs.clone()),
+            Arc::new(Staleness::new()),
+            Duration::from_secs(600),
+            metrics,
+        ));
+
+        tx.send(ReplicaEvent::SecretChanged {
+            group: "prod".into(),
+            name: "x".into(),
+            version: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            next_ref(&mut stream).await,
+            ("ns1".to_string(), "a".to_string())
+        );
+
+        tx.send(ReplicaEvent::SecretDeleted {
+            group: "prod".into(),
+            name: "x".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            next_ref(&mut stream).await,
+            ("ns1".to_string(), "a".to_string())
+        );
+
+        tx.send(ReplicaEvent::GroupAdded {
+            group: "prod".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            next_ref(&mut stream).await,
+            ("ns1".to_string(), "a".to_string())
+        );
+
+        tx.send(ReplicaEvent::GroupRemoved {
+            group: "prod".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            next_ref(&mut stream).await,
+            ("ns1".to_string(), "a".to_string())
+        );
+
+        // Connected/Disconnected don't push to the stream, so there is no
+        // trigger to await. A single broadcast receiver processes events
+        // strictly in order, so waiting for the *second* one's metric to
+        // land also proves the first was already handled — no probe event
+        // needed (a probe would double-count one of the six labels below).
+        tx.send(ReplicaEvent::Connected).unwrap();
+        tx.send(ReplicaEvent::Disconnected).unwrap();
+        wait_for_metric(&metrics_check, "disconnected", 1).await;
+
+        let text = render_metrics(&metrics_check);
+        for label in [
+            "secret_changed",
+            "secret_deleted",
+            "group_added",
+            "group_removed",
+            "connected",
+            "disconnected",
+        ] {
+            let expected = format!("bunker_replica_events_total{{type=\"{label}\"}} 1");
+            assert!(
+                text.contains(&expected),
+                "expected `{expected}` in:\n{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lagged_triggers_reconcile_all_and_counts_metric() {
+        // Small capacity so a burst of sends overflows the receiver's
+        // buffer. On the current-thread test runtime the spawned bridge
+        // task cannot poll until this test task first `.await`s, so all
+        // sends below land before the bridge ever calls `rx.recv()` —
+        // guaranteeing the receiver is lagged on its first read.
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        let crs = vec![cr("a", "ns1", "prod"), cr("b", "ns2", "staging")];
+        let metrics = Metrics::new().unwrap();
+        let metrics_check = metrics.clone();
+        let mut stream = Box::pin(spawn_event_bridge(
+            rx,
+            Box::new(move || crs.clone()),
+            Arc::new(Staleness::new()),
+            Duration::from_secs(600),
+            metrics,
+        ));
+        for i in 0..20u64 {
+            tx.send(ReplicaEvent::SecretChanged {
+                group: "prod".into(),
+                name: format!("s{i}"),
+                version: i,
+            })
+            .unwrap();
+        }
+
+        // Lagged must reconcile ALL CRs, including "b" (group "staging"),
+        // which no sent event referenced — distinguishing this from
+        // targeted, group-scoped triggering.
+        let mut seen = HashSet::new();
+        for _ in 0..2 {
+            seen.insert(next_ref(&mut stream).await);
+        }
+        assert_eq!(
+            seen,
+            HashSet::from([
+                ("ns1".to_string(), "a".to_string()),
+                ("ns2".to_string(), "b".to_string()),
+            ]),
+            "lagged should reconcile ALL CRs"
+        );
+
+        let text = render_metrics(&metrics_check);
+        assert!(
+            text.contains("bunker_replica_events_total{type=\"lagged\"} 1"),
+            "expected exactly one lagged event, got:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn staleness_ticker_triggers_reconcile_all_on_threshold_crossing_and_recovery() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let staleness = Arc::new(Staleness::new());
+        let crs = vec![cr("a", "ns1", "prod"), cr("b", "ns2", "staging")];
+        let mut stream = Box::pin(spawn_event_bridge(
+            rx,
+            Box::new(move || crs.clone()),
+            staleness.clone(),
+            Duration::from_millis(300),
+            Metrics::new().unwrap(),
+        ));
+
+        // No broadcast event is ever sent here: crossing the staleness
+        // threshold by itself must trigger reconcile-all, via the ticker.
+        let mut seen = HashSet::new();
+        for _ in 0..2 {
+            seen.insert(next_ref(&mut stream).await);
+        }
+        assert_eq!(
+            seen,
+            HashSet::from([
+                ("ns1".to_string(), "a".to_string()),
+                ("ns2".to_string(), "b".to_string()),
+            ]),
+            "crossing the staleness threshold should reconcile ALL CRs with no event sent"
+        );
+
+        // Recovery: Connected clears staleness; the next tick observes the
+        // stale -> not-stale transition and triggers reconcile-all again.
+        tx.send(ReplicaEvent::Connected).unwrap();
+        let mut seen2 = HashSet::new();
+        for _ in 0..2 {
+            seen2.insert(next_ref(&mut stream).await);
+        }
+        assert_eq!(
+            seen2,
+            HashSet::from([
+                ("ns1".to_string(), "a".to_string()),
+                ("ns2".to_string(), "b".to_string()),
+            ]),
+            "recovering from staleness should also reconcile ALL CRs"
+        );
     }
 
     #[tokio::test]
