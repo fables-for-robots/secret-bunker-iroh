@@ -1,5 +1,6 @@
 //! The reconcile loop: render from the mirror, server-side apply, status.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -17,7 +18,7 @@ use crate::crd::{
     BunkerSecret, BunkerSecretStatus, DeletionPolicy, FIELD_MANAGER, FINALIZER, HASH_ANNOTATION,
 };
 use crate::metrics::Metrics;
-use crate::render::{RenderError, render};
+use crate::render::{RenderError, content_hash, render};
 use crate::secretbuild::build_secret;
 use secret_bunker_iroh::replica::Replica;
 
@@ -227,12 +228,22 @@ pub async fn apply_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<Act
 
     let desired = build_secret(cr, &data);
     let desired_hash = desired.metadata.annotations.as_ref().unwrap()[HASH_ANNOTATION].clone();
-    let existing_hash = existing
-        .as_ref()
-        .and_then(|s| s.metadata.annotations.as_ref())
-        .and_then(|a| a.get(HASH_ANNOTATION).cloned());
+    // Compare CONTENT, not the (informational-only) annotation: the
+    // annotation on a manually-edited Secret is left untouched by the hand
+    // edit, so trusting it would let a tampered value stand forever —
+    // breaking the "manual edits get reverted" promise. Hash what's
+    // actually in `data` instead. `existing.data` is already base64-decoded
+    // by k8s-openapi (`ByteString`), so this is a direct byte comparison via
+    // the same hash the apply path used to produce the annotation. A Secret
+    // with no `data` at all (freshly adopted, or wiped by hand) never
+    // matches, so it always gets (re)applied.
+    let existing_content_hash = existing.as_ref().and_then(|s| s.data.as_ref()).map(|d| {
+        let decoded: BTreeMap<String, Vec<u8>> =
+            d.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect();
+        content_hash(&decoded)
+    });
 
-    if existing_hash.as_deref() == Some(desired_hash.as_str()) {
+    if existing_content_hash.as_deref() == Some(desired_hash.as_str()) {
         ctx.metrics
             .applies_total
             .with_label_values(&["skipped"])

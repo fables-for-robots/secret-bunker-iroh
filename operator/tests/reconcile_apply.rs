@@ -174,7 +174,10 @@ async fn hash_match_skips_apply() {
                     "annotations": {HASH_ANNOTATION: hash},
                     "ownerReferences": [{"apiVersion": "bunker.fables-for-robots.ch/v1alpha1",
                         "kind": "BunkerSecret", "name": "app", "uid": "uid-1", "controller": true}]
-                }
+                },
+                // The skip gate now hashes actual `data`, not the annotation
+                // — a true no-op needs the data to genuinely match too.
+                "data": {"PW": base64_encode(b"hunter2")}
             }),
         ),
         // No Secret PATCH — straight to status.
@@ -205,6 +208,94 @@ async fn hash_match_skips_apply() {
         .metric
         .iter()
         .find(|m| m.label.iter().any(|l| l.value() == "skipped"))
+        .unwrap();
+    assert_eq!(m.counter.value() as u64, 1);
+}
+
+/// A manually-edited Secret data value must be reverted even though its
+/// content-hash annotation still carries the CORRECT desired hash (the hand
+/// edit touched `data` but left the annotation alone) — the skip gate has to
+/// compare actual content, not trust the annotation as a cache of it.
+#[tokio::test]
+async fn manual_data_edit_is_reverted_despite_matching_annotation() {
+    let bunker = TestBunker::spawn().await;
+    bunker.create_group("prod").await;
+    let reader = SecretKey::generate();
+    bunker.add_reader("op", &reader).await;
+    bunker.grant_read("prod", "op").await;
+    bunker.put("prod", "pw", b"hunter2", 0).await;
+
+    let cr = test_cr("data: [{secretKey: PW, remoteRef: {group: prod, name: pw}}]");
+    // The annotation the operator would have written for the CORRECT
+    // ("hunter2") content — a stale/tampered `data` alongside it is exactly
+    // the scenario a hand edit produces (the editor changes the value but
+    // never recomputes this operator-owned annotation).
+    let mut data = std::collections::BTreeMap::new();
+    data.insert("PW".to_string(), b"hunter2".to_vec());
+    let hash = secret_bunker_operator::render::content_hash(&data);
+
+    let script = vec![
+        expect(
+            "GET",
+            "/api/v1/namespaces/ns/secrets/app",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret",
+                "metadata": {
+                    "name": "app", "namespace": "ns",
+                    "annotations": {HASH_ANNOTATION: hash},
+                    "ownerReferences": [{"apiVersion": "bunker.fables-for-robots.ch/v1alpha1",
+                        "kind": "BunkerSecret", "name": "app", "uid": "uid-1", "controller": true}]
+                },
+                // Tampered: a human changed the value in place without
+                // touching the annotation.
+                "data": {"PW": base64_encode(b"tampered-by-hand")}
+            }),
+        ),
+        // The skip gate must NOT trust the (stale) matching annotation —
+        // content differs, so this has to be a real revert PATCH.
+        expect_checked(
+            "PATCH",
+            "/api/v1/namespaces/ns/secrets/app",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "app", "namespace": "ns"}
+            }),
+            |body| {
+                assert_eq!(body["data"]["PW"], json!(base64_encode(b"hunter2")));
+            },
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
+        expect(
+            "PATCH",
+            "/bunkersecrets/app/status",
+            200,
+            json!({"apiVersion": "bunker.fables-for-robots.ch/v1alpha1", "kind": "BunkerSecret",
+                   "metadata": {"name": "app", "namespace": "ns"}, "spec": {}}),
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
+    ];
+    let (client, join) = scripted(script);
+    let (ctx, _dir) = synced_context(&bunker, reader, client).await;
+    common::await_mirrored(&ctx.replica, "prod", "pw").await;
+
+    apply_bunker_secret(&cr, &ctx).await.unwrap();
+    join.await.unwrap();
+    // applies_total{applied} == 1 — this was a real revert, not a skip.
+    let fams = ctx.metrics.registry.gather();
+    let fam = fams
+        .iter()
+        .find(|f| f.name() == "bunker_secret_applies_total")
+        .unwrap();
+    let m = fam
+        .metric
+        .iter()
+        .find(|m| m.label.iter().any(|l| l.value() == "applied"))
         .unwrap();
     assert_eq!(m.counter.value() as u64, 1);
 }
@@ -493,7 +584,11 @@ async fn second_reconcile_with_unchanged_state_skips_status_patch() {
                 "annotations": {HASH_ANNOTATION: hash},
                 "ownerReferences": [{"apiVersion": "bunker.fables-for-robots.ch/v1alpha1",
                     "kind": "BunkerSecret", "name": "app", "uid": "uid-1", "controller": true}]
-            }
+            },
+            // The skip gate hashes actual `data` now — needs to genuinely
+            // match for the apply (and therefore this status-patch-skip
+            // isolation) to hold.
+            "data": {"PW": base64_encode(b"hunter2")}
         }),
     )];
     let (client2, join2) = scripted(script2);
