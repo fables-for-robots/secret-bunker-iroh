@@ -2,6 +2,7 @@ pub mod bunker;
 pub mod crd;
 pub mod events;
 pub mod http;
+pub mod identity;
 pub mod metrics;
 pub mod reconcile;
 pub mod render;
