@@ -132,6 +132,13 @@ whatever it last successfully rendered. Nothing is ever torn down because
 the operator can no longer confirm it's still correct — only because a CR
 or its target Secret is explicitly deleted.
 
+### Security notes
+
+The `bunker.fables-for-robots.ch/content-hash` annotation is an unsalted
+SHA-256 over the rendered Secret data; low-entropy values (short passwords,
+PINs, etc.) are offline-guessable by anyone who can read the Secret's
+metadata, without needing `get` on its data.
+
 ## Identity provisioning (runbook)
 
 The operator needs its own iroh identity, registered with the bunker and

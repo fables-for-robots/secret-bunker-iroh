@@ -81,8 +81,10 @@ async fn main() -> anyhow::Result<()> {
     let crs: Api<BunkerSecret> = Api::all(client.clone());
     let secrets: Api<Secret> = Api::all(client.clone());
 
-    let controller =
-        Controller::new(crs, watcher::Config::default()).owns(secrets, watcher::Config::default());
+    let controller = Controller::new(crs, watcher::Config::default()).owns(
+        secrets,
+        watcher::Config::default().labels("app.kubernetes.io/managed-by=secret-bunker-operator"),
+    );
     let store = controller.store();
     let bridge = spawn_event_bridge(
         events_rx,

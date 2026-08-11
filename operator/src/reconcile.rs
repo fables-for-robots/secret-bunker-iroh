@@ -373,8 +373,18 @@ async fn handle_render_error(
         .as_ref()
         .and_then(|s| s.last_sync_time.as_ref())
         .is_some();
+    // AccessRevoked is a diagnosis about a group that USED to be readable —
+    // it only applies while the CR's spec hasn't moved since the last
+    // successful sync. Without this, editing a synced CR to reference a
+    // group that never existed (generation bumped, observedGeneration still
+    // stale) would misreport as "revoked" instead of the more accurate
+    // MissingGroup.
+    let spec_unchanged_since_sync = cr
+        .status
+        .as_ref()
+        .is_some_and(|s| s.observed_generation == cr.metadata.generation);
     let (reason, message) = match &e {
-        RenderError::MissingGroup { group } if previously_synced => (
+        RenderError::MissingGroup { group } if previously_synced && spec_unchanged_since_sync => (
             "AccessRevoked",
             format!(
                 "group '{group}' disappeared from the mirror after having synced; keeping the last applied Secret"

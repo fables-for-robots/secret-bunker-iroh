@@ -365,11 +365,15 @@ async fn revocation_freezes_previously_synced_cr() {
     bunker.put("prod", "pw", b"x", 0).await;
 
     let mut cr = test_cr("data: [{secretKey: PW, remoteRef: {group: prod, name: pw}}]");
-    // Previously synced: lastSyncTime present in status.
+    // Previously synced: lastSyncTime present, and observedGeneration
+    // matches the CR's current (unedited) generation — AccessRevoked only
+    // applies while the spec hasn't moved since that sync (see the
+    // never-existing-group distinction test below).
     cr.status = Some(BunkerSecretStatus {
         last_sync_time: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
             k8s_openapi::jiff::Timestamp::now(),
         )),
+        observed_generation: cr.metadata.generation,
         ..Default::default()
     });
 
@@ -423,6 +427,67 @@ async fn revocation_freezes_previously_synced_cr() {
         assert!(std::time::Instant::now() < deadline, "mirror never emptied");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    apply_bunker_secret(&cr, &ctx).await.unwrap();
+    join.await.unwrap();
+}
+
+/// AccessRevoked is a diagnosis about a group that USED to be readable, and
+/// only holds while the spec hasn't moved since the last successful sync.
+/// Here the CR was synced once (generation 1, observedGeneration 1), then
+/// hand-edited (generation bumped to 2) to reference a group that was NEVER
+/// created — a fresh mistake, not a revoked grant. Despite `previously_synced`
+/// being true (lastSyncTime is still set from the earlier sync), the
+/// generation mismatch must steer this to plain MissingGroup.
+#[tokio::test]
+async fn edit_to_never_existing_group_after_sync_reports_missing_group_not_access_revoked() {
+    let bunker = TestBunker::spawn().await;
+    bunker.create_group("prod").await;
+    let reader = SecretKey::generate();
+    bunker.add_reader("op", &reader).await;
+    bunker.grant_read("prod", "op").await;
+    bunker.put("prod", "pw", b"x", 0).await;
+
+    let mut cr = test_cr("data: [{secretKey: PW, remoteRef: {group: nonexistent, name: pw}}]");
+    cr.metadata.generation = Some(2);
+    cr.status = Some(BunkerSecretStatus {
+        last_sync_time: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::jiff::Timestamp::now(),
+        )),
+        observed_generation: Some(1), // stale: the edit to generation 2 hasn't been observed yet
+        ..Default::default()
+    });
+
+    let script = vec![
+        expect(
+            "POST",
+            "events",
+            201,
+            json!({
+                "apiVersion": "events.k8s.io/v1", "kind": "Event",
+                "metadata": {"name": "app.warn", "namespace": "ns"}
+            }),
+        ),
+        expect_checked(
+            "PATCH",
+            "/bunkersecrets/app/status",
+            200,
+            json!({"apiVersion": "bunker.fables-for-robots.ch/v1alpha1", "kind": "BunkerSecret",
+                   "metadata": {"name": "app", "namespace": "ns"}, "spec": {}}),
+            |body| {
+                assert_eq!(
+                    body["status"]["conditions"][0]["reason"],
+                    json!("MissingGroup")
+                );
+            },
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
+    ];
+    let (client, join) = scripted(script);
+    let (ctx, _dir) = synced_context(&bunker, reader, client).await;
+    common::await_mirrored(&ctx.replica, "prod", "pw").await;
 
     apply_bunker_secret(&cr, &ctx).await.unwrap();
     join.await.unwrap();

@@ -30,6 +30,9 @@ jobs:
       - name: Tests (unit + end-to-end over in-process iroh endpoints)
         run: cargo test --workspace
 
+      - name: CRD drift check (generated CRD must match the checked-in manifest)
+        run: cargo run -p secret-bunker-operator --bin crdgen | diff - operator/deploy/crd.yaml
+
   audit:
     runs-on: ubuntu-latest
     # audit-check reports its results as a check run, which needs an
@@ -64,7 +67,7 @@ jobs:
           docker load < result
           kind load docker-image secret-bunker-operator:latest --name chart-testing
 
-      - name: Deploy CRD + operator
+      - name: Install CRD and validate registration
         run: |
           kubectl create secret generic secret-bunker-operator-identity \
             --namespace default --from-literal=identity.key=placeholder || true
