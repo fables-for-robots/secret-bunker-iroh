@@ -9,6 +9,7 @@ use iroh::{Endpoint, EndpointAddr, SecretKey};
 
 use secret_bunker_iroh::client::Client;
 use secret_bunker_iroh::proto::{ALPN, Request, Response};
+use secret_bunker_iroh::replica::{Replica, ReplicaEvent};
 use secret_bunker_iroh::server::Bunker;
 use secret_bunker_iroh::store::{RECIPIENT_BACKUP, Store};
 use secret_bunker_iroh::sync::{self, SYNC_ALPN, SyncMessage, SyncRequest};
@@ -657,6 +658,388 @@ async fn next_sync_msg(recv: &mut iroh::endpoint::RecvStream) -> SyncMessage {
     .expect("timed out waiting for a sync message")
     .expect("reading sync message")
     .expect("sync stream ended unexpectedly")
+}
+
+// ---- replica engine (`Replica`) ----
+
+/// An endpoint that can dial the authoritative node by bare EndpointId: a
+/// memory address book seeded with its full address stands in for
+/// discovery, which these tests deliberately run without.
+async fn replica_endpoint(secret: SecretKey, authoritative: &EndpointAddr) -> Endpoint {
+    Endpoint::builder(presets::Minimal)
+        .secret_key(secret)
+        .address_lookup(iroh::address_lookup::MemoryLookup::from_endpoint_info([
+            authoritative.clone(),
+        ]))
+        .bind()
+        .await
+        .expect("binding replica endpoint")
+}
+
+/// Await the next replica event, failing loudly on timeout.
+async fn next_replica_event(
+    rx: &mut tokio::sync::broadcast::Receiver<ReplicaEvent>,
+) -> ReplicaEvent {
+    tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+        .await
+        .expect("timed out waiting for a replica event")
+        .expect("replica event channel closed")
+}
+
+/// Await `want`, skipping a bounded number of other events (some steps may
+/// legitimately surface an extra event first, e.g. a delete-then-recreate
+/// split across two push rounds).
+async fn await_replica_event(
+    rx: &mut tokio::sync::broadcast::Receiver<ReplicaEvent>,
+    want: &ReplicaEvent,
+) {
+    for _ in 0..32 {
+        if next_replica_event(rx).await == *want {
+            return;
+        }
+    }
+    panic!("event {want:?} never arrived");
+}
+
+#[tokio::test]
+async fn replica_engine_full_flow() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bunker.sqlite");
+    let replica_db = dir.path().join("replica.sqlite");
+
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+    let replica_secret = SecretKey::generate();
+
+    let store = init_store(&db, &op, &backup, &admin_secret.public());
+    let (router, addr) = spawn_authoritative(store, op).await;
+
+    // --- authoritative content: g1 (granted) and g2 (not granted) ---
+    let admin = Client::with_endpoint(client_endpoint(admin_secret).await, addr.clone())
+        .await
+        .unwrap();
+    for group in ["g1", "g2"] {
+        assert_eq!(
+            admin
+                .request(&Request::CreateGroup { name: group.into() })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+    }
+    assert_eq!(
+        admin
+            .request(&Request::AddIdentity {
+                name: "replica".into(),
+                endpoint_id: replica_secret.public().to_string(),
+                service_admin: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Grant {
+                group: "g1".into(),
+                identity: "replica".into(),
+                perms: 1,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    for (group, name, value) in [("g1", "s1", "s1-plaintext"), ("g2", "sx", "sx-plaintext")] {
+        assert_eq!(
+            admin
+                .request(&Request::Put {
+                    group: group.into(),
+                    name: name.into(),
+                    value: value.as_bytes().to_vec(),
+                    expected_version: 0,
+                })
+                .await
+                .unwrap(),
+            Response::Version { version: 1 }
+        );
+    }
+
+    // --- spawn the replica and follow its initial sync ---
+    let ep = replica_endpoint(replica_secret.clone(), &addr).await;
+    let replica = Replica::builder()
+        .store_path(&replica_db)
+        .secret_key(replica_secret.clone())
+        .authoritative(addr.id)
+        .endpoint(ep.clone())
+        .spawn()
+        .await
+        .unwrap();
+    // Subscribing directly after spawn: the sync task cannot have finished
+    // its QUIC handshake (let alone the manifest) in the meantime.
+    let mut rx = replica.subscribe();
+
+    assert_eq!(next_replica_event(&mut rx).await, ReplicaEvent::Connected);
+    assert_eq!(
+        next_replica_event(&mut rx).await,
+        ReplicaEvent::GroupAdded { group: "g1".into() }
+    );
+    assert_eq!(
+        next_replica_event(&mut rx).await,
+        ReplicaEvent::SecretChanged {
+            group: "g1".into(),
+            name: "s1".into(),
+            version: 1,
+        }
+    );
+
+    // --- the mirror serves exactly the granted scope ---
+    assert_eq!(&*replica.get("g1", "s1").unwrap(), b"s1-plaintext");
+    assert!(
+        replica.get("g2", "sx").is_err(),
+        "an ungranted group must not be readable"
+    );
+    assert_eq!(replica.groups().unwrap(), vec!["g1".to_string()]);
+    assert_eq!(replica.list("g1").unwrap(), vec![("s1".to_string(), 1)]);
+    let status = replica.status();
+    assert!(status.connected);
+    assert!(status.last_synced.is_some());
+    assert_eq!(status.authoritative, addr.id);
+    assert_eq!(status.groups, vec!["g1".to_string()]);
+
+    // --- live push: a new secret arrives as an event, then via get() ---
+    assert_eq!(
+        admin
+            .request(&Request::Put {
+                group: "g1".into(),
+                name: "s2".into(),
+                value: b"s2-plaintext".to_vec(),
+                expected_version: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Version { version: 1 }
+    );
+    assert_eq!(
+        next_replica_event(&mut rx).await,
+        ReplicaEvent::SecretChanged {
+            group: "g1".into(),
+            name: "s2".into(),
+            version: 1,
+        }
+    );
+    assert_eq!(&*replica.get("g1", "s2").unwrap(), b"s2-plaintext");
+
+    // --- revocation: the group vanishes from the mirror ---
+    assert_eq!(
+        admin
+            .request(&Request::Grant {
+                group: "g1".into(),
+                identity: "replica".into(),
+                perms: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        next_replica_event(&mut rx).await,
+        ReplicaEvent::GroupRemoved { group: "g1".into() }
+    );
+    assert!(replica.groups().unwrap().is_empty());
+    assert!(replica.get("g1", "s1").is_err());
+
+    // --- re-grant: the full resync brings everything back ---
+    assert_eq!(
+        admin
+            .request(&Request::Grant {
+                group: "g1".into(),
+                identity: "replica".into(),
+                perms: 1,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        next_replica_event(&mut rx).await,
+        ReplicaEvent::GroupAdded { group: "g1".into() }
+    );
+    for name in ["s1", "s2"] {
+        assert_eq!(
+            next_replica_event(&mut rx).await,
+            ReplicaEvent::SecretChanged {
+                group: "g1".into(),
+                name: name.into(),
+                version: 1,
+            }
+        );
+    }
+    assert_eq!(&*replica.get("g1", "s1").unwrap(), b"s1-plaintext");
+
+    // --- delete/recreate ABA: same version, same DEK, new value; only the
+    // nonce tells them apart, and the replica must refetch on it ---
+    assert_eq!(
+        admin
+            .request(&Request::Put {
+                group: "g1".into(),
+                name: "aba".into(),
+                value: b"first".to_vec(),
+                expected_version: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Version { version: 1 }
+    );
+    assert_eq!(
+        next_replica_event(&mut rx).await,
+        ReplicaEvent::SecretChanged {
+            group: "g1".into(),
+            name: "aba".into(),
+            version: 1,
+        }
+    );
+    assert_eq!(&*replica.get("g1", "aba").unwrap(), b"first");
+    assert_eq!(
+        admin
+            .request(&Request::Delete {
+                group: "g1".into(),
+                name: "aba".into(),
+                expected_version: 1,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Put {
+                group: "g1".into(),
+                name: "aba".into(),
+                value: b"second".to_vec(),
+                expected_version: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Version { version: 1 }
+    );
+    // Delete and re-put may land in one push round (one SecretChanged) or
+    // two (SecretDeleted first), depending on the server's debounce.
+    await_replica_event(
+        &mut rx,
+        &ReplicaEvent::SecretChanged {
+            group: "g1".into(),
+            name: "aba".into(),
+            version: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        &*replica.get("g1", "aba").unwrap(),
+        b"second",
+        "the recreated secret must carry the new value, not the stale mirror"
+    );
+
+    replica.shutdown().await;
+    ep.close().await;
+    admin.close().await;
+    router.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn replica_serves_reads_while_authoritative_down() {
+    // Issue #1's headline scenario: the authoritative node goes away and
+    // the replica keeps answering get() from its local mirror.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bunker.sqlite");
+    let replica_db = dir.path().join("replica.sqlite");
+
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+    let replica_secret = SecretKey::generate();
+
+    let store = init_store(&db, &op, &backup, &admin_secret.public());
+    let (router, addr) = spawn_authoritative(store, op).await;
+
+    let admin = Client::with_endpoint(client_endpoint(admin_secret).await, addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        admin
+            .request(&Request::CreateGroup { name: "g1".into() })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::AddIdentity {
+                name: "replica".into(),
+                endpoint_id: replica_secret.public().to_string(),
+                service_admin: false,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Grant {
+                group: "g1".into(),
+                identity: "replica".into(),
+                perms: 1,
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        admin
+            .request(&Request::Put {
+                group: "g1".into(),
+                name: "s1".into(),
+                value: b"survives-outages".to_vec(),
+                expected_version: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Version { version: 1 }
+    );
+
+    let ep = replica_endpoint(replica_secret.clone(), &addr).await;
+    let replica = Replica::builder()
+        .store_path(&replica_db)
+        .secret_key(replica_secret)
+        .authoritative(addr.id)
+        .endpoint(ep.clone())
+        .spawn()
+        .await
+        .unwrap();
+    let mut rx = replica.subscribe();
+    await_replica_event(
+        &mut rx,
+        &ReplicaEvent::SecretChanged {
+            group: "g1".into(),
+            name: "s1".into(),
+            version: 1,
+        },
+    )
+    .await;
+    assert_eq!(&*replica.get("g1", "s1").unwrap(), b"survives-outages");
+
+    // The authoritative node goes down entirely.
+    admin.close().await;
+    router.shutdown().await.unwrap();
+    await_replica_event(&mut rx, &ReplicaEvent::Disconnected).await;
+    assert!(!replica.status().connected);
+
+    // The mirror still serves.
+    assert_eq!(&*replica.get("g1", "s1").unwrap(), b"survives-outages");
+    assert_eq!(replica.groups().unwrap(), vec!["g1".to_string()]);
+
+    replica.shutdown().await;
+    ep.close().await;
 }
 
 #[tokio::test]
