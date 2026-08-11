@@ -1,3 +1,4 @@
+pub mod bunker;
 pub mod crd;
 pub mod http;
 pub mod metrics;
