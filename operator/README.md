@@ -174,9 +174,11 @@ granted `read` on every group it should sync — never `service_admin`.
 
 4. Set `BUNKER_ID` on the Deployment to the bunker's EndpointId (and
    `BUNKER_ADDR` if it needs a direct address — see
-   [Configuration](#configuration)), then apply the manifests:
+   [Configuration](#configuration)), then apply the manifests, namespace
+   first (see [Deploying](#deploying) for why):
 
    ```sh
+   kubectl apply -f operator/deploy/namespace.yaml
    kubectl apply -f operator/deploy/
    ```
 
@@ -339,16 +341,25 @@ sync. This is a documented limitation, not a bug.
 
 ## Deploying
 
+`kubectl apply -f <dir>` applies every file in the directory in
+alphabetical order, **not** dependency order — `crd.yaml`,
+`deployment.yaml`, `namespace.yaml`, `rbac.yaml`. Applying the whole
+directory in one shot therefore tries the Deployment (namespace
+`secret-bunker-system`) before the Namespace itself exists, and fails on
+a fresh cluster (`namespaces "secret-bunker-system" not found`). Apply
+the namespace first, then the rest:
+
 ```sh
+kubectl apply -f operator/deploy/namespace.yaml
 kubectl apply -f operator/deploy/
 ```
 
-applies, in order, the `secret-bunker-system` Namespace, the
-`BunkerSecret` CRD, the ServiceAccount/ClusterRole/ClusterRoleBinding, and
-the Deployment (`operator/deploy/namespace.yaml`, `crd.yaml`, `rbac.yaml`,
-`deployment.yaml`). It assumes the `secret-bunker-operator-identity`
-Secret already exists (step 3 of [Identity
-provisioning](#identity-provisioning-runbook)) and that
+The second command applies the `BunkerSecret` CRD, the
+ServiceAccount/ClusterRole/ClusterRoleBinding, and the Deployment
+(`operator/deploy/crd.yaml`, `rbac.yaml`, `deployment.yaml` — order among
+these three doesn't matter). It assumes the
+`secret-bunker-operator-identity` Secret already exists (step 3 of
+[Identity provisioning](#identity-provisioning-runbook)) and that
 `deployment.yaml`'s `BUNKER_ID` and container `image` have been edited for
 your bunker and registry.
 

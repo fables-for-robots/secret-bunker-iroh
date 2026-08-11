@@ -295,9 +295,13 @@ callers are trusted; ACL enforcement applies to the served surface.
 `secret-bunker-operator` (workspace member `operator/`) is exactly such an
 embedder: it syncs bunker secrets into native Kubernetes `Secret` objects,
 driven by a namespaced `BunkerSecret` custom resource (one CR → one
-Secret, `external-secrets`-style key mappings). Deploy it with:
+Secret, `external-secrets`-style key mappings). Deploy it with (the
+namespace first — `kubectl apply -f <dir>` applies files in unordered,
+alphabetical order, and the Deployment needs its namespace to already
+exist):
 
 ```sh
+kubectl apply -f operator/deploy/namespace.yaml
 kubectl apply -f operator/deploy/
 ```
 
