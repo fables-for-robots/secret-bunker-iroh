@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -14,9 +14,10 @@ use secret_bunker_iroh::keys::KeyRole;
 use secret_bunker_iroh::proto::{Request, Response};
 use secret_bunker_iroh::server::Bunker;
 use secret_bunker_iroh::store::{
-    AuditVerification, PERM_ADMIN, PERM_READ, PERM_WRITE, RECIPIENT_BACKUP, Store,
+    AuditVerification, PERM_ADMIN, PERM_READ, PERM_WRITE, RECIPIENT_BACKUP, RECIPIENT_OPERATIONAL,
+    Store,
 };
-use secret_bunker_iroh::{crypto, keys};
+use secret_bunker_iroh::{agebridge, crypto, keys};
 use zeroize::Zeroize;
 
 #[derive(Parser)]
@@ -261,6 +262,11 @@ enum DbCmd {
         /// "r", "rw", "rwa", or "none".
         #[arg(long)]
         perms: String,
+        /// Operational age identity file, needed only when the grant adds
+        /// the read bit (the existing DEKs must be unwrapped to re-wrap
+        /// them to the grantee). Defaults to the XDG data dir.
+        #[arg(long)]
+        operational_key: Option<PathBuf>,
     },
     /// Verify the audit log hash chain and print the head entry. Record
     /// the head externally: the chain proves in-place integrity, but only
@@ -431,6 +437,110 @@ fn parse_perms(s: &str) -> Result<u8> {
     Ok(perms)
 }
 
+/// `db grant`: set permissions directly in the database, bypassing the
+/// wire ACL checks. Mirrors the server's wrap lifecycle exactly — gaining
+/// read re-wraps every retained DEK version to the grantee, losing read
+/// deletes its wraps and rotates the group DEK — so a rescue grant leaves
+/// the database in the same shape a wire grant would.
+fn db_grant(
+    db: &Path,
+    group: &str,
+    identity: &str,
+    perms: &str,
+    operational_key: Option<PathBuf>,
+) -> Result<()> {
+    let mut store = Store::open(db)?;
+    anyhow::ensure!(store.is_initialized()?, "database is not initialized");
+    let perms = parse_perms(perms)?;
+    let gid = store
+        .group_id(group)?
+        .with_context(|| format!("no group named '{group}'"))?;
+    let target = store
+        .identity_by_name(identity)?
+        .with_context(|| format!("no identity named '{identity}'"))?;
+    let current = store.perms(target.id, gid)?;
+    let audit_target = format!("{group}:{identity}");
+    match (current & PERM_READ != 0, perms & PERM_READ != 0) {
+        (false, true) => {
+            // The only branch that needs the private operational key: the
+            // retained DEKs have to be unwrapped before they can be
+            // re-wrapped to the grantee.
+            let op = resolve_operational_key(operational_key)?;
+            let recorded = store
+                .meta_get("operational_pubkey")?
+                .context("database has no operational pubkey")?;
+            anyhow::ensure!(
+                op.to_public().to_string() == recorded,
+                "operational key {} does not match the one recorded in this database \
+                 ({recorded}); pass the right one with --operational-key",
+                op.to_public()
+            );
+            let recipient = agebridge::recipient_for_endpoint_hex(&target.endpoint_id)?;
+            let mut wraps = Vec::new();
+            for version in store.dek_versions(gid)? {
+                let wrapped_op = store
+                    .dek_wrap(gid, version, RECIPIENT_OPERATIONAL)?
+                    .with_context(|| {
+                        format!("group '{group}' DEK v{version} has no operational wrap")
+                    })?;
+                let dek = crypto::unwrap_dek(&wrapped_op, &op)?;
+                wraps.push((version, crypto::wrap_dek(&dek, &recipient)?));
+            }
+            let wrapped = wraps.len();
+            store.grant_with_wraps(target.id, gid, perms, &wraps, &target.endpoint_id)?;
+            store.audit("(local)", "db-grant", &audit_target, "ok")?;
+            eprintln!("wrapped {wrapped} DEK version(s) to '{identity}'");
+        }
+        (true, false) => {
+            // Revocation needs public keys only: the new DEK is generated
+            // here and wrapped outward, never unwrapped.
+            let op_recipient = keys::parse_age_recipient(
+                &store
+                    .meta_get("operational_pubkey")?
+                    .context("database has no operational pubkey")?,
+            )?;
+            let backup_recipient = keys::parse_age_recipient(
+                &store
+                    .meta_get("backup_pubkey")?
+                    .context("database has no backup pubkey")?,
+            )?;
+            let dek = crypto::Dek::generate();
+            let mut wraps = vec![
+                (
+                    RECIPIENT_OPERATIONAL.to_string(),
+                    crypto::wrap_dek(&dek, &op_recipient)?,
+                ),
+                (
+                    RECIPIENT_BACKUP.to_string(),
+                    crypto::wrap_dek(&dek, &backup_recipient)?,
+                ),
+            ];
+            for reader in store.read_granted_identities(gid)? {
+                if reader.endpoint_id == target.endpoint_id {
+                    continue;
+                }
+                let recipient = agebridge::recipient_for_endpoint_hex(&reader.endpoint_id)?;
+                let wrapped = crypto::wrap_dek(&dek, &recipient)?;
+                wraps.push((reader.endpoint_id, wrapped));
+            }
+            let version =
+                store.revoke_read_and_rotate(gid, target.id, perms, &target.endpoint_id, &wraps)?;
+            store.audit("(local)", "db-grant", &audit_target, "ok")?;
+            store.audit("(local)", "rotate-dek", group, "ok")?;
+            eprintln!("revoked read: rotated group '{group}' to DEK v{version}");
+        }
+        _ => {
+            store.set_perms(target.id, gid, perms)?;
+            store.audit("(local)", "db-grant", &audit_target, "ok")?;
+        }
+    }
+    println!(
+        "granted [{}] on '{group}' to '{identity}'",
+        secret_bunker_iroh::proto::perms_str(perms)
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -515,6 +625,14 @@ async fn main() -> Result<()> {
             let op = resolve_operational_key(operational_key)?;
             let store = Store::open(&db)?;
             let bunker = Bunker::new(store, op)?;
+            // Grants made before per-reader wrapping existed have ACL rows
+            // but no wraps; mint the missing ones now, while the store is
+            // still ours alone. Idempotent, so this is a no-op on every
+            // start after the first.
+            let backfilled = bunker.backfill_reader_wraps()?;
+            if backfilled > 0 {
+                eprintln!("backfilled {backfilled} reader DEK wrap(s)");
+            }
             // N0 presets publish to n0 pkarr/DNS and (unless --no-relay)
             // configure relays; hole punching is on by default, so clients
             // behind NATs can dial the bare EndpointId. mDNS additionally
@@ -592,23 +710,8 @@ async fn main() -> Result<()> {
                 group,
                 identity,
                 perms,
-            } => {
-                let store = Store::open(&db)?;
-                anyhow::ensure!(store.is_initialized()?, "database is not initialized");
-                let perms = parse_perms(&perms)?;
-                let gid = store
-                    .group_id(&group)?
-                    .with_context(|| format!("no group named '{group}'"))?;
-                let target = store
-                    .identity_by_name(&identity)?
-                    .with_context(|| format!("no identity named '{identity}'"))?;
-                store.set_perms(target.id, gid, perms)?;
-                store.audit("(local)", "db-grant", &format!("{group}:{identity}"), "ok")?;
-                println!(
-                    "granted [{}] on '{group}' to '{identity}'",
-                    secret_bunker_iroh::proto::perms_str(perms)
-                );
-            }
+                operational_key,
+            } => db_grant(&db, &group, &identity, &perms, operational_key)?,
             DbCmd::AuditVerify { db } => {
                 let store = Store::open(&db)?;
                 match store.verify_audit_chain()? {

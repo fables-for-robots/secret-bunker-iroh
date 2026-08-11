@@ -28,6 +28,11 @@ pub struct Identity {
     pub service_admin: bool,
 }
 
+/// One group's share of an identity removal: the group to rotate, the
+/// `dek_wrap.recipient` whose rows go away, and the full wrap set of the
+/// DEK version that replaces the old one.
+pub type GroupRotation = (i64, String, Vec<(String, Vec<u8>)>);
+
 #[derive(Debug, Clone)]
 pub struct SecretVersion {
     pub version: u64,
@@ -319,6 +324,10 @@ impl Store {
         Ok(())
     }
 
+    /// Delete an identity without touching key material. Callers that can
+    /// reach the group DEKs should use
+    /// [`Store::remove_identity_with_rotations`] instead: a removed reader
+    /// keeps every DEK it ever unwrapped, so its groups need rotating.
     pub fn remove_identity(&self, name: &str) -> Result<bool> {
         let n = self
             .conn
@@ -372,6 +381,9 @@ impl Store {
         creator_identity_id: i64,
         creator_perms: u8,
     ) -> Result<()> {
+        // A DEK nobody can unwrap is a group nobody can ever read; refuse
+        // to create one rather than discover it at the first `get`.
+        anyhow::ensure!(!wraps.is_empty(), "a group DEK needs at least one wrap");
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO secret_group (name, created_at) VALUES (?1, ?2)",
@@ -513,24 +525,11 @@ impl Store {
     /// Records a new DEK version for a group with a full set of recipient
     /// wraps, in one transaction. Returns the new version number.
     pub fn add_dek(&mut self, group_id: i64, wraps: &[(String, Vec<u8>)]) -> Result<u64> {
+        anyhow::ensure!(!wraps.is_empty(), "a DEK version needs at least one wrap");
         let tx = self.conn.transaction()?;
-        let next: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM group_dek WHERE group_id = ?1",
-            [group_id],
-            |r| r.get(0),
-        )?;
-        tx.execute(
-            "INSERT INTO group_dek (group_id, version, created_at) VALUES (?1, ?2, ?3)",
-            params![group_id, next, now()],
-        )?;
-        for (recipient, wrapped) in wraps {
-            tx.execute(
-                "INSERT INTO dek_wrap (group_id, dek_version, recipient, wrapped, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![group_id, next, recipient, wrapped, now()],
-            )?;
-        }
+        let next = Self::insert_dek_version(&tx, group_id, wraps)?;
         tx.commit()?;
-        Ok(next as u64)
+        Ok(next)
     }
 
     /// Upserts a single recipient's wrap for an existing DEK version (e.g.
@@ -602,6 +601,205 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    // ---- wrap lifecycle ----
+
+    /// Identities holding an explicit READ bit on a group — exactly the
+    /// set that gets a `dek_wrap` row per retained DEK version. A service
+    /// admin without an ACL row is deliberately not included: it reads
+    /// through the operational key, not through a personal wrap.
+    pub fn read_granted_identities(&self, group_id: i64) -> Result<Vec<Identity>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.id, i.endpoint_id, i.name, i.service_admin
+             FROM group_acl a JOIN identity i ON i.id = a.identity_id
+             WHERE a.group_id = ?1 AND (a.perms & ?2) != 0 ORDER BY i.name",
+        )?;
+        let rows = stmt.query_map(params![group_id, PERM_READ as i64], |r| {
+            Ok(Identity {
+                id: r.get(0)?,
+                endpoint_id: r.get(1)?,
+                name: r.get(2)?,
+                service_admin: r.get::<_, i64>(3)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Ids of the groups the identity holds an explicit READ bit on.
+    pub fn groups_with_read(&self, identity_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id FROM group_acl
+             WHERE identity_id = ?1 AND (perms & ?2) != 0 ORDER BY group_id",
+        )?;
+        let rows = stmt.query_map(params![identity_id, PERM_READ as i64], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Name of a group by id (the inverse of [`Store::group_id`]).
+    pub fn group_name(&self, group_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT name FROM secret_group WHERE id = ?1",
+                [group_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Grant read (and whatever else is in `perms`) together with the
+    /// grantee's `(dek_version, wrapped)` rows, in one transaction: an
+    /// identity is never left holding READ without the wraps to use it,
+    /// nor wraps without the ACL row that justifies them.
+    pub fn grant_with_wraps(
+        &mut self,
+        identity_id: i64,
+        group_id: i64,
+        perms: u8,
+        wraps: &[(u64, Vec<u8>)],
+        recipient: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            perms & PERM_READ != 0,
+            "grant_with_wraps is only for grants that include read"
+        );
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO group_acl (identity_id, group_id, perms) VALUES (?1, ?2, ?3)
+             ON CONFLICT (identity_id, group_id) DO UPDATE SET perms = ?3",
+            params![identity_id, group_id, perms as i64],
+        )?;
+        for (dek_version, wrapped) in wraps {
+            tx.execute(
+                "INSERT INTO dek_wrap (group_id, dek_version, recipient, wrapped, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (group_id, dek_version, recipient) DO UPDATE SET wrapped = ?4",
+                params![group_id, *dek_version as i64, recipient, wrapped, now()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Take read away from one identity and rotate the group DEK in the
+    /// same transaction: the ACL change, the deletion of every wrap the
+    /// revoked recipient held, and the new DEK version (wrapped to
+    /// everyone who remains) either all land or none do. Returns the new
+    /// DEK version.
+    pub fn revoke_read_and_rotate(
+        &mut self,
+        group_id: i64,
+        target_identity_id: i64,
+        new_perms: u8,
+        revoked_recipient: &str,
+        new_dek_wraps: &[(String, Vec<u8>)],
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            !new_dek_wraps.is_empty(),
+            "a DEK version needs at least one wrap"
+        );
+        anyhow::ensure!(
+            new_perms & PERM_READ == 0,
+            "revoke_read_and_rotate must not leave the read bit set"
+        );
+        let tx = self.conn.transaction()?;
+        if new_perms == 0 {
+            tx.execute(
+                "DELETE FROM group_acl WHERE identity_id = ?1 AND group_id = ?2",
+                [target_identity_id, group_id],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO group_acl (identity_id, group_id, perms) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (identity_id, group_id) DO UPDATE SET perms = ?3",
+                params![target_identity_id, group_id, new_perms as i64],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM dek_wrap WHERE group_id = ?1 AND recipient = ?2",
+            params![group_id, revoked_recipient],
+        )?;
+        let next = Self::insert_dek_version(&tx, group_id, new_dek_wraps)?;
+        tx.commit()?;
+        Ok(next)
+    }
+
+    /// Delete an identity and rotate the DEK of every group it could
+    /// read, in ONE transaction: `(group_id, revoked_recipient, wraps)`
+    /// per group. False when there is no such identity (nothing is
+    /// rotated in that case). The identity's ACL rows go with it via the
+    /// `group_acl` foreign key cascade.
+    pub fn remove_identity_with_rotations(
+        &mut self,
+        name: &str,
+        rotations: &[GroupRotation],
+    ) -> Result<bool> {
+        for (group_id, _, wraps) in rotations {
+            anyhow::ensure!(
+                !wraps.is_empty(),
+                "group {group_id}'s new DEK needs at least one wrap"
+            );
+        }
+        let tx = self.conn.transaction()?;
+        let removed = tx.execute("DELETE FROM identity WHERE name = ?1", [name])?;
+        if removed == 0 {
+            return Ok(false); // dropping `tx` rolls back
+        }
+        for (group_id, revoked_recipient, wraps) in rotations {
+            tx.execute(
+                "DELETE FROM dek_wrap WHERE group_id = ?1 AND recipient = ?2",
+                params![group_id, revoked_recipient],
+            )?;
+            Self::insert_dek_version(&tx, *group_id, wraps)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Append the next DEK version for a group with its wraps, inside an
+    /// existing transaction. Returns the new version number.
+    fn insert_dek_version(
+        tx: &rusqlite::Transaction<'_>,
+        group_id: i64,
+        wraps: &[(String, Vec<u8>)],
+    ) -> Result<u64> {
+        let next: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM group_dek WHERE group_id = ?1",
+            [group_id],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO group_dek (group_id, version, created_at) VALUES (?1, ?2, ?3)",
+            params![group_id, next, now()],
+        )?;
+        for (recipient, wrapped) in wraps {
+            tx.execute(
+                "INSERT INTO dek_wrap (group_id, dek_version, recipient, wrapped, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![group_id, next, recipient, wrapped, now()],
+            )?;
+        }
+        Ok(next as u64)
+    }
+
+    /// Every `(group_id, dek_version, endpoint_id)` where a read-granted
+    /// identity has no wrap for a retained DEK version — the work list
+    /// for the startup backfill of grants that predate per-reader wraps.
+    pub fn missing_reader_wraps(&self) -> Result<Vec<(i64, u64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.group_id, d.version, i.endpoint_id
+             FROM group_acl a
+             JOIN identity i ON i.id = a.identity_id
+             JOIN group_dek d ON d.group_id = a.group_id
+             LEFT JOIN dek_wrap w ON w.group_id = a.group_id
+               AND w.dek_version = d.version AND w.recipient = i.endpoint_id
+             WHERE (a.perms & ?1) != 0 AND w.recipient IS NULL
+             ORDER BY a.group_id, d.version, i.endpoint_id",
+        )?;
+        let rows = stmt.query_map([PERM_READ as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     // ---- secrets ----
@@ -1032,6 +1230,130 @@ mod tests {
             s.dek_wrap(gid, 1, RECIPIENT_OPERATIONAL).unwrap().unwrap(),
             b"op"
         );
+    }
+
+    #[test]
+    fn empty_wrap_sets_are_refused() {
+        // A DEK version nobody is wrapped to is unrecoverable ciphertext;
+        // every path that mints one refuses an empty wrap set.
+        let mut s = store();
+        let admin = s.identity_by_endpoint("endpoint-admin").unwrap().unwrap();
+        assert!(s.create_group("empty", &[], admin.id, PERM_READ).is_err());
+        assert!(s.group_id("empty").unwrap().is_none());
+        let gid = create_group(&mut s, "g");
+        assert!(s.add_dek(gid, &[]).is_err());
+        assert!(
+            s.revoke_read_and_rotate(gid, admin.id, 0, "endpoint-admin", &[])
+                .is_err()
+        );
+        assert_eq!(s.current_dek_version(gid).unwrap(), 1);
+        assert_eq!(
+            s.perms(admin.id, gid).unwrap(),
+            PERM_READ | PERM_WRITE | PERM_ADMIN
+        );
+    }
+
+    #[test]
+    fn wrap_lifecycle_grant_revoke_and_remove() {
+        let mut s = store();
+        let gid = create_group(&mut s, "g");
+        s.add_identity("alice", "endpoint-alice", false).unwrap();
+        let alice = s.identity_by_name("alice").unwrap().unwrap();
+        // The creator's grant came from create_group's ACL row; it is a
+        // reader, alice is not yet.
+        assert_eq!(
+            s.read_granted_identities(gid)
+                .unwrap()
+                .iter()
+                .map(|i| i.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["admin".to_string()]
+        );
+        assert!(s.groups_with_read(alice.id).unwrap().is_empty());
+
+        // Granting read carries the wraps in the same transaction.
+        s.grant_with_wraps(
+            alice.id,
+            gid,
+            PERM_READ | PERM_WRITE,
+            &[(1, b"alice-v1".to_vec())],
+            "endpoint-alice",
+        )
+        .unwrap();
+        assert_eq!(s.perms(alice.id, gid).unwrap(), PERM_READ | PERM_WRITE);
+        assert_eq!(
+            s.dek_wrap(gid, 1, "endpoint-alice").unwrap().unwrap(),
+            b"alice-v1"
+        );
+        assert_eq!(s.groups_with_read(alice.id).unwrap(), vec![gid]);
+        // A grant without the read bit is a caller bug, not a silent no-op.
+        assert!(
+            s.grant_with_wraps(alice.id, gid, PERM_WRITE, &[], "endpoint-alice")
+                .is_err()
+        );
+
+        // Revoking read down to write-only drops the wraps and rotates.
+        let v = s
+            .revoke_read_and_rotate(
+                gid,
+                alice.id,
+                PERM_WRITE,
+                "endpoint-alice",
+                &[
+                    (RECIPIENT_OPERATIONAL.into(), b"op2".to_vec()),
+                    (RECIPIENT_BACKUP.into(), b"bk2".to_vec()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(v, 2);
+        assert_eq!(s.perms(alice.id, gid).unwrap(), PERM_WRITE);
+        assert!(s.dek_wrap(gid, 1, "endpoint-alice").unwrap().is_none());
+        assert!(s.groups_with_read(alice.id).unwrap().is_empty());
+
+        // Every read-granted identity missing a wrap for a retained
+        // version shows up in the backfill work list. Alice no longer
+        // holds read, so only admin — whose ACL row this test's helper
+        // created without any wraps, exactly like a pre-redesign grant —
+        // is listed, once per retained version.
+        assert_eq!(
+            s.missing_reader_wraps().unwrap(),
+            vec![
+                (gid, 1, "endpoint-admin".to_string()),
+                (gid, 2, "endpoint-admin".to_string())
+            ]
+        );
+
+        // Removing an identity that does not exist rotates nothing.
+        assert!(
+            !s.remove_identity_with_rotations(
+                "nobody",
+                &[(
+                    gid,
+                    "endpoint-admin".into(),
+                    vec![("x".into(), b"y".to_vec())]
+                )],
+            )
+            .unwrap()
+        );
+        assert_eq!(s.current_dek_version(gid).unwrap(), 2);
+
+        // Removing a real one deletes it, its ACL rows, and its wraps,
+        // and rotates the groups it could read — all at once.
+        assert!(
+            s.remove_identity_with_rotations(
+                "admin",
+                &[(
+                    gid,
+                    "endpoint-admin".into(),
+                    vec![(RECIPIENT_OPERATIONAL.into(), b"op3".to_vec())],
+                )],
+            )
+            .unwrap()
+        );
+        assert!(s.identity_by_name("admin").unwrap().is_none());
+        assert_eq!(s.current_dek_version(gid).unwrap(), 3);
+        assert!(s.dek_wrap(gid, 1, "endpoint-admin").unwrap().is_none());
+        assert_eq!(s.admin_count(gid).unwrap(), 0);
     }
 
     #[test]
