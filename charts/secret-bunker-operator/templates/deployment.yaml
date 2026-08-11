@@ -51,7 +51,7 @@ spec:
             {{- if .Values.identity.existingSecret }}
             - --key-file=/etc/secret-bunker/{{ .Values.identity.secretKey }}
             {{- else }}
-            - --identity-secret={{ .Values.identity.secretName }}
+            - --identity-secret={{ required "identity.secretName must be set in managed mode (or set identity.existingSecret for bring-your-own-key)" .Values.identity.secretName }}
             {{- end }}
             - --mirror-path=/var/lib/secret-bunker/replica.sqlite
             {{- with .Values.resyncInterval }}

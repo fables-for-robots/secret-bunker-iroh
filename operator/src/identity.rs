@@ -66,7 +66,12 @@ fn parse_identity_secret(secret: &Secret, name: &str) -> anyhow::Result<SecretKe
         .data
         .as_ref()
         .and_then(|d| d.get(IDENTITY_SECRET_KEY))
-        .with_context(|| format!("identity Secret {name} has no {IDENTITY_SECRET_KEY:?} entry"))?;
+        .with_context(|| {
+            format!(
+                "identity Secret {name} has no {IDENTITY_SECRET_KEY:?} entry — this Secret is \
+                 never overwritten; delete it to let the operator generate a fresh identity"
+            )
+        })?;
     let text = std::str::from_utf8(&data.0)
         .with_context(|| format!("identity Secret {name}: {IDENTITY_SECRET_KEY:?} is not UTF-8"))?;
     text.trim().parse::<SecretKey>().map_err(|e| {
@@ -85,6 +90,11 @@ fn identity_secret(name: &str, key: &SecretKey) -> Secret {
                 ENDPOINT_ID_ANNOTATION.to_string(),
                 key.public().to_string(),
             )])),
+            // NB: this label matches the controller's owned-Secrets watch
+            // selector. The reconciler currently only acts on Secrets with a
+            // matching ownerReference, so this is safe today — but any
+            // future "sweep Secrets by our label" logic must exclude the
+            // identity Secret, or it becomes a key-destroying footgun.
             labels: Some(BTreeMap::from([(
                 "app.kubernetes.io/managed-by".to_string(),
                 "secret-bunker-operator".to_string(),

@@ -20,6 +20,10 @@ Managed by default: first boot generates an iroh key into
 carries the id to grant); restarts reuse it. Set `identity.existingSecret`
 for bring-your-own-key (mounted read-only, `--key-file`; nothing generated).
 The private key never passes through Helm values in either mode.
+`identity.secretName` is fixed per values, not per release, so run at most
+one release per namespace — or override `identity.secretName` per release —
+otherwise two releases in one namespace would silently share one iroh
+identity, which the operator does not support.
 
 ## CRD lifecycle
 

@@ -16,6 +16,9 @@ Grant the operator read access on your bunker:
   bunker add-identity --name k8s-operator --id <EndpointId printed above>
   bunker grant --group <group> --identity k8s-operator --perms r
 
+  (`bunker` here is the `secret-bunker-iroh client` alias set up in the
+  root README's quick start.)
+
 Until granted, /readyz stays 503 and BunkerSecrets report AwaitingSync — loud,
 nothing rendered.
 {{- end }}

@@ -162,6 +162,9 @@ bunker add-identity --name k8s-operator --id <EndpointId printed above>
 bunker grant --group prod --identity k8s-operator --perms r
 ```
 
+(`bunker` here is the `secret-bunker-iroh client` alias set up in the
+[root README's quick start](../README.md#quick-start).)
+
 Until granted, the pod runs but `/readyz` stays 503 and `BunkerSecret`s
 report `AwaitingSync`. To bring your own key instead (the runbook below),
 set `identity.existingSecret` — the chart then mounts that Secret and passes
