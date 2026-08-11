@@ -1042,6 +1042,104 @@ async fn replica_serves_reads_while_authoritative_down() {
     ep.close().await;
 }
 
+/// A fake authoritative node that walks one replica into the fetch phase
+/// and then stalls forever: it serves the Hello with a manifest listing
+/// one secret, reads the resulting `FetchSecrets` request, signals
+/// `got_fetch`, and never answers.
+async fn stalled_authoritative(ep: Endpoint, got_fetch: tokio::sync::oneshot::Sender<()>) {
+    let incoming = ep
+        .accept()
+        .await
+        .expect("endpoint closed before a connection");
+    let conn = incoming.await.expect("accepting sync connection");
+    let (mut send, mut recv) = conn.accept_bi().await.expect("accepting session stream");
+    assert_eq!(
+        sync::read_msg::<SyncRequest>(&mut recv).await.unwrap(),
+        Some(SyncRequest::Hello)
+    );
+    sync::write_msg(
+        &mut send,
+        &SyncMessage::Group {
+            name: "g".into(),
+            acl: Vec::new(),
+            deks: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    sync::write_msg(
+        &mut send,
+        &SyncMessage::GroupSecrets {
+            group: "g".into(),
+            secrets: vec![sync::SecretEntry {
+                name: "s".into(),
+                current_version: 1,
+                dek_version: 1,
+                nonce: vec![0; 12],
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    sync::write_msg(&mut send, &SyncMessage::ManifestDone)
+        .await
+        .unwrap();
+    // The manifest lists a secret the replica does not hold, so it must
+    // now open a fetch stream. Read the request — then go silent, keeping
+    // the connection alive.
+    let (_fetch_send, mut fetch_recv) = conn.accept_bi().await.expect("accepting fetch stream");
+    assert!(matches!(
+        sync::read_msg::<SyncRequest>(&mut fetch_recv).await,
+        Ok(Some(SyncRequest::FetchSecrets { .. }))
+    ));
+    got_fetch.send(()).expect("test dropped the fetch signal");
+    std::future::pending::<()>().await
+}
+
+#[tokio::test]
+async fn replica_shutdown_unblocks_a_stalled_fetch() {
+    // The session-stream reads race the shutdown watch, but the fetch
+    // helpers await inside streams of their own. A peer that stalls
+    // mid-fetch (or dies, leaving QUIC to time out) must not be able to
+    // hold shutdown() hostage: closing the connection has to abort the
+    // pending fetch immediately.
+    let dir = tempfile::tempdir().unwrap();
+    let replica_secret = SecretKey::generate();
+
+    let server_ep = Endpoint::builder(presets::Minimal)
+        .alpns(vec![SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server_addr = server_ep.addr();
+    let (got_fetch_tx, got_fetch_rx) = tokio::sync::oneshot::channel();
+    let stall = tokio::spawn(stalled_authoritative(server_ep.clone(), got_fetch_tx));
+
+    let ep = replica_endpoint(replica_secret.clone(), &server_addr).await;
+    let replica = Replica::builder()
+        .store_path(dir.path().join("replica.sqlite"))
+        .secret_key(replica_secret)
+        .authoritative(server_addr.id)
+        .endpoint(ep.clone())
+        .spawn()
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), got_fetch_rx)
+        .await
+        .expect("timed out waiting for the replica to enter the fetch")
+        .unwrap();
+    // The replica is now parked in the unraced fetch await. Well under
+    // any QUIC idle timeout, and the stalled peer is still alive:
+    tokio::time::timeout(std::time::Duration::from_secs(5), replica.shutdown())
+        .await
+        .expect("shutdown must not wait out a stalled fetch");
+
+    stall.abort();
+    ep.close().await;
+    server_ep.close().await;
+}
+
 #[tokio::test]
 async fn sync_manifest_fetch_and_denials() {
     let dir = tempfile::tempdir().unwrap();

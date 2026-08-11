@@ -89,6 +89,13 @@ struct ReplicaInner {
     /// Whether `spawn` bound `endpoint` itself (then `shutdown` closes it)
     /// or the embedder supplied it (then its lifecycle stays theirs).
     owned_endpoint: bool,
+    /// The sync task's current connection, stashed so [`Replica::shutdown`]
+    /// can close it. The shutdown watch only interrupts the awaits that
+    /// race it (the session reads); closing the connection errors out
+    /// every OTHER pending stream op — notably the fetch helpers — so
+    /// shutdown never waits out a QUIC idle timeout on a dead peer, nor a
+    /// stalled-but-alive one that never finishes a fetch.
+    conn: Mutex<Option<Connection>>,
     shutdown: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -213,6 +220,20 @@ impl Replica {
     /// Stop the sync task and, if `spawn` bound the endpoint, close it.
     pub async fn shutdown(self) {
         let _ = self.inner.shutdown.send(true);
+        // Close the live connection (if any) AFTER signalling: the watch
+        // covers the raced awaits, the close covers everything else (see
+        // the `conn` field). `run_connection` re-checks the watch after
+        // stashing a connection, so one dialled concurrently with this
+        // close cannot slip through unclosed.
+        let conn = self
+            .inner
+            .conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(conn) = conn {
+            conn.close(0u32.into(), b"shutdown");
+        }
         let task = self
             .inner
             .task
@@ -293,8 +314,8 @@ impl ReplicaBuilder {
             .context("ReplicaBuilder: authoritative is required")?;
         let endpoint_hex = secret.public().to_string();
 
-        let store = Store::open(&store_path)?;
-        check_role(&store, &authoritative, &endpoint_hex)?;
+        let mut store = Store::open(&store_path)?;
+        check_role(&mut store, &authoritative, &endpoint_hex)?;
         let age_identity = agebridge::identity_from_secret(&secret)?;
 
         let (endpoint, owned_endpoint) = match self.endpoint {
@@ -332,6 +353,7 @@ impl ReplicaBuilder {
             authoritative,
             endpoint,
             owned_endpoint,
+            conn: Mutex::new(None),
             shutdown,
             task: Mutex::new(None),
         });
@@ -345,12 +367,16 @@ impl ReplicaBuilder {
 /// role, one authoritative node, and one endpoint key on first use, and
 /// refuses any other combination afterwards — syncing a mirror over the
 /// wrong database must fail before the first byte moves.
-fn check_role(store: &Store, authoritative: &EndpointId, own_hex: &str) -> Result<()> {
+fn check_role(store: &mut Store, authoritative: &EndpointId, own_hex: &str) -> Result<()> {
     match store.meta_get("role")?.as_deref() {
         None => {
-            store.meta_set("role", "replica")?;
-            store.meta_set("authoritative", &authoritative.to_string())?;
-            store.meta_set("replica_endpoint_id", own_hex)?;
+            // One transaction: a crash must not leave `role=replica` with
+            // the other stamps missing, which would bail on every reopen.
+            store.meta_set_many(&[
+                ("role", "replica"),
+                ("authoritative", &authoritative.to_string()),
+                ("replica_endpoint_id", own_hex),
+            ])?;
         }
         Some("replica") => {
             let stored = store.meta_get("authoritative")?.unwrap_or_default();
@@ -416,6 +442,15 @@ async fn run_connection(
         }
         _ = shutdown.changed() => return Ok(()),
     };
+    // Make the connection reachable from `shutdown()` (see the `conn`
+    // field), then re-check the flag: had shutdown() looked before the
+    // stash landed, it found nothing to close, and this connection would
+    // otherwise outlive it.
+    *inner.conn.lock().unwrap_or_else(PoisonError::into_inner) = Some(conn.clone());
+    if *shutdown.borrow() {
+        conn.close(0u32.into(), b"shutdown");
+        return Ok(());
+    }
     loop {
         match run_session(inner, &conn, shutdown, backoff).await? {
             SessionEnd::CycleStream => continue,

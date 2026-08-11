@@ -289,6 +289,22 @@ impl Store {
             .optional()?)
     }
 
+    /// Set several meta keys in one transaction — all or none, so a
+    /// multi-key stamp (like a replica's role bookkeeping) can never be
+    /// torn by a crash between the writes.
+    pub fn meta_set_many(&mut self, entries: &[(&str, &str)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (key, value) in entries {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = ?2",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     // ---- identities ----
 
     pub fn identity_by_endpoint(&self, endpoint_id: &str) -> Result<Option<Identity>> {
