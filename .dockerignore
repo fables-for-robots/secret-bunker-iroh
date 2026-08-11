@@ -1,0 +1,9 @@
+.git/
+.direnv/
+.superpowers/
+target/
+result
+docs/
+design/
+*.gif
+*.png
