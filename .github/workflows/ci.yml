@@ -21,13 +21,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests (unit + end-to-end over in-process iroh endpoints)
-        run: cargo test
+        run: cargo test --workspace
 
   audit:
     runs-on: ubuntu-latest

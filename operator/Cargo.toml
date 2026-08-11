@@ -1,0 +1,43 @@
+[package]
+name = "secret-bunker-operator"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "operator"
+path = "src/main.rs"
+
+[[bin]]
+name = "crdgen"
+path = "src/bin/crdgen.rs"
+
+[dependencies]
+secret-bunker-iroh = { path = ".." }
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+data-encoding = "2"
+futures = "0.3"
+humantime = "2.4"
+iroh = "1"
+k8s-openapi = { version = "0.28", features = ["latest", "schemars"] }
+kube = { version = "4.2", features = ["runtime", "client", "derive", "unstable-runtime"] }
+prometheus = "0.14"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = "1"
+
+[dev-dependencies]
+age = "0.11"
+http = "1"
+tempfile = "3"
+tower-test = "0.4"
