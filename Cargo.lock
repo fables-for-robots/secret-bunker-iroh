@@ -4600,6 +4600,7 @@ dependencies = [
  "data-encoding",
  "futures",
  "http",
+ "http-body-util",
  "humantime",
  "iroh",
  "k8s-openapi",
