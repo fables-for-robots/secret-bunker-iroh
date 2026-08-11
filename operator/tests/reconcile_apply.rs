@@ -498,6 +498,198 @@ async fn rename_onto_unowned_secret_is_conflict_and_old_target_untouched() {
     join.await.unwrap();
 }
 
+/// Positive rename cleanup, `deletionPolicy: Delete`: once the new target
+/// ("app") is confirmed safe and applied, the previous target ("old") — a
+/// Secret this CR owns — is deleted outright. Call order matters here:
+/// cleanup of the old name only runs AFTER the new target's apply-or-skip
+/// (see the ordering comment in `apply_bunker_secret`), so the script below
+/// scripts GET-new, PATCH-new, GET-old, DELETE-old, status-PATCH in exactly
+/// that order.
+#[tokio::test]
+async fn rename_cleanup_deletes_old_target_under_delete_policy() {
+    let bunker = TestBunker::spawn().await;
+    bunker.create_group("prod").await;
+    let reader = SecretKey::generate();
+    bunker.add_reader("op", &reader).await;
+    bunker.grant_read("prod", "op").await;
+    bunker.put("prod", "pw", b"hunter2", 0).await;
+
+    let mut cr = test_cr(
+        "deletionPolicy: Delete\ndata: [{secretKey: PW, remoteRef: {group: prod, name: pw}}]",
+    );
+    // Previously applied under "old"; target_name() now resolves to "app"
+    // (no spec.target override) — a rename.
+    cr.status = Some(BunkerSecretStatus {
+        target_secret_name: Some("old".into()),
+        ..Default::default()
+    });
+
+    let script = vec![
+        // 1. GET the new target ("app") — absent.
+        expect(
+            "GET",
+            "/api/v1/namespaces/ns/secrets/app",
+            404,
+            json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            }),
+        ),
+        // 2. SSA apply of the new target.
+        expect_checked(
+            "PATCH",
+            "/api/v1/namespaces/ns/secrets/app",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "app", "namespace": "ns"}
+            }),
+            |body| {
+                assert_eq!(body["data"]["PW"], json!(base64_encode(b"hunter2")));
+            },
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
+        // 3. GET the old target ("old") — present, owned by this CR's uid.
+        expect(
+            "GET",
+            "/api/v1/namespaces/ns/secrets/old",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "old", "namespace": "ns",
+                    "ownerReferences": [{"apiVersion": "bunker.fables-for-robots.ch/v1alpha1",
+                        "kind": "BunkerSecret", "name": "app", "uid": "uid-1", "controller": true}]}
+            }),
+        ),
+        // 4. DELETE the old target — Delete policy, owned, so it goes.
+        expect(
+            "DELETE",
+            "/api/v1/namespaces/ns/secrets/old",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "old", "namespace": "ns"}
+            }),
+        ),
+        // 5. status PATCH — targetSecretName now reflects the new name.
+        expect_checked(
+            "PATCH",
+            "/bunkersecrets/app/status",
+            200,
+            json!({"apiVersion": "bunker.fables-for-robots.ch/v1alpha1", "kind": "BunkerSecret",
+                   "metadata": {"name": "app", "namespace": "ns"}, "spec": {}}),
+            |body| {
+                assert_eq!(body["status"]["targetSecretName"], json!("app"));
+            },
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
+    ];
+    let (client, join) = scripted(script);
+    let (ctx, _dir) = synced_context(&bunker, reader, client).await;
+    common::await_mirrored(&ctx.replica, "prod", "pw").await;
+
+    apply_bunker_secret(&cr, &ctx).await.unwrap();
+    join.await.unwrap();
+}
+
+/// Same rename scenario, but `deletionPolicy: Retain`: instead of a DELETE,
+/// the old target gets a merge-patch that nulls out `metadata.ownerReferences`
+/// so garbage collection never touches it — GC-orphaning, not deletion.
+#[tokio::test]
+async fn rename_cleanup_orphans_old_target_under_retain_policy() {
+    let bunker = TestBunker::spawn().await;
+    bunker.create_group("prod").await;
+    let reader = SecretKey::generate();
+    bunker.add_reader("op", &reader).await;
+    bunker.grant_read("prod", "op").await;
+    bunker.put("prod", "pw", b"hunter2", 0).await;
+
+    // Retain is the default `deletionPolicy`, so the bare data-only spec
+    // below already exercises it.
+    let mut cr = test_cr("data: [{secretKey: PW, remoteRef: {group: prod, name: pw}}]");
+    cr.status = Some(BunkerSecretStatus {
+        target_secret_name: Some("old".into()),
+        ..Default::default()
+    });
+
+    let script = vec![
+        expect(
+            "GET",
+            "/api/v1/namespaces/ns/secrets/app",
+            404,
+            json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            }),
+        ),
+        expect_checked(
+            "PATCH",
+            "/api/v1/namespaces/ns/secrets/app",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "app", "namespace": "ns"}
+            }),
+            |body| {
+                assert_eq!(body["data"]["PW"], json!(base64_encode(b"hunter2")));
+            },
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
+        expect(
+            "GET",
+            "/api/v1/namespaces/ns/secrets/old",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "old", "namespace": "ns",
+                    "ownerReferences": [{"apiVersion": "bunker.fables-for-robots.ch/v1alpha1",
+                        "kind": "BunkerSecret", "name": "app", "uid": "uid-1", "controller": true}]}
+            }),
+        ),
+        // Retain: a merge PATCH clearing ownerReferences, not a DELETE.
+        expect_checked(
+            "PATCH",
+            "/api/v1/namespaces/ns/secrets/old",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "old", "namespace": "ns"}
+            }),
+            |body| {
+                assert!(
+                    body["metadata"]["ownerReferences"].is_null(),
+                    "Retain must orphan the old target by clearing ownerReferences, got {body}"
+                );
+            },
+        ),
+        expect_checked(
+            "PATCH",
+            "/bunkersecrets/app/status",
+            200,
+            json!({"apiVersion": "bunker.fables-for-robots.ch/v1alpha1", "kind": "BunkerSecret",
+                   "metadata": {"name": "app", "namespace": "ns"}, "spec": {}}),
+            |body| {
+                assert_eq!(body["status"]["targetSecretName"], json!("app"));
+            },
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
+    ];
+    let (client, join) = scripted(script);
+    let (ctx, _dir) = synced_context(&bunker, reader, client).await;
+    common::await_mirrored(&ctx.replica, "prod", "pw").await;
+
+    apply_bunker_secret(&cr, &ctx).await.unwrap();
+    join.await.unwrap();
+}
+
 /// Second call, same converged state, no bunker mutation in between: the
 /// condition (status/reason/message), lastSyncTime, observedGeneration,
 /// syncedSecretKeys, and targetSecretName the operator would compute are all
