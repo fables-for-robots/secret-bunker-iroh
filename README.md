@@ -290,6 +290,36 @@ read-only `secret-bunker/1` handler to mount on your own `Router` — an
 embedder that only materializes secrets elsewhere can skip it. In-process
 callers are trusted; ACL enforcement applies to the served surface.
 
+## Kubernetes operator
+
+`secret-bunker-operator` (workspace member `operator/`) is exactly such an
+embedder: it syncs bunker secrets into native Kubernetes `Secret` objects,
+driven by a namespaced `BunkerSecret` custom resource (one CR → one
+Secret, `external-secrets`-style key mappings). Deploy it with:
+
+```sh
+kubectl apply -f operator/deploy/
+```
+
+(after provisioning its identity — see [`operator/README.md`](operator/README.md)).
+Once running, a `BunkerSecret` like this renders a `Secret` named
+`app-secrets` from the bunker's `prod` group:
+
+```yaml
+apiVersion: bunker.fables-for-robots.ch/v1alpha1
+kind: BunkerSecret
+metadata:
+  name: app-secrets
+spec:
+  data:
+    - secretKey: DB_PASSWORD
+      remoteRef: { group: prod, name: db-password }
+```
+
+Full docs — CRD reference, identity provisioning and rotation runbooks,
+config flags, metrics, and deletion/access-loss semantics — are in
+[`operator/README.md`](operator/README.md).
+
 ## Disaster recovery
 
 If the operational key is compromised or lost, take the service down and
