@@ -47,6 +47,7 @@ async fn synced_context(
         recorder,
         resync: Duration::from_secs(3600),
         staleness_threshold: Duration::from_secs(600),
+        backoffs: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
     (ctx, dir)
 }
@@ -800,6 +801,7 @@ async fn second_reconcile_with_unchanged_state_skips_status_patch() {
         recorder: recorder2,
         resync: ctx.resync,
         staleness_threshold: ctx.staleness_threshold,
+        backoffs: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     apply_bunker_secret(&cr2, &ctx2).await.unwrap();
@@ -876,6 +878,7 @@ async fn awaiting_sync_publishes_event_on_first_transition() {
         recorder,
         resync: Duration::from_secs(3600),
         staleness_threshold: Duration::from_secs(600),
+        backoffs: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let action = apply_bunker_secret(&cr, &ctx).await.unwrap();

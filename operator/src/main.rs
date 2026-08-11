@@ -145,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         recorder,
         resync: args.resync_interval,
         staleness_threshold: args.staleness_threshold,
+        backoffs: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     controller

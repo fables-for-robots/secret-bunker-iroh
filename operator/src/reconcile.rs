@@ -1,7 +1,7 @@
 //! The reconcile loop: render from the mirror, server-side apply, status.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use k8s_openapi::api::core::v1::Secret;
@@ -32,6 +32,10 @@ pub struct Context {
     pub recorder: Recorder,
     pub resync: Duration,
     pub staleness_threshold: Duration,
+    /// Per-object ("namespace/name") consecutive transient-error count, used
+    /// by `error_policy` to compute an exponential backoff. Cleared on the
+    /// next successful reconcile of that object.
+    pub backoffs: Mutex<HashMap<String, u32>>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -44,9 +48,31 @@ pub enum Error {
     Transient(String),
 }
 
+/// Key `Context::backoffs` by "namespace/name" — cheap, stable, and unique
+/// enough for a single-kind controller's per-object error count.
+fn backoff_key(cr: &BunkerSecret) -> String {
+    format!("{}/{}", cr.namespace().unwrap_or_default(), cr.name_any())
+}
+
+/// Record one more consecutive transient error for `key`, returning the new
+/// count. A free function over the bare map (rather than a `Context` method)
+/// so it's unit-testable without standing up a `Client`/`Replica`.
+fn record_error(backoffs: &Mutex<HashMap<String, u32>>, key: &str) -> u32 {
+    let mut backoffs = backoffs.lock().unwrap();
+    let count = backoffs.entry(key.to_string()).or_insert(0);
+    *count += 1;
+    *count
+}
+
+/// Clear `key`'s consecutive-error count on a successful reconcile.
+fn clear_backoff(backoffs: &Mutex<HashMap<String, u32>>, key: &str) {
+    backoffs.lock().unwrap().remove(key);
+}
+
 pub async fn reconcile(cr: Arc<BunkerSecret>, ctx: Arc<Context>) -> Result<Action, Error> {
     let timer = ctx.metrics.reconcile_duration.start_timer();
     let ns = cr.namespace().unwrap_or_default();
+    let key = backoff_key(&cr);
     let api: Api<BunkerSecret> = Api::namespaced(ctx.client.clone(), &ns);
     let result = finalizer(&api, FINALIZER, cr, |event| async {
         match event {
@@ -61,12 +87,36 @@ pub async fn reconcile(cr: Arc<BunkerSecret>, ctx: Arc<Context>) -> Result<Actio
         .reconciles_total
         .with_label_values(&[if result.is_ok() { "success" } else { "error" }])
         .inc();
+    // A reconcile that completes without error — even one that only got as
+    // far as reporting a degraded Ready condition (AwaitingSync, Conflict,
+    // StaleReplica, ...) — is not a *transient* failure, so it resets this
+    // object's backoff. Only Err results (kube API errors, `Error::Transient`)
+    // ever reach `error_policy` and grow the count.
+    if result.is_ok() {
+        clear_backoff(&ctx.backoffs, &key);
+    }
     result
 }
 
-pub fn error_policy(_cr: Arc<BunkerSecret>, err: &Error, _ctx: Arc<Context>) -> Action {
+const BACKOFF_BASE: Duration = Duration::from_secs(10);
+const BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
+
+/// Pure exponential-backoff schedule: `min(10s * 2^count, 5min)`. `count` is
+/// the number of consecutive transient errors seen so far for an object (1
+/// on the first error, 2 on the second, ...). Kept as a free function with
+/// no `Context` dependency specifically so the doubling and the cap are
+/// trivially unit-testable without a mock apiserver.
+fn backoff_delay(count: u32) -> Duration {
+    let factor = 1u64.checked_shl(count).unwrap_or(u64::MAX);
+    let secs = BACKOFF_BASE.as_secs().saturating_mul(factor);
+    Duration::from_secs(secs.min(BACKOFF_CAP.as_secs()))
+}
+
+pub fn error_policy(cr: Arc<BunkerSecret>, err: &Error, ctx: Arc<Context>) -> Action {
     tracing::warn!(%err, "reconcile failed; backing off");
-    Action::requeue(Duration::from_secs(10))
+    let key = backoff_key(&cr);
+    let count = record_error(&ctx.backoffs, &key);
+    Action::requeue(backoff_delay(count))
 }
 
 /// The k8s `Time` wire format is second-precision
@@ -459,4 +509,44 @@ pub async fn cleanup_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<A
         }
     }
     Ok(Action::await_change())
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    #[test]
+    fn backoff_delay_doubles_then_caps_at_five_minutes() {
+        assert_eq!(backoff_delay(1), Duration::from_secs(20));
+        assert_eq!(backoff_delay(2), Duration::from_secs(40));
+        assert_eq!(backoff_delay(3), Duration::from_secs(80));
+        assert_eq!(backoff_delay(4), Duration::from_secs(160));
+        // 10 * 2^5 = 320s would exceed the 5-minute cap.
+        assert_eq!(backoff_delay(5), Duration::from_secs(300));
+        assert_eq!(backoff_delay(6), Duration::from_secs(300));
+        assert_eq!(backoff_delay(1000), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn record_error_increments_per_key_and_clear_resets() {
+        let backoffs = Mutex::new(HashMap::new());
+        assert_eq!(record_error(&backoffs, "ns/app"), 1);
+        assert_eq!(record_error(&backoffs, "ns/app"), 2);
+        assert_eq!(record_error(&backoffs, "ns/app"), 3);
+        // A different object's count is tracked independently.
+        assert_eq!(record_error(&backoffs, "ns/other"), 1);
+
+        clear_backoff(&backoffs, "ns/app");
+        // Reset: the next error for this object starts back at 1...
+        assert_eq!(record_error(&backoffs, "ns/app"), 1);
+        // ...while the untouched object's count is unaffected by the reset.
+        assert_eq!(*backoffs.lock().unwrap().get("ns/other").unwrap(), 1);
+    }
+
+    #[test]
+    fn clear_backoff_on_unknown_key_is_a_no_op() {
+        let backoffs = Mutex::new(HashMap::new());
+        clear_backoff(&backoffs, "ns/never-errored");
+        assert!(backoffs.lock().unwrap().is_empty());
+    }
 }

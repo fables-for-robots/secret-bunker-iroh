@@ -38,6 +38,7 @@ async fn ctx_with(client: kube::Client) -> (Context, tempfile::TempDir) {
         recorder,
         resync: Duration::from_secs(3600),
         staleness_threshold: Duration::from_secs(600),
+        backoffs: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
     (ctx, dir)
 }
