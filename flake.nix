@@ -20,7 +20,7 @@
             # Set here the env vars you want to be available in the shell
           '';
 
-          packages = with pkgs; [ rustc cargo rustfmt clippy rust-analyzer kind kubectl ];
+          packages = with pkgs; [ rustc cargo rustfmt clippy rust-analyzer kind kubectl kubernetes-helm ];
         };
       });
 
@@ -40,14 +40,6 @@
         in
         {
           inherit operator;
-        }
-        // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-          operator-image = pkgs.dockerTools.buildLayeredImage {
-            name = "secret-bunker-operator";
-            tag = "latest";
-            contents = [ pkgs.dockerTools.caCertificates ];
-            config.Entrypoint = [ "${operator}/bin/operator" ];
-          };
         });
     };
 }

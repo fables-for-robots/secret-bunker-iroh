@@ -7,7 +7,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use secret_bunker_iroh::keys;
 use secret_bunker_iroh::replica::Replica;
 
 use crate::render::{SecretSource, SourceError};
@@ -90,18 +89,18 @@ impl Default for Staleness {
     }
 }
 
-/// Spawn the embedded replica from operator config. The key path must exist —
-/// keys::load_endpoint_key never auto-generates (an accidental fresh identity
-/// would have no grants and sync nothing, silently).
+/// Spawn the embedded replica from operator config. Key resolution (file or
+/// managed Secret) happens in `main`/`identity` before this — by the time we
+/// are here an identity exists; nothing is ever auto-generated past this
+/// point.
 pub async fn spawn_replica(
     id: &str,
     addrs: &[SocketAddr],
-    key_file: &Path,
+    secret: iroh::SecretKey,
     mirror_path: &Path,
 ) -> anyhow::Result<Replica> {
     let authoritative: iroh::EndpointId =
         id.parse().context("parsing --bunker-id as an EndpointId")?;
-    let secret = keys::load_endpoint_key(key_file)?;
     tracing::info!(
         operator_id = %secret.public(),
         %authoritative,

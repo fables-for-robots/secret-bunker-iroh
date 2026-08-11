@@ -1,0 +1,27 @@
+secret-bunker-operator installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+{{- if .Values.identity.existingSecret }}
+
+Identity: bring-your-own-key mode, using Secret "{{ .Values.identity.existingSecret }}"
+(item "{{ .Values.identity.secretKey }}"). The Secret must already exist in
+{{ .Release.Namespace }} — the pod will not start until it does.
+{{- else }}
+
+Identity: managed mode. On first boot the operator generates its iroh key and
+stores it in Secret "{{ .Values.identity.secretName }}"; restarts reuse it.
+Grant the operator read access on your bunker:
+
+  kubectl -n {{ .Release.Namespace }} get secret {{ .Values.identity.secretName }} \
+    -o jsonpath='{.metadata.annotations.bunker\.fables-for-robots\.ch/endpoint-id}'
+  bunker add-identity --name k8s-operator --id <EndpointId printed above>
+  bunker grant --group <group> --identity k8s-operator --perms r
+
+  (`bunker` here is the `secret-bunker-iroh client` alias set up in the
+  root README's quick start.)
+
+Until granted, /readyz stays 503 and BunkerSecrets report AwaitingSync — loud,
+nothing rendered.
+{{- end }}
+
+CRD upgrades are manual (Helm never touches crds/ after install):
+  kubectl apply -f https://raw.githubusercontent.com/fables-for-robots/secret-bunker-iroh/main/operator/deploy/crd.yaml

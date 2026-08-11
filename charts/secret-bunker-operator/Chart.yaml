@@ -1,0 +1,11 @@
+apiVersion: v2
+name: secret-bunker-operator
+description: Syncs secrets from a secret-bunker-iroh bunker into native Kubernetes Secrets
+type: application
+# Placeholders: the release workflow stamps the real chart/app version from
+# the git tag (helm package --version X.Y.Z --app-version X.Y.Z).
+version: 0.0.0-dev
+appVersion: 0.0.0-dev
+home: https://github.com/fables-for-robots/secret-bunker-iroh
+sources:
+  - https://github.com/fables-for-robots/secret-bunker-iroh

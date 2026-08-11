@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secret-bunker-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "secret-bunker-operator.labels" . | nindent 4 }}
+spec:
+  # One iroh identity, one replica: never two pods at once — sharing one
+  # identity key across concurrent endpoints is unsupported upstream.
+  # Deliberately not a value.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "secret-bunker-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "secret-bunker-operator.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "secret-bunker-operator.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --bunker-id={{ required "bunker.id is required: the authoritative bunker's EndpointId (64-char hex)" .Values.bunker.id }}
+            {{- range .Values.bunker.addrs }}
+            - --bunker-addr={{ . }}
+            {{- end }}
+            {{- if .Values.identity.existingSecret }}
+            - --key-file=/etc/secret-bunker/{{ .Values.identity.secretKey }}
+            {{- else }}
+            - --identity-secret={{ required "identity.secretName must be set in managed mode (or set identity.existingSecret for bring-your-own-key)" .Values.identity.secretName }}
+            {{- end }}
+            - --mirror-path=/var/lib/secret-bunker/replica.sqlite
+            {{- with .Values.resyncInterval }}
+            - --resync-interval={{ . }}
+            {{- end }}
+            {{- with .Values.stalenessThreshold }}
+            - --staleness-threshold={{ . }}
+            {{- end }}
+            - --listen=0.0.0.0:{{ .Values.metrics.port }}
+          ports:
+            - containerPort: {{ .Values.metrics.port }}
+              name: http
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: mirror
+              mountPath: /var/lib/secret-bunker
+            {{- if .Values.identity.existingSecret }}
+            - name: identity
+              mountPath: /etc/secret-bunker
+              readOnly: true
+            {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: mirror
+          emptyDir: {}      # full resync each start, by design
+        {{- if .Values.identity.existingSecret }}
+        - name: identity
+          secret:
+            secretName: {{ .Values.identity.existingSecret }}
+            defaultMode: 0400
+        {{- end }}

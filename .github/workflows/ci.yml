@@ -48,6 +48,34 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Lint chart
+        run: helm lint charts/secret-bunker-operator
+
+      - name: Render smoke (managed identity, defaults)
+        run: |
+          helm template test charts/secret-bunker-operator \
+            --namespace secret-bunker-system \
+            --set bunker.id=5866666666666666666666666666666666666666666666666666666666666666 \
+            > /dev/null
+
+      - name: Render smoke (BYO key + metrics + ServiceMonitor)
+        run: |
+          helm template test charts/secret-bunker-operator \
+            --namespace secret-bunker-system \
+            --set bunker.id=5866666666666666666666666666666666666666666666666666666666666666 \
+            --set identity.existingSecret=my-identity \
+            --set metrics.service.enabled=true \
+            --set metrics.serviceMonitor.enabled=true \
+            > /dev/null
+
+      - name: Chart CRD copy matches operator/deploy/crd.yaml
+        run: diff operator/deploy/crd.yaml charts/secret-bunker-operator/crds/bunkersecrets.yaml
+
   e2e-kind:
     # Manual-only heavyweight smoke test: run from the Actions tab.
     if: github.event_name == 'workflow_dispatch'
@@ -55,21 +83,44 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: DeterminateSystems/nix-installer-action@v16
-
-      - name: Build operator container image
-        run: nix build .#operator-image
+      - name: Build operator image
+        run: docker build -t secret-bunker-operator:e2e .
 
       - uses: helm/kind-action@v1
 
       - name: Load operator image into kind
-        run: |
-          docker load < result
-          kind load docker-image secret-bunker-operator:latest --name chart-testing
+        run: kind load docker-image secret-bunker-operator:e2e --name chart-testing
 
-      - name: Install CRD and validate registration
+      - name: Install chart (managed identity mode)
         run: |
-          kubectl create secret generic secret-bunker-operator-identity \
-            --namespace default --from-literal=identity.key=placeholder || true
-          kubectl apply -f operator/deploy/crd.yaml
-          kubectl get crd bunkersecrets.bunker.fables-for-robots.ch
+          # No bunker is reachable in this smoke test; any parseable
+          # EndpointId works. 0x58 + 31×0x66 is the ed25519 basepoint —
+          # a guaranteed-valid public key encoding.
+          helm install bunker charts/secret-bunker-operator \
+            --namespace secret-bunker-system --create-namespace \
+            --set image.repository=secret-bunker-operator \
+            --set image.tag=e2e \
+            --set image.pullPolicy=Never \
+            --set bunker.id=5866666666666666666666666666666666666666666666666666666666666666
+
+      - name: CRD registered
+        run: kubectl get crd bunkersecrets.bunker.fables-for-robots.ch
+
+      - name: Operator bootstraps its identity Secret
+        run: |
+          for i in $(seq 1 60); do
+            id=$(kubectl -n secret-bunker-system get secret secret-bunker-operator-identity \
+              -o jsonpath='{.metadata.annotations.bunker\.fables-for-robots\.ch/endpoint-id}' \
+              2>/dev/null) && [ -n "$id" ] && break
+            sleep 2
+          done
+          echo "operator EndpointId: ${id:-<never appeared>}"
+          [[ "$id" =~ ^[0-9a-f]{64}$ ]]
+
+      - name: Pod is running, not crash-looping
+        run: |
+          kubectl -n secret-bunker-system get pods
+          sel='-l app.kubernetes.io/name=secret-bunker-operator'
+          phase=$(kubectl -n secret-bunker-system get pods $sel -o jsonpath='{.items[0].status.phase}')
+          restarts=$(kubectl -n secret-bunker-system get pods $sel -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
+          [ "$phase" = Running ] && [ "$restarts" = "0" ]

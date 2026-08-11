@@ -17,6 +17,7 @@ use secret_bunker_operator::bunker::{ReplicaSource, Staleness, spawn_replica};
 use secret_bunker_operator::crd::BunkerSecret;
 use secret_bunker_operator::events::spawn_event_bridge;
 use secret_bunker_operator::http::{AppState, router};
+use secret_bunker_operator::identity;
 use secret_bunker_operator::metrics::Metrics;
 use secret_bunker_operator::reconcile::{Context, error_policy, reconcile};
 
@@ -33,9 +34,19 @@ struct Args {
     /// relay/discovery is used (remote bunker).
     #[arg(long, env = "BUNKER_ADDR")]
     bunker_addr: Vec<SocketAddr>,
-    /// Path to the operator's iroh ed25519 key (pre-provisioned; never generated).
-    #[arg(long, env = "BUNKER_KEY_FILE")]
-    key_file: PathBuf,
+    /// Path to the operator's iroh ed25519 key (pre-provisioned; never
+    /// generated). Exactly one of --key-file / --identity-secret.
+    #[arg(
+        long,
+        env = "BUNKER_KEY_FILE",
+        conflicts_with = "identity_secret",
+        required_unless_present = "identity_secret"
+    )]
+    key_file: Option<PathBuf>,
+    /// Name of a Secret in the operator's own namespace holding its identity
+    /// key; generated and stored there on first boot when missing.
+    #[arg(long, env = "BUNKER_IDENTITY_SECRET")]
+    identity_secret: Option<String>,
     /// Replica mirror SQLite path (emptyDir volume).
     #[arg(long, env = "BUNKER_MIRROR_PATH")]
     mirror_path: PathBuf,
@@ -61,11 +72,20 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let metrics = Metrics::new()?;
+    let client = Client::try_default()
+        .await
+        .context("building kube client")?;
+    let secret_key = match (&args.key_file, &args.identity_secret) {
+        (Some(path), None) => secret_bunker_iroh::keys::load_endpoint_key(path)?,
+        (None, Some(name)) => identity::resolve_managed_identity(&client, name).await?,
+        // clap: conflicts_with + required_unless_present enforce exactly one.
+        _ => unreachable!("clap enforces exactly one of --key-file/--identity-secret"),
+    };
     let replica = Arc::new(
         spawn_replica(
             &args.bunker_id,
             &args.bunker_addr,
-            &args.key_file,
+            secret_key,
             &args.mirror_path,
         )
         .await
@@ -75,9 +95,6 @@ async fn main() -> anyhow::Result<()> {
     let events_rx = replica.subscribe();
     let staleness = Arc::new(Staleness::new());
 
-    let client = Client::try_default()
-        .await
-        .context("building kube client")?;
     let crs: Api<BunkerSecret> = Api::all(client.clone());
     let secrets: Api<Secret> = Api::all(client.clone());
 
