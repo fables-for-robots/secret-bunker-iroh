@@ -68,13 +68,41 @@ pub fn error_policy(_cr: Arc<BunkerSecret>, err: &Error, _ctx: Arc<Context>) -> 
     Action::requeue(Duration::from_secs(10))
 }
 
+/// The k8s `Time` wire format is second-precision
+/// (`%Y-%m-%dT%H:%M:%SZ`, see k8s-openapi's `Time::serialize`), but the
+/// in-memory `jiff::Timestamp` we build it from carries sub-second
+/// precision. Truncate before storing so a value we set ourselves compares
+/// equal to itself after a round trip through the apiserver — otherwise the
+/// status-equality check in `patch_status` never converges, and every
+/// reconcile looks "changed" by a spurious sub-second delta even when
+/// nothing did.
+fn truncate_to_wire_precision(ts: k8s_openapi::jiff::Timestamp) -> k8s_openapi::jiff::Timestamp {
+    k8s_openapi::jiff::Timestamp::from_second(ts.as_second()).unwrap_or(ts)
+}
+
+/// k8s condition convention: `lastTransitionTime` only moves when the
+/// condition's (status, reason) actually changes — carry the prior
+/// timestamp forward otherwise, rather than stamping `now()` on every
+/// reconcile.
 fn ready_condition(cr: &BunkerSecret, ok: bool, reason: &str, message: &str) -> Condition {
+    let status = if ok { "True" } else { "False" }.to_string();
+    let last_transition_time = cr
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.first())
+        .filter(|c| c.status == status && c.reason == reason)
+        .map(|c| c.last_transition_time.clone())
+        .unwrap_or_else(|| {
+            Time(truncate_to_wire_precision(
+                k8s_openapi::jiff::Timestamp::now(),
+            ))
+        });
     Condition {
         type_: "Ready".to_string(),
-        status: if ok { "True" } else { "False" }.to_string(),
+        status,
         reason: reason.to_string(),
         message: message.to_string(),
-        last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
+        last_transition_time,
         observed_generation: cr.metadata.generation,
     }
 }
@@ -85,7 +113,6 @@ async fn patch_status(
     status: BunkerSecretStatus,
 ) -> Result<(), Error> {
     let ns = cr.namespace().unwrap_or_default();
-    let api: Api<BunkerSecret> = Api::namespaced(ctx.client.clone(), &ns);
     let ready = status
         .conditions
         .first()
@@ -95,6 +122,18 @@ async fn patch_status(
         .ready
         .with_label_values(&[&ns, &cr.name_any()])
         .set(if ready { 1 } else { 0 });
+
+    // Nothing materially changed: condition status/reason/message (with
+    // lastTransitionTime already carried forward by `ready_condition` when
+    // status+reason match), lastSyncTime, observedGeneration,
+    // syncedSecretKeys, and targetSecretName are all identical to what's
+    // already on the CR — skip the write instead of patching a no-op.
+    let prev = cr.status.clone().unwrap_or_default();
+    if status == prev {
+        return Ok(());
+    }
+
+    let api: Api<BunkerSecret> = Api::namespaced(ctx.client.clone(), &ns);
     let patch = Patch::Apply(json!({
         "apiVersion": "bunker.fables-for-robots.ch/v1alpha1",
         "kind": "BunkerSecret",
@@ -140,18 +179,12 @@ pub async fn apply_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<Act
     // Gate: never render from an unsynced mirror (a boot-time empty mirror
     // must not look like mass deletion). Tests pre-converge, production waits.
     if ctx.replica.status().last_synced.is_none() {
+        let message = "replica has not completed its initial sync";
+        publish_warning_on_transition(cr, ctx, "AwaitingSync", message).await;
         patch_status(
             cr,
             ctx,
-            status_with(
-                cr,
-                ready_condition(
-                    cr,
-                    false,
-                    "AwaitingSync",
-                    "replica has not completed its initial sync",
-                ),
-            ),
+            status_with(cr, ready_condition(cr, false, "AwaitingSync", message)),
         )
         .await?;
         return Ok(Action::requeue(Duration::from_secs(5)));
@@ -163,18 +196,14 @@ pub async fn apply_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<Act
         Err(e) => return handle_render_error(cr, ctx, e).await,
     };
 
-    // Target rename cleanup: the previously applied Secret, if differently named.
     let target = cr.target_name();
-    if let Some(prev) = cr
-        .status
-        .as_ref()
-        .and_then(|s| s.target_secret_name.clone())
-        && prev != target
-    {
-        cleanup_target(&secrets, cr, &prev).await?;
-    }
 
-    // Fetch current state for ownership + hash-skip.
+    // Fetch current state for ownership + hash-skip. This ownership check on
+    // the (possibly renamed-to) target MUST run before any cleanup of a
+    // previous target name below: if the new name collides with a Secret we
+    // don't own, we bail out with Conflict and leave BOTH the old and the
+    // would-be Secret alone. Cleaning up the old name first and then
+    // aborting here would leave the workload with no Secret at all.
     let existing = match secrets.get(&target).await {
         Ok(s) => Some(s),
         Err(kube::Error::Api(ae)) if ae.code == 404 => None,
@@ -222,26 +251,41 @@ pub async fn apply_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<Act
             .inc();
     }
 
+    // Target rename cleanup: now that the (possibly new) target is confirmed
+    // safe and has been applied or skipped, retire the previous target name
+    // if this reconcile renamed the Secret.
+    if let Some(prev) = cr
+        .status
+        .as_ref()
+        .and_then(|s| s.target_secret_name.clone())
+        && prev != target
+    {
+        cleanup_target(&secrets, cr, &prev).await?;
+    }
+
     // Status: Ready, or degraded-but-serving when the replica is stale.
     let stale = ctx
         .staleness
         .disconnected_for()
         .is_some_and(|d| d >= ctx.staleness_threshold);
     let condition = if stale {
-        ready_condition(
-            cr,
-            false,
-            "StaleReplica",
-            "bunker unreachable; serving last synced state",
-        )
+        let message = "bunker unreachable; serving last synced state";
+        publish_warning_on_transition(cr, ctx, "StaleReplica", message).await;
+        ready_condition(cr, false, "StaleReplica", message)
     } else {
         ready_condition(cr, true, "Synced", "")
     };
+    // A conversion failure (or, defensively, a replica that somehow reports
+    // no sync at all here) must not let SSA null out a lastSyncTime this
+    // field manager previously set — the AccessRevoked freeze rule keys on
+    // it staying present. Carry the CR's current value forward instead.
+    let prev_last_sync = cr.status.as_ref().and_then(|s| s.last_sync_time.clone());
     let last_synced = ctx
         .replica
         .status()
         .last_synced
-        .and_then(system_time_to_k8s);
+        .and_then(system_time_to_k8s)
+        .or(prev_last_sync);
     let status = BunkerSecretStatus {
         conditions: vec![condition],
         last_sync_time: last_synced,
@@ -255,7 +299,7 @@ pub async fn apply_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<Act
 
 fn system_time_to_k8s(t: SystemTime) -> Option<Time> {
     let ts = k8s_openapi::jiff::Timestamp::try_from(t).ok()?;
-    Some(Time(ts))
+    Some(Time(truncate_to_wire_precision(ts)))
 }
 
 async fn handle_render_error(

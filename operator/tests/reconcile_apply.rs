@@ -81,7 +81,9 @@ async fn happy_path_creates_secret_and_sets_ready() {
                 "reason": "NotFound", "code": 404
             }),
         ),
-        // 2. SSA apply of the Secret; assert rendered content
+        // 2. SSA apply of the Secret; assert rendered content + the SSA
+        // contract itself (field manager, force, and the apply-patch
+        // content type — not just method+path).
         expect_checked(
             "PATCH",
             "/api/v1/namespaces/ns/secrets/app",
@@ -103,8 +105,12 @@ async fn happy_path_creates_secret_and_sets_ready() {
                     json!("BunkerSecret")
                 );
             },
-        ),
-        // 3. status patch; assert Ready=True/Synced + bookkeeping
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
+        // 3. status patch; assert Ready=True/Synced + bookkeeping, and the
+        // same SSA contract.
         expect_checked(
             "PATCH",
             "/apis/bunker.fables-for-robots.ch/v1alpha1/namespaces/ns/bunkersecrets/app/status",
@@ -119,7 +125,10 @@ async fn happy_path_creates_secret_and_sets_ready() {
                 assert_eq!(body["status"]["syncedSecretKeys"], json!(["PW"]));
                 assert_eq!(body["status"]["targetSecretName"], json!("app"));
             },
-        ),
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
     ];
     let (client, join) = scripted(script);
     let (ctx, _dir) = synced_context(&bunker, reader, client).await;
@@ -175,7 +184,10 @@ async fn hash_match_skips_apply() {
             200,
             json!({"apiVersion": "bunker.fables-for-robots.ch/v1alpha1", "kind": "BunkerSecret",
                    "metadata": {"name": "app", "namespace": "ns"}, "spec": {}}),
-        ),
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
     ];
     let (client, join) = scripted(script);
     let (ctx, _dir) = synced_context(&bunker, reader, client).await;
@@ -238,7 +250,10 @@ async fn unowned_secret_is_conflict_not_overwrite() {
                 assert_eq!(c["status"], json!("False"));
                 assert_eq!(c["reason"], json!("Conflict"));
             },
-        ),
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
     ];
     let (client, join) = scripted(script);
     let (ctx, _dir) = synced_context(&bunker, reader, client).await;
@@ -290,7 +305,10 @@ async fn revocation_freezes_previously_synced_cr() {
                     json!("AccessRevoked")
                 );
             },
-        ),
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
     ];
     let (client, join) = scripted(script);
     let (ctx, _dir) = synced_context(&bunker, reader, client).await;
@@ -315,5 +333,268 @@ async fn revocation_freezes_previously_synced_cr() {
     }
 
     apply_bunker_secret(&cr, &ctx).await.unwrap();
+    join.await.unwrap();
+}
+
+/// Renaming a CR onto a target name that collides with a Secret we don't own
+/// must not delete/orphan the OLD Secret before discovering the collision:
+/// that would leave the workload with no Secret at all. The ownership check
+/// on the new name has to run, and fail with Conflict, before any cleanup of
+/// the previous name is attempted. The script below has no expectation that
+/// mentions "old" at all — any call the code makes to the old target (GET,
+/// PATCH, or DELETE) is either a path-substring mismatch against the
+/// currently-expected step, or (if the script is already exhausted) a
+/// request the closed mock can't answer — both fail the test.
+#[tokio::test]
+async fn rename_onto_unowned_secret_is_conflict_and_old_target_untouched() {
+    let bunker = TestBunker::spawn().await;
+    bunker.create_group("prod").await;
+    let reader = SecretKey::generate();
+    bunker.add_reader("op", &reader).await;
+    bunker.grant_read("prod", "op").await;
+    bunker.put("prod", "pw", b"x", 0).await;
+
+    let mut cr = test_cr("data: [{secretKey: PW, remoteRef: {group: prod, name: pw}}]");
+    // This CR previously applied to "old"; target_name() now resolves to the
+    // CR's own name "app" (no spec.target override) — a rename.
+    cr.status = Some(BunkerSecretStatus {
+        target_secret_name: Some("old".into()),
+        ..Default::default()
+    });
+
+    let script = vec![
+        // GET the NEW target ("app") — exists, but not owned by this CR.
+        expect(
+            "GET",
+            "/api/v1/namespaces/ns/secrets/app",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "app", "namespace": "ns"} // no ownerReferences
+            }),
+        ),
+        expect(
+            "POST",
+            "events",
+            201,
+            json!({
+                "apiVersion": "events.k8s.io/v1", "kind": "Event",
+                "metadata": {"name": "app.warn", "namespace": "ns"}
+            }),
+        ),
+        expect_checked(
+            "PATCH",
+            "/bunkersecrets/app/status",
+            200,
+            json!({"apiVersion": "bunker.fables-for-robots.ch/v1alpha1", "kind": "BunkerSecret",
+                   "metadata": {"name": "app", "namespace": "ns"}, "spec": {}}),
+            |body| {
+                let c = &body["status"]["conditions"][0];
+                assert_eq!(c["status"], json!("False"));
+                assert_eq!(c["reason"], json!("Conflict"));
+            },
+        )
+        .with_query_contains("fieldManager=secret-bunker-operator")
+        .with_query_contains("force=true")
+        .with_content_type("application/apply-patch+yaml"),
+        // Script ends here — no GET/PATCH/DELETE against "old" is expected.
+    ];
+    let (client, join) = scripted(script);
+    let (ctx, _dir) = synced_context(&bunker, reader, client).await;
+    common::await_mirrored(&ctx.replica, "prod", "pw").await;
+
+    apply_bunker_secret(&cr, &ctx).await.unwrap();
+    join.await.unwrap();
+}
+
+/// Second call, same converged state, no bunker mutation in between: the
+/// condition (status/reason/message), lastSyncTime, observedGeneration,
+/// syncedSecretKeys, and targetSecretName the operator would compute are all
+/// identical to what's already on the CR, so `patch_status` must skip the
+/// write entirely. The second script has no status-PATCH expectation at
+/// all — any attempt to PATCH status here is either a path mismatch against
+/// the (already-consumed) script, or a call the closed mock can't answer;
+/// both fail the test via `.unwrap()` on a `kube::Error`.
+#[tokio::test]
+async fn second_reconcile_with_unchanged_state_skips_status_patch() {
+    let bunker = TestBunker::spawn().await;
+    bunker.create_group("prod").await;
+    let reader = SecretKey::generate();
+    bunker.add_reader("op", &reader).await;
+    bunker.grant_read("prod", "op").await;
+    bunker.put("prod", "pw", b"hunter2", 0).await;
+
+    let cr = test_cr("data: [{secretKey: PW, remoteRef: {group: prod, name: pw}}]");
+
+    let captured_status: Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let captured_status_check = captured_status.clone();
+
+    let script = vec![
+        expect(
+            "GET",
+            "/api/v1/namespaces/ns/secrets/app",
+            404,
+            json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            }),
+        ),
+        expect_checked(
+            "PATCH",
+            "/api/v1/namespaces/ns/secrets/app",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "app", "namespace": "ns"}
+            }),
+            |_body| {},
+        ),
+        expect_checked(
+            "PATCH",
+            "/apis/bunker.fables-for-robots.ch/v1alpha1/namespaces/ns/bunkersecrets/app/status",
+            200,
+            json!({"apiVersion": "bunker.fables-for-robots.ch/v1alpha1", "kind": "BunkerSecret",
+                   "metadata": {"name": "app", "namespace": "ns"}, "spec": {}}),
+            move |body| {
+                *captured_status_check.lock().unwrap() = Some(body["status"].clone());
+            },
+        ),
+    ];
+    let (client, join) = scripted(script);
+    let (ctx, _dir) = synced_context(&bunker, reader, client).await;
+    common::await_mirrored(&ctx.replica, "prod", "pw").await;
+
+    apply_bunker_secret(&cr, &ctx).await.unwrap();
+    join.await.unwrap();
+
+    // Reconstruct the CR exactly as the apiserver would now show it, per the
+    // status this reconcile just wrote.
+    let status_json = captured_status.lock().unwrap().clone().unwrap();
+    let status: BunkerSecretStatus = serde_json::from_value(status_json).unwrap();
+    let mut cr2 = cr.clone();
+    cr2.status = Some(status);
+
+    // Same hash the (unchanged) bunker content renders to, so the Secret GET
+    // below reports an owned, up-to-date Secret and the apply is skipped too
+    // — isolating the assertion to the status-patch skip specifically.
+    let mut data = std::collections::BTreeMap::new();
+    data.insert("PW".to_string(), b"hunter2".to_vec());
+    let hash = secret_bunker_operator::render::content_hash(&data);
+
+    let script2 = vec![expect(
+        "GET",
+        "/api/v1/namespaces/ns/secrets/app",
+        200,
+        json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {
+                "name": "app", "namespace": "ns",
+                "annotations": {HASH_ANNOTATION: hash},
+                "ownerReferences": [{"apiVersion": "bunker.fables-for-robots.ch/v1alpha1",
+                    "kind": "BunkerSecret", "name": "app", "uid": "uid-1", "controller": true}]
+            }
+        }),
+    )];
+    let (client2, join2) = scripted(script2);
+    let recorder2 = kube::runtime::events::Recorder::new(
+        client2.clone(),
+        kube::runtime::events::Reporter {
+            controller: "secret-bunker-operator".into(),
+            instance: None,
+        },
+    );
+    let ctx2 = Context {
+        client: client2,
+        source: ReplicaSource(ctx.replica.clone()),
+        replica: ctx.replica.clone(),
+        metrics: ctx.metrics.clone(),
+        staleness: ctx.staleness.clone(),
+        recorder: recorder2,
+        resync: ctx.resync,
+        staleness_threshold: ctx.staleness_threshold,
+    };
+
+    apply_bunker_secret(&cr2, &ctx2).await.unwrap();
+    join2.await.unwrap();
+}
+
+/// Ready=False transitions publish a Warning event on every transition, not
+/// just the render-error reasons — AwaitingSync included. Calls
+/// `apply_bunker_secret` before the replica's first sync completes (no
+/// `await_mirrored`), which is only deterministic because this is a
+/// current-thread `#[tokio::test]`: the replica's background sync task
+/// can't run until this test task itself yields at an `.await`, and the
+/// AwaitingSync gate is checked synchronously as the very first thing
+/// `apply_bunker_secret` does — mirroring the same current-thread-ordering
+/// argument the event-bridge Lagged test in `events.rs` relies on.
+#[tokio::test]
+async fn awaiting_sync_publishes_event_on_first_transition() {
+    let bunker = TestBunker::spawn().await;
+    bunker.create_group("prod").await;
+    let reader = SecretKey::generate();
+    bunker.add_reader("op", &reader).await;
+    bunker.grant_read("prod", "op").await;
+    bunker.put("prod", "pw", b"x", 0).await;
+
+    let cr = test_cr("data: [{secretKey: PW, remoteRef: {group: prod, name: pw}}]");
+    let dir = tempfile::tempdir().unwrap();
+    let (replica, _rx) = bunker
+        .replica_for(reader, &dir.path().join("m.sqlite"))
+        .await;
+    let replica = Arc::new(replica);
+    assert!(
+        replica.status().last_synced.is_none(),
+        "replica must not have synced yet for this test to be meaningful"
+    );
+
+    let script = vec![
+        expect(
+            "POST",
+            "events",
+            201,
+            json!({
+                "apiVersion": "events.k8s.io/v1", "kind": "Event",
+                "metadata": {"name": "app.warn", "namespace": "ns"}
+            }),
+        ),
+        expect_checked(
+            "PATCH",
+            "/bunkersecrets/app/status",
+            200,
+            json!({"apiVersion": "bunker.fables-for-robots.ch/v1alpha1", "kind": "BunkerSecret",
+                   "metadata": {"name": "app", "namespace": "ns"}, "spec": {}}),
+            |body| {
+                assert_eq!(
+                    body["status"]["conditions"][0]["reason"],
+                    json!("AwaitingSync")
+                );
+            },
+        ),
+    ];
+    let (client, join) = scripted(script);
+    let recorder = kube::runtime::events::Recorder::new(
+        client.clone(),
+        kube::runtime::events::Reporter {
+            controller: "secret-bunker-operator".into(),
+            instance: None,
+        },
+    );
+    let ctx = Context {
+        client,
+        source: ReplicaSource(replica.clone()),
+        replica,
+        metrics: Metrics::new().unwrap(),
+        staleness: Arc::new(Staleness::new()),
+        recorder,
+        resync: Duration::from_secs(3600),
+        staleness_threshold: Duration::from_secs(600),
+    };
+
+    let action = apply_bunker_secret(&cr, &ctx).await.unwrap();
+    assert_eq!(
+        action,
+        kube::runtime::controller::Action::requeue(Duration::from_secs(5))
+    );
     join.await.unwrap();
 }
