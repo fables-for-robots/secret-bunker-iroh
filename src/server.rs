@@ -1003,7 +1003,7 @@ pub(crate) fn audit_outcome(response: &Response) -> &'static str {
 impl ProtocolHandler for Bunker {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote = connection.remote_id().to_string();
-        tracing::debug!(remote, "connection accepted");
+        tracing::info!(client = remote, "client connected");
         // Serve requests until the peer closes the connection. Per-stream
         // errors terminate only this connection.
         loop {
@@ -1072,7 +1072,7 @@ impl Bunker {
 impl ProtocolHandler for SyncServer {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote = connection.remote_id().to_string();
-        tracing::debug!(remote, "sync connection accepted");
+        tracing::info!(client = remote, "sync client connected");
         // One task per stream, so a long-lived Hello session never blocks
         // the fetch streams multiplexed on the same connection. The
         // JoinSet aborts whatever still runs once the connection closes;

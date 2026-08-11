@@ -374,7 +374,7 @@ fn dispatch(inner: &ReplicaInner, store: &Store, remote: &str, req: &Request) ->
 impl ProtocolHandler for ReplicaServer {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote = connection.remote_id().to_string();
-        tracing::debug!(remote, "replica client connection accepted");
+        tracing::info!(client = remote, "client connected");
         // One frame per stream, mirroring `Bunker`'s accept loop: serve
         // until the peer closes, and let per-stream errors end only this
         // connection.
@@ -982,6 +982,7 @@ fn set_connected(inner: &ReplicaInner) {
         !std::mem::replace(&mut status.connected, true)
     };
     if flipped {
+        tracing::info!(authoritative = %inner.authoritative, "connected to authoritative node");
         inner.emit(ReplicaEvent::Connected);
     }
 }
@@ -992,6 +993,7 @@ fn set_disconnected(inner: &ReplicaInner) {
         std::mem::replace(&mut status.connected, false)
     };
     if flipped {
+        tracing::info!(authoritative = %inner.authoritative, "disconnected from authoritative node");
         inner.emit(ReplicaEvent::Disconnected);
     }
 }
