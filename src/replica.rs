@@ -12,6 +12,7 @@
 //! sees the new state.
 
 use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
@@ -19,7 +20,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, bail, ensure};
 use iroh::endpoint::{Connection, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tokio::sync::{broadcast, watch};
 use zeroize::{Zeroize, Zeroizing};
@@ -88,6 +89,11 @@ struct ReplicaInner {
     events: broadcast::Sender<ReplicaEvent>,
     status: Mutex<StatusInner>,
     authoritative: EndpointId,
+    /// What the sync task dials: the authoritative EndpointId, carrying
+    /// any direct addresses the caller seeded (see
+    /// [`ReplicaBuilder::authoritative_addrs`]). With none, this is the
+    /// bare id and resolution is discovery's job.
+    dial: EndpointAddr,
     endpoint: Endpoint,
     /// Whether `spawn` bound `endpoint` itself (then `shutdown` closes it)
     /// or the embedder supplied it (then its lifecycle stays theirs).
@@ -405,6 +411,7 @@ pub struct ReplicaBuilder {
     store_path: Option<PathBuf>,
     secret_key: Option<SecretKey>,
     authoritative: Option<EndpointId>,
+    authoritative_addrs: Vec<SocketAddr>,
     endpoint: Option<Endpoint>,
 }
 
@@ -425,6 +432,15 @@ impl ReplicaBuilder {
     /// The authoritative bunker to sync from.
     pub fn authoritative(mut self, id: EndpointId) -> Self {
         self.authoritative = Some(id);
+        self
+    }
+
+    /// Optional direct socket addresses for the authoritative node, for
+    /// deployments where it cannot be resolved from its EndpointId alone
+    /// (no relays, no mDNS, no DNS — a fixed pair on one host, say).
+    /// Purely additive addressing: the id still authenticates the peer.
+    pub fn authoritative_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.authoritative_addrs = addrs.into_iter().collect();
         self
     }
 
@@ -487,6 +503,13 @@ impl ReplicaBuilder {
                 last_synced: None,
             }),
             authoritative,
+            // With no seeded addresses this is exactly the bare id the
+            // sync task dialled before: `from_parts` over an empty
+            // iterator is `EndpointAddr::new`.
+            dial: EndpointAddr::from_parts(
+                authoritative,
+                self.authoritative_addrs.into_iter().map(TransportAddr::Ip),
+            ),
             endpoint,
             owned_endpoint,
             conn: Mutex::new(None),
@@ -573,7 +596,7 @@ async fn run_connection(
     backoff: &mut Duration,
 ) -> Result<()> {
     let conn = tokio::select! {
-        res = inner.endpoint.connect(inner.authoritative, SYNC_ALPN) => {
+        res = inner.endpoint.connect(inner.dial.clone(), SYNC_ALPN) => {
             res.context("connecting to authoritative node")?
         }
         _ = shutdown.changed() => return Ok(()),

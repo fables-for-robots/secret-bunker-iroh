@@ -86,6 +86,11 @@ enum Cmd {
         /// (EndpointId hex or a server alias). No operational key needed.
         #[arg(long)]
         replica_of: Option<String>,
+        /// Direct `ip:port` of the authoritative node, repeatable. Only
+        /// with --replica-of, and only needed where discovery cannot
+        /// resolve its EndpointId (no relays, no mDNS, no DNS).
+        #[arg(long)]
+        replica_addr: Vec<SocketAddr>,
         /// Disable relays (direct connections only).
         #[arg(long)]
         no_relay: bool,
@@ -648,6 +653,7 @@ async fn main() -> Result<()> {
             endpoint_key,
             operational_key,
             replica_of,
+            replica_addr,
             no_relay,
             no_mdns,
         } => {
@@ -667,6 +673,7 @@ async fn main() -> Result<()> {
                     .store_path(&db)
                     .secret_key(secret)
                     .authoritative(authoritative)
+                    .authoritative_addrs(replica_addr)
                     .endpoint(endpoint.clone())
                     .spawn()
                     .await?;
@@ -688,6 +695,10 @@ async fn main() -> Result<()> {
                 replica.shutdown().await;
                 return Ok(());
             }
+            anyhow::ensure!(
+                replica_addr.is_empty(),
+                "--replica-addr is only meaningful with --replica-of"
+            );
             let secret = resolve_endpoint_key(endpoint_key, KeyRole::Server)?;
             let op = resolve_operational_key(operational_key)?;
             let store = Store::open(&db)?;

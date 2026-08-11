@@ -2388,7 +2388,10 @@ async fn a_commit_while_the_manifest_streams_is_pushed_after_it() {
     let (_hello_send, mut hello_recv) = sync_request(&conn, &SyncRequest::Hello).await;
 
     // Deliberately no reads: the server fills the window and parks there.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // It cannot get past the window without us, so this only has to be
+    // long enough for the snapshot to have been taken — generously, since
+    // a machine under load is the only way to lose that race.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert_eq!(
         admin
             .request(&Request::Put {

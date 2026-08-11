@@ -662,15 +662,10 @@ fn cli_replica_serves_reads_and_outlives_the_authoritative() {
         None,
     );
 
-    // mDNS stays on for both serve processes: `--replica-of` takes an
-    // EndpointId and no address, so local discovery is the only way the
-    // replica can find the authoritative node offline. Clients keep using
-    // --server-addr, as everywhere else in this suite.
-    let (auth_guard, auth_port) = spawn_serve(
-        &server,
-        &root.join("serve.log"),
-        &["--db", db.to_str().unwrap(), "--no-relay"],
-    );
+    // No relays, no mDNS, no DNS — as hermetic as the rest of the suite.
+    // The replica is handed the authoritative node's socket with
+    // --replica-addr, which is what --server-addr does for clients.
+    let (auth_guard, auth_port) = spawn_server(&server, &db, &root.join("serve.log"));
     let auth_addr = format!("127.0.0.1:{auth_port}");
     let to_auth = |rest: &[&str]| -> Vec<String> {
         [
@@ -722,6 +717,29 @@ fn cli_replica_serves_reads_and_outlives_the_authoritative() {
         );
     }
 
+    // That address hint is replica-only: an authoritative `serve` refuses
+    // it rather than silently ignoring it.
+    let out = server.run(
+        &[
+            "serve",
+            "--db",
+            db.to_str().unwrap(),
+            "--replica-addr",
+            &auth_addr,
+        ],
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--replica-addr without --replica-of must fail: {stderr}"
+    );
+    assert!(
+        stderr.contains("--replica-of"),
+        "the error must point at --replica-of: {stderr}"
+    );
+
     let (_replica_guard, replica_port) = spawn_serve(
         &replica,
         &root.join("replica.log"),
@@ -730,7 +748,10 @@ fn cli_replica_serves_reads_and_outlives_the_authoritative() {
             replica_db.to_str().unwrap(),
             "--replica-of",
             &server_id,
+            "--replica-addr",
+            &auth_addr,
             "--no-relay",
+            "--no-mdns",
         ],
     );
     let replica_addr = format!("127.0.0.1:{replica_port}");
