@@ -35,7 +35,9 @@ hostile operator.
 ### In scope
 
 - Theft of the SQLite database file. An attacker who obtains the file alone
-  cannot read any secret.
+  cannot read any secret: every DEK in it is wrapped, and the file holds no
+  private key. Note the recipient set has widened — see "Stolen database
+  files and reader keys" below.
 - Network adversaries between client and server, passive or active. iroh
   connections are end-to-end encrypted (QUIC / TLS 1.3) and mutually
   authenticated by ed25519 endpoint keys; there is nothing to eavesdrop on
@@ -53,8 +55,13 @@ hostile operator.
   data to a connection's negotiated keys; captured packets cannot be
   replayed into a new session. Write requests additionally carry a
   version-CAS precondition, which serves concurrency control.
-- Stolen client credentials. A revoked client identity loses access
-  immediately via ACL change.
+- Stolen client credentials. At the authoritative node, a revoked client
+  identity loses access immediately via the ACL change, and revoking its
+  `read` additionally rotates the group DEK in the same transaction, so
+  nothing written after the revocation is protected by a key the revoked
+  identity ever held. What it already fetched or mirrored cannot be
+  clawed back, and a replica enforces the revocation only once it applies
+  the sync carrying it — see "Replicas" below and section 7.
 - Operational key compromise. Recovery from an offline backup keypair is
   supported.
 
@@ -70,11 +77,52 @@ hostile operator.
   older retained version, or redirect future DEK wrapping to a key they
   hold. Whoever can write the SQLite file is the operator.
 - Compromise of an authorized client's iroh secret key prior to revocation.
-  Anything that client could fetch, the attacker can fetch.
+  Anything that client could fetch, the attacker can fetch — and, since
+  DEKs are wrapped to readers, can also decrypt from any copy of the
+  database or of a mirror covering those groups.
 - Side-channel attacks on the host running the service.
 - Denial of service against the endpoint or its relays.
 - Metadata privacy against relay and discovery infrastructure (see
   Non-Goals).
+
+### Stolen database files and reader keys
+
+Group DEKs are wrapped to every identity holding an explicit `read` grant
+on the group, not only to the operational and backup keys (section 4). Two
+consequences, both accepted deliberately as the price of "any reader can
+run a replica":
+
+- A stolen SQLite file is no longer opaque to everyone but the
+  operational- and backup-key holders. It is decryptable by **any
+  read-granted identity's iroh secret key**, for the groups that identity
+  can read. The blast radius of a leaked client key now includes the
+  database file, not just the wire.
+- A stolen **replica** database exposes, with no key at all, the mirrored
+  metadata: group names, secret names and versions, and the full ACL
+  rosters (identity names, endpoint ids, permission bits) of the groups
+  the replica mirrors. Its ciphertext still needs the replica's endpoint
+  secret key.
+
+Replication also widens *live* metadata visibility: a read grant used for
+sync delivers the group's whole roster to the grantee — data that on the
+client protocol is admin-gated (`GroupAcl`, `ListIdentityNames`) or
+service-admin-gated (endpoint ids via `ListIdentities`). The replica needs
+it to authorize its own clients. See
+[`../docs/sync-protocol.md`](../docs/sync-protocol.md) section 4.
+
+### Replica trust model
+
+A replica is a reader, and nothing more. Compromising it compromises
+exactly the groups its key can read — the same blast radius as
+compromising the client identity it runs as. It holds no operational key,
+no backup key, and no wrap addressed to anyone else, so it cannot read a
+group it was never granted, cannot mint DEK versions, and cannot be
+promoted by anything in its own database (`service_admin` is pinned to 0
+on every mirrored identity row).
+
+The one property a replica does *not* inherit is revocation timeliness:
+an ACL change binds there only once the replica has synced it, with no
+upper bound while it is partitioned (sections 7 and 12).
 
 ## 3. Identities and Keys
 
@@ -131,7 +179,7 @@ recovery.
 ### Client identities
 
 A client identity is exactly one iroh EndpointId. There is no separate
-signing key, no encryption recipient, and no fingerprint scheme: the
+signing key, no *registered* encryption key, and no fingerprint scheme: the
 EndpointId *is* the public key, and the transport handshake performs both
 authentication and confidentiality. A client identity is registered by an
 administrator and bound to a name and zero or more group ACLs.
@@ -141,6 +189,45 @@ client keys are software keys held by the client process.
 Hardware-token-backed identities (FIDO2/PIV) from the original design do not
 carry over; see Non-Goals.
 
+### Derived age recipients
+
+Every identity is also an **age recipient, derived from the EndpointId it
+already has** — no second keypair, no registration step, nothing to
+distribute. This is what lets a group DEK be wrapped to a reader
+(section 4), and hence what lets any reader run a replica.
+
+The derivation is the standard ed25519 → X25519 conversion (`src/agebridge.rs`):
+
+- **Recipient (public), computable by anyone** from the EndpointId stored
+  in the `identity` table: the ed25519 public key is mapped to its
+  Montgomery form (the birational Edwards→Montgomery map) and Bech32-encoded
+  with the `age` HRP, giving an `age1…` recipient.
+- **Identity (secret), computable only by the key holder**: the iroh secret
+  key's SHA-512-expanded scalar half is Bech32-encoded with the
+  `AGE-SECRET-KEY-` HRP. `identity.to_public()` equals the publicly derived
+  recipient, so a wrap made from the EndpointId opens with the endpoint key
+  and nothing else.
+
+Three notes on why this is safe and why it is done this way:
+
+- Reusing one ed25519 keypair for signatures *and* an X25519-based KEM is
+  established practice (age's `ssh-ed25519` stanzas, ssh-to-age/sops-nix,
+  libsodium) and has a formal joint-security analysis: Thormarker, *On
+  using the same key pair for Ed25519 and an X25519 based KEM*, IACR ePrint
+  [2021/509](https://eprint.iacr.org/2021/509). The iroh key's existing
+  TLS signing use stays inside the analyzed signing + ECDH model.
+- The conversion is **native X25519**, deliberately *not* age's `ssh`
+  feature: ssh-ed25519 stanzas apply an extra HKDF tweak and would not
+  interoperate with this derivation.
+- The Bech32 round-trip is not decoration: the pinned age version exposes
+  only Bech32-string constructors for its x25519 types. Only `[u8; 32]`
+  arrays and Bech32 strings cross the bridge, so the two curve25519 stacks
+  in the dependency tree never exchange types.
+
+The derivation is pinned by a golden vector
+(`agebridge::tests::derivation_golden_vector`): if it ever changed
+silently, every stored reader wrap would become unreadable.
+
 ## 4. Encryption at Rest
 
 ### Group DEK model
@@ -149,35 +236,81 @@ Each secret group has an associated 256-bit symmetric data-encryption key
 (DEK). All secret values within a group are encrypted with the current DEK
 using ChaCha20-Poly1305, with the tuple `(group, name, version, dek_version)`
 bound as associated data so a ciphertext cannot be transplanted between
-secrets or versions. The DEK is never stored in cleartext; it exists in two
-wrapped forms:
+secrets or versions. The DEK is never stored in cleartext; it exists only
+as **one wrap per recipient**, each produced by encrypting the DEK as the
+body of an age file addressed to that recipient:
 
-- Wrapped to the operational public key (used for normal serving).
-- Wrapped to the backup public key (used for disaster recovery).
+| `dek_wrap.recipient` | Held by | Used for |
+|---|---|---|
+| `operational` | the server process | normal serving (unwrap to read, re-wrap on rotation) |
+| `backup` | the operator, offline | disaster recovery |
+| a 64-char lowercase-hex EndpointId | that identity | the identity's own reads from a mirror it replicates |
 
-Both wrappings are produced by encrypting the DEK as the body of an age
-file with the two pubkeys as recipients.
+The third row type is the SOPS-style part: **every identity holding an
+explicit `read` grant on the group gets its own wrap**, addressed to the
+age recipient derived from its EndpointId (section 3). It is what lets a
+reader mirror the group and serve it from its own database. The
+service-admin flag's implicit read deliberately creates **no** wraps — it
+is an authorization rule only, so that revoking a service admin does not
+force rotating every group in the bunker. A service admin that should run
+a replica gets explicit read grants.
 
 DEKs are versioned. When a group DEK is rotated, the new DEK is wrapped to
-both recipients and written as a new row. Old DEKs are retained because
-historical secret versions remain encrypted under them.
+the full current recipient set and written as a new version. Old DEK
+versions are retained because historical secret versions remain encrypted
+under them — which is also why *every retained version*, not just the
+current one, is wrapped to a new reader.
+
+### Wrap lifecycle
+
+| Event | Effect on wraps |
+|---|---|
+| `CreateGroup` | DEK v1 wrapped to `operational`, `backup`, and the creator (whose grant carries `read`), in the group's creation transaction |
+| `Grant` gaining `read` | every retained DEK version is unwrapped with the operational key and re-wrapped to the grantee, in the same transaction as the ACL row |
+| `Grant` losing `read` | the identity's wraps (all versions) are deleted **and the group DEK is auto-rotated**, in one transaction |
+| `RemoveIdentity` | the same delete + auto-rotate, for **every** group the identity could read, all in one transaction — a crash can never leave a revocation half-applied |
+| `RotateDek` | a new version wrapped to `operational`, `backup`, and every current reader; nobody loses access to what they were granted |
+| `recover` | the `operational` row of each DEK version is replaced in place; reader and backup wraps are untouched |
+| `serve` startup | idempotent backfill: any missing `(group, version, read-granted identity)` wrap is minted before the sync ALPN starts accepting sessions |
+
+Rotation needs **no private key**: a fresh DEK is generated and wrapped
+outward to public recipients only. Handing a *new* reader the retained
+versions does need the operational key, because those DEKs must be
+unwrapped first — which is why the offline `db grant` command resolves the
+operational key for read grants and for nothing else.
+
+The startup backfill exists so that a database predating per-reader
+wrapping becomes fully wrapped on the first boot of the new binary, and it
+runs *before* replication is served so a replica can never receive a
+manifest with its own wraps still missing.
 
 ### Storage layout
 
 ```
+meta             schema version, role, operational/backup pubkeys, replica stamps
 identity         registered EndpointId + name + service-admin flag
 secret_group     group metadata
 group_acl        which identities have which permissions on a group
-group_dek        (group_id, version, wrapped_operational, wrapped_backup, ...)
+group_dek        (group_id, version, created_at) — the DEK version registry
+dek_wrap         (group_id, dek_version, recipient, wrapped, created_at)
 secret           (group_id, name) — metadata only
 secret_version   (secret_id, version, dek_version, nonce, ciphertext, ...)
 audit_log        append-only request log with hash chain
 ```
 
+`group_dek` carried the two wrapped blobs as columns in schema v1; v2 moved
+them into `dek_wrap` rows (`'operational'`, `'backup'`) and made
+`group_dek` a bare version registry. The migration is pure SQL and applies
+on open; reader wraps cannot be minted by SQL alone (they need the
+operational key to unwrap what they re-wrap) and are backfilled at `serve`
+startup instead.
+
 The SQLite file contains EndpointIds (public material only), ACLs,
 ciphertext, and wrapped DEKs. It contains no plaintext secrets and no
-private keys. A leaked SQLite file is opaque to anyone without the
-operational or backup private key.
+private keys. A leaked SQLite file is opaque to anyone holding none of the
+private keys its wraps are addressed to — which since schema v2 includes
+every read-granted identity's endpoint key, not just the operational and
+backup keys (section 2).
 
 ## 5. Request Authentication
 
@@ -185,7 +318,10 @@ There is no application-layer signature scheme. Authentication is a
 transport property:
 
 - The server binds an iroh endpoint with the ALPN `secret-bunker/1` and
-  accepts connections from any peer.
+  accepts connections from any peer. An authoritative node additionally
+  serves `secret-bunker-sync/1` on the same endpoint for replication,
+  authenticated identically and authorized by explicit `read` grants alone
+  (see [`../docs/sync-protocol.md`](../docs/sync-protocol.md)).
 - iroh's handshake (TLS 1.3, Raw Public Key) proves possession of the
   peer's ed25519 secret key. The server reads the authenticated
   `EndpointId` from the connection; it cannot be spoofed without the
@@ -252,6 +388,16 @@ The server obtains a secret's plaintext by:
 4. Decrypting the secret ciphertext with the recovered DEK
    (ChaCha20-Poly1305, verifying the associated data).
 
+A replica runs the identical path with two substitutions: it opens the wrap
+addressed to its own EndpointId, using the age identity derived from its
+endpoint key (section 3). It has no operational key and no other wrap to
+try.
+
+Replication itself carries no plaintext: a sync stream ships ciphertext,
+the caller's own wraps, and metadata, never an unwrapped DEK and never a
+wrap addressed to anyone else (see
+[`../docs/sync-protocol.md`](../docs/sync-protocol.md) section 4).
+
 ## 7. Authorization
 
 Connection is not authorization. The accept loop admits any peer; every
@@ -298,11 +444,48 @@ that uniformity, both scoped to already-authorized callers:
   service-admin-only.
 
 ACL changes are themselves requests and require `admin` permission on the
-target group. Because DEKs are wrapped only to the operational and backup
-pubkeys — never to client identities — removing an identity from a group's
-ACL takes effect immediately without re-wrapping. A subsequent DEK rotation
-provides defense-in-depth against any plaintext the removed identity
-captured before revocation.
+target group.
+
+### Revocation
+
+Since group DEKs are wrapped to readers (section 4), revoking access is two
+things at once, and the implementation does both in a single transaction:
+it deletes the ACL row (or clears the `read` bit) **and** deletes that
+identity's wraps and auto-rotates the group DEK. `RemoveIdentity` does it
+for every group the identity could read at once. What that buys, precisely:
+
+- **At the authoritative node the denial is instant.** Identity and ACL are
+  re-checked on every request, so the very next stream on an already-open
+  connection is refused — connections carry no session token to outlive
+  the change.
+- **Future writes are protected.** Every secret written after the rotation
+  is encrypted under a DEK version the revoked identity has no wrap for,
+  so a stashed copy of the old DEK decrypts nothing new.
+- **Already-synced copies cannot be clawed back.** Ciphertext and wraps a
+  reader mirrored before the revocation stay readable by it. Rotation does
+  not re-encrypt existing secret versions — old versions stay under old
+  DEKs by design — so revocation is forward protection, never retroactive
+  erasure. Treat a secret a revoked reader could read as compromised and
+  rewrite it; that write lands under the new DEK.
+- **A replica enforces a revocation only when it syncs it.** The ACL
+  travels with the mirror, so until the replica applies the sync carrying
+  the change, a revoked third party can still read its formerly-granted
+  groups *through that replica*. While the authoritative node is down or
+  the replica is partitioned, that window is unbounded — see section 12.
+
+### Replicas
+
+A replica authorizes strictly by the explicit ACL rows it mirrored. The
+permission check is the same shared code as the authoritative node's, with
+the service-admin bypass switched off: `service_admin` is pinned to 0 on
+every mirrored identity row *and* the replica passes "no implicit admin"
+on every call, so neither a synced flag nor a locally tampered one buys
+anything. `ListIdentities` — service-admin gated upstream — is therefore
+uniformly denied on a replica, `ListGroups` reports explicit grants with
+`service_admin: false`, and mutations get `ReadOnlyReplica` (registered
+callers) or the uniform `Denied` (everyone else, so a stranger cannot even
+learn the node's role). See [`../docs/protocol.md`](../docs/protocol.md)
+section 7.
 
 A `Grant` that would leave a group with no explicit `admin` holder is
 refused: an ACL edit is never urgent, and the guard keeps every group
@@ -329,19 +512,43 @@ A one-shot `init` command creates the SQLite file. Inputs:
 
 The command records the operational pubkey, backup pubkey, and admin
 identity, creates no groups, and exits. The service refuses to run `init`
-against a populated database.
+against a populated database. It also stamps the database's **role** as
+authoritative; the v1→v2 migration stamps existing databases the same way,
+so the authoritative/replica distinction is well defined for pre-existing
+files.
+
+### Replica initialization
+
+A replica has no `init` and no key ceremony. Its only key material is its
+own iroh endpoint secret key (auto-generated on first use like any other);
+the age identity that opens its DEK wraps is derived from it (section 3),
+and it holds neither the operational nor the backup key. The first
+`serve --replica-of <id>` stamps the mirror database with its role, the
+authoritative EndpointId, and its own EndpointId, and every later start is
+refused unless all three match — a mirror whose wraps are addressed to a
+different key is useless, and syncing over an authoritative database would
+destroy it.
+
+Onboarding a replica is therefore an ordinary identity registration: read
+its EndpointId on the replica host, register it and grant `read` on the
+authoritative node, start it. One key per replica instance — sharing a key
+across replicas confuses audit attribution and is unsupported.
 
 ### Rotation
 
 **Group DEK.** An admin issues a `rotate-dek` request for a group. The
-server generates a new DEK, wraps it to operational and backup pubkeys, and
-writes a new `group_dek` row. New writes use the new DEK; old secret
-versions remain decryptable via the retained old DEK.
+server generates a new DEK, wraps it to the operational and backup pubkeys
+*and to every current reader*, and writes it as a new version. New writes
+use the new DEK; old secret versions remain decryptable via the retained
+old DEKs. Revoking a reader's `read` performs the same rotation implicitly
+(section 7).
 
 **Operational age keypair.** Generate a new keypair offline. Use the
 existing operational private key (or, if unavailable, the backup private
 key) to decrypt every wrapped DEK, then re-wrap to the new operational
-pubkey. Replace the k8s Secret. The bunker's EndpointId is unaffected.
+pubkey. Replace the k8s Secret. The bunker's EndpointId is unaffected, and
+so are the backup and reader wraps: only the `operational` rows change, so
+replicas notice nothing.
 
 **Server endpoint keypair.** Generate a new iroh keypair and replace the
 k8s Secret. This changes the bunker's EndpointId; every client must be told
@@ -355,15 +562,21 @@ identity is removed. There is deliberately no "replace the EndpointId on
 an existing identity row" operation: it would let a service admin
 silently assume an existing identity, corrupting the audit trail's
 attribution of every subsequent request. Grants do not carry across the
-swap for the same reason. No re-encryption is needed at any point
-because DEKs are never wrapped to client identities.
+swap for the same reason. Key material follows the ACL automatically:
+removing the old identity rotates every group it could read, and each new
+grant of `read` wraps the group's retained DEK versions to the new
+EndpointId's derived recipient. Existing secret versions are never
+re-encrypted.
 
 ### Revocation
 
 Deleting an identity row (or its ACL rows) takes effect on the next
 request. iroh connections are authenticated per-connection, not
 per-session-token, so a revoked peer's existing connection can no longer
-pass the ACL check on any subsequent stream.
+pass the ACL check on any subsequent stream. Since DEKs are wrapped to
+readers, revocation also deletes the identity's wraps and rotates the
+group DEK in the same transaction; what that does and does not guarantee
+is spelled out in section 7.
 
 ## 9. Disaster Recovery
 
@@ -373,16 +586,25 @@ If the operational private key is suspected compromised:
 2. Generate a new operational age keypair offline.
 3. On a clean machine, with the SQLite file copied offline and the backup
    private key available, run the recovery tool:
-   - For every `group_dek` row, age-decrypt `wrapped_backup` with the
-     backup identity.
+   - For every `dek_wrap` row whose recipient is `backup`, age-decrypt the
+     wrap with the backup identity.
    - Re-wrap the recovered DEK to the new operational pubkey.
-   - Update `wrapped_operational` in place.
+   - Update that DEK version's `operational` row in place, and record the
+     new operational pubkey — all in one transaction, so a failure part-way
+     cannot leave a half-rewrapped database.
 4. Replace the k8s Secret with the new operational private key.
 5. Bring the service back up.
 
+Reader wraps are **not** touched: they are addressed to endpoint keys the
+operational key has nothing to do with, so replicas keep working across a
+recovery without re-syncing anything. Backup wraps are likewise untouched —
+recovery re-keys the online half only.
+
 Compromise of the *endpoint* secret key does not expose stored secrets (it
 grants the ability to impersonate the bunker to clients); respond by
-rotating the endpoint key as in section 8.
+rotating the endpoint key as in section 8. The derivation of section 3
+does not change this: the bunker's own endpoint key is not a registered
+identity, so no DEK is ever wrapped to it.
 
 The backup private key is the recovery root and must be stored with the
 same care as a root CA key or password-manager master key. Suggested
@@ -424,6 +646,16 @@ In Kubernetes, mount both server secrets and protect them as follows:
 - Treat operational-key rotation as a routine procedure (see section 8),
   not an emergency response.
 
+A **replica** — including an operator pod embedding the `Replica` library
+component — needs exactly **one** mounted Secret: its own endpoint secret
+key. No operational key, no backup key, no age key of any kind; the age
+identity is derived from the endpoint key in process. What such a pod can
+mirror is decided cryptographically by the authoritative node's ACL and
+its DEK wraps, not by anything configurable in the cluster: granting the
+pod's EndpointId `read` on a group is the whole mechanism, and revoking it
+(plus the automatic rotation) is the whole undo — subject to the sync lag
+of section 7.
+
 ## 11. Cryptographic Primitives Summary
 
 | Purpose | Primitive | Library |
@@ -431,6 +663,7 @@ In Kubernetes, mount both server secrets and protect them as follows:
 | Transport auth + encryption | QUIC / TLS 1.3 RPK, ed25519 EndpointIds | `iroh` |
 | Symmetric secret encryption (DEK) | ChaCha20-Poly1305 | `chacha20poly1305` |
 | Wrapping DEKs to public keys | X25519 + ChaCha20-Poly1305 via age | `age` |
+| Deriving an age recipient/identity from an iroh key | ed25519 → X25519 (Edwards→Montgomery; SHA-512 scalar half), Bech32-encoded | `ed25519-dalek`, `bech32` |
 | Audit-log hash chain | SHA-256 | `sha2` |
 
 ## 12. Non-Goals
@@ -441,7 +674,30 @@ The following are explicitly not provided:
   memory to serve reads, so the operator can read all plaintexts in
   principle.
 - **Forward secrecy for stored secrets.** A future leak of the backup
-  private key allows decryption of past database snapshots.
+  private key allows decryption of past database snapshots. The same holds
+  for a read-granted identity's endpoint key, for the groups it could read.
+- **Retroactive revocation.** Revoking `read` rotates the group DEK, so
+  nothing written afterwards is readable by the revoked key — but
+  ciphertext and wraps it already fetched or mirrored cannot be recalled,
+  and existing secret versions are not re-encrypted. Revocation is forward
+  protection; rewrite the secrets you must actually consider burned.
+- **A staleness bound on replicas.** A replica serves its last mirror for
+  as long as it cannot reach the authoritative node — that is the feature —
+  so an ACL revocation reaches a replica's clients only when the replica
+  syncs it, with no upper bound during a partition or an outage. Nothing
+  in the protocol expires a mirror, and clients cannot tell how stale one
+  is.
+- **Replica chaining.** A replica does not serve the sync ALPN, and a v1
+  mirror could not anyway: it holds only the wraps addressed to its own
+  key. Every replica syncs from the authoritative node directly.
+- **Write proxying and multi-master.** Replicas redirect mutations to the
+  authoritative node rather than forwarding them; there is exactly one
+  writable copy.
+- **Metadata confinement of a read grant.** A read grant used for
+  replication discloses the group's full ACL roster (names, endpoint ids,
+  permission bits) to the grantee, wider than what the client protocol
+  would give the same identity (section 2). There is no "sync without the
+  roster" mode: a replica needs the roster to authorize its own clients.
 - **Multi-party / threshold key management.** A single operational private
   key and a single backup private key.
 - **Hardware-backed client keys.** The iroh handshake requires the ed25519

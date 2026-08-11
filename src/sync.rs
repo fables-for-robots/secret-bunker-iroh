@@ -207,9 +207,11 @@ mod tests {
         }
     }
 
-    /// CBOR golden vectors shared with the Go client
-    /// (go-secret-bunker-iroh/sync_test.go). A failure here means the wire
-    /// format changed and every non-Rust client breaks.
+    /// CBOR golden vectors pinning the sync wire format. A failure here
+    /// means the format changed and every non-Rust implementation breaks.
+    /// Self-contained for now: unlike `proto`'s vectors these have no
+    /// counterpart in another language yet, and should gain one in
+    /// lockstep once a non-Rust replica exists.
     #[test]
     fn wire_format_is_stable() {
         let cases: Vec<(Vec<u8>, &str)> = vec![
