@@ -272,8 +272,10 @@ never reads anything else from it.
    manifest snapshot**. Every mutation committed from that moment on is
    therefore observed either inside the manifest or as a buffered push
    event — never in neither. Events that arrive while the manifest is
-   still streaming are held by the session's debouncer and delivered after
-   `ManifestDone`.
+   still streaming queue up in the session's broadcast subscription; the
+   debouncer only starts draining them once the push phase begins, so they
+   surface right after `ManifestDone` (or, if enough of them accumulated to
+   overflow the channel, as a single `ScopeChanged`).
 3. If the caller is unregistered, the server writes `SyncDenied` and closes
    the stream. Otherwise it streams the scope's groups ordered by name.
 4. For each group: one `Group`, then one or more `GroupSecrets`.
@@ -296,7 +298,12 @@ same group append to its listing, and repeated `Group` messages for the
 same name append to `acl` and `deks`. The current server emits exactly one
 `Group` per group (`acl` and `deks` are not chunked today, the `deks` list
 being ~200 bytes per retained version); the merge rule is the contract, so
-a later server may split them without a protocol break.
+a later server may split them without a protocol break. Until it does, a
+`Group` record that would exceed the cap — an ACL or a rotation history of
+tens of thousands of rows — is not truncated or partially sent: framing
+fails before a byte leaves, the stream dies, and the replica falls into the
+reconnect loop, where it fails identically. Splitting `Group` is the fix
+should such a group ever exist.
 
 **Push events, debounced.** After `ManifestDone` the server forwards
 mutations as they commit. Events are batched: the first event opens a
@@ -320,7 +327,7 @@ under-notification would be a correctness bug.
 
 | Received | Reaction |
 |---|---|
-| `SyncDenied` as the first reply to `Hello` | the session fails; reconnect with backoff (the replica's identity is not registered, or holds no read anywhere) |
+| `SyncDenied` as the first reply to `Hello` | the session fails; reconnect with backoff (the replica's identity is not registered upstream; a *registered* identity with no read grants receives an empty manifest instead — see section 4) |
 | `Changed{group}` | issue `FetchGroup{group}`, then apply section 8 for that group in one local transaction |
 | `SyncDenied` to that `FetchGroup` | the group was deleted upstream or this replica's read was revoked: drop the group locally |
 | `ScopeChanged` | **full resync**: end this session stream and open a fresh one (`Hello` → manifest → apply), preferably on the same QUIC connection |
@@ -330,11 +337,17 @@ under-notification would be a correctness bug.
 belonging to the previous session generation are abandoned. Missed events
 are recovered by the resync; they are never lost silently.
 
-A replica whose identity is removed upstream observes the sequence in full:
-its scope goes empty, the server sends `ScopeChanged`, the replica cycles
-the stream, and the fresh `Hello` is answered with `SyncDenied` — after
-which it retries with backoff, holding its last mirror until an operator
-intervenes.
+The two ways a replica can lose everything are deliberately different:
+
+- **Its identity is removed upstream.** Its scope goes empty, the server
+  sends `ScopeChanged`, the replica cycles the stream, and the fresh
+  `Hello` is answered with `SyncDenied` — after which it retries with
+  backoff, **holding its last mirror** until an operator intervenes.
+- **Its last read grant is revoked, the identity surviving.** The session
+  is not denied: the next `Hello` is answered with an immediate,
+  *empty* manifest, and the completed-resync rule of section 8 then drops
+  every local group. The mirror empties itself and the replica keeps
+  following, ready for a future grant.
 
 ## 7. Fetch streams
 

@@ -19,10 +19,11 @@ pub const SYNC_ALPN: &[u8] = b"secret-bunker-sync/1";
 /// fits one SecretData frame (ciphertext = plaintext + 16B tag + metadata).
 pub const SYNC_MAX_MSG: usize = 8 * 1024 * 1024;
 
-// WIRE CONTRACT: variant and field NAMES are the CBOR encoding. Non-Rust
-// clients (github.com/fables-for-robots/go-secret-bunker-iroh) match them
-// as strings — never rename a variant or field; adding variants is fine.
-// Guarded by the wire_format_is_stable test below.
+// WIRE CONTRACT: variant and field NAMES are the CBOR encoding. No
+// non-Rust implementation of this protocol exists yet, but any that
+// appears will match them as strings — never rename a variant or field;
+// adding variants is fine. Guarded by the wire_format_is_stable test
+// below.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SyncRequest {
     Hello,
