@@ -1,0 +1,53 @@
+image:
+  repository: ghcr.io/fables-for-robots/secret-bunker-operator
+  # "" → the chart's appVersion (the image released with this chart).
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+bunker:
+  # REQUIRED: EndpointId (64-char hex) of the authoritative bunker.
+  id: ""
+  # Direct host:port addresses of the bunker; each entry becomes a repeated
+  # --bunker-addr flag. Empty → iroh n0 relay/discovery.
+  addrs: []
+
+identity:
+  # Managed mode (default): the operator generates its iroh key on first
+  # boot and stores it in this Secret in the release namespace; restarts
+  # reuse it. The public EndpointId to grant is recorded in the Secret's
+  # "bunker.fables-for-robots.ch/endpoint-id" annotation.
+  secretName: secret-bunker-operator-identity
+  # Bring-your-own-key mode: set to the name of an existing Secret to mount
+  # it read-only and pass --key-file instead. Nothing is ever generated.
+  existingSecret: ""
+  # BYO-key mode only: the item inside existingSecret holding the key file.
+  # Managed mode always uses "identity.key" (hardcoded operator-side).
+  secretKey: identity.key
+
+# "" → binary defaults (1h / 10m); flags are only rendered when set.
+resyncInterval: ""
+stalenessThreshold: ""
+
+metrics:
+  port: 8080
+  service:
+    enabled: false
+  serviceMonitor:
+    # Requires metrics.service.enabled and the Prometheus Operator CRDs.
+    enabled: false
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+rbac:
+  create: true
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""

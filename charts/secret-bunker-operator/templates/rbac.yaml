@@ -1,0 +1,39 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "secret-bunker-operator.fullname" . }}
+  labels:
+    {{- include "secret-bunker-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["bunker.fables-for-robots.ch"]
+    resources: ["bunkersecrets"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["bunker.fables-for-robots.ch"]
+    resources: ["bunkersecrets/status"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "secret-bunker-operator.fullname" . }}
+  labels:
+    {{- include "secret-bunker-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "secret-bunker-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "secret-bunker-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
