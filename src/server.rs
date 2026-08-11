@@ -207,12 +207,7 @@ impl Bunker {
             _ => Vec::new(),
         };
         let outcome = Self::dispatch(inner, &mut store, remote, req);
-        let audit_outcome = match &outcome {
-            Response::Denied => "denied",
-            Response::VersionConflict { .. } => "conflict",
-            Response::Failed { .. } => "failed",
-            _ => "ok",
-        };
+        let audit_outcome = audit_outcome(&outcome);
         if let Err(err) = store.audit(remote, req.op(), &req.target(), audit_outcome) {
             tracing::error!(%err, "audit append failed");
         }
@@ -261,8 +256,19 @@ impl Bunker {
         let Ok(Some(ident)) = store.identity_by_endpoint(remote) else {
             return Response::Denied;
         };
+        // The read paths are shared with the replica handler; the
+        // authoritative node is the caller that passes the operational
+        // key and honours the service-admin bypass.
         match req {
-            Request::Get { group, name } => Self::get(inner, store, &ident, group, name),
+            Request::Get { group, name } => read_secret(
+                store,
+                &ident,
+                group,
+                name,
+                RECIPIENT_OPERATIONAL,
+                &inner.op_identity,
+                ident.service_admin,
+            ),
             Request::Put {
                 group,
                 name,
@@ -274,7 +280,7 @@ impl Bunker {
                 name,
                 expected_version,
             } => Self::delete(store, &ident, group, name, *expected_version),
-            Request::List { group } => Self::list(store, &ident, group),
+            Request::List { group } => list(store, &ident, group, ident.service_admin),
             Request::CreateGroup { name } => Self::create_group(inner, store, &ident, name),
             Request::AddIdentity {
                 name,
@@ -290,8 +296,10 @@ impl Bunker {
             } => Self::grant(inner, store, &ident, group, identity, *perms),
             Request::RotateDek { group } => Self::rotate_dek(inner, store, &ident, group),
             Request::ListGroups => Self::list_groups(store, &ident),
-            Request::GroupAcl { group } => Self::group_acl(store, &ident, group),
-            Request::ListIdentityNames { group } => Self::list_identity_names(store, &ident, group),
+            Request::GroupAcl { group } => group_acl(store, &ident, group, ident.service_admin),
+            Request::ListIdentityNames { group } => {
+                list_identity_names(store, &ident, group, ident.service_admin)
+            }
             Request::SetServiceAdmin {
                 name,
                 service_admin,
@@ -299,26 +307,23 @@ impl Bunker {
         }
     }
 
+    /// The authoritative listing: every group for a service admin (with
+    /// the effective, full bitmask), the caller's explicit grants
+    /// otherwise. Replicas serve [`list_groups_explicit`] instead.
     fn list_groups(store: &Store, ident: &Identity) -> Response {
-        let groups = if ident.service_admin {
-            store.all_groups_with_perms(ident.id)
-        } else {
-            store.groups_for_identity(ident.id)
-        };
-        match groups {
+        if !ident.service_admin {
+            return list_groups_explicit(store, ident);
+        }
+        match store.all_groups_with_perms(ident.id) {
             Ok(groups) => Response::Groups {
-                service_admin: ident.service_admin,
+                service_admin: true,
                 groups: groups
                     .into_iter()
-                    .map(|(name, perms)| crate::proto::GroupInfo {
+                    .map(|(name, _)| crate::proto::GroupInfo {
                         name,
                         // Report effective perms: service admins hold
                         // every bit on every group.
-                        perms: if ident.service_admin {
-                            PERM_READ | PERM_WRITE | PERM_ADMIN
-                        } else {
-                            perms
-                        },
+                        perms: PERM_READ | PERM_WRITE | PERM_ADMIN,
                     })
                     .collect(),
             },
@@ -326,41 +331,6 @@ impl Bunker {
                 reason: "internal error".into(),
             },
         }
-    }
-
-    fn group_acl(store: &Store, ident: &Identity, group: &str) -> Response {
-        let Some(group_id) = Self::authorize_group(store, ident, group, PERM_ADMIN) else {
-            return Response::Denied;
-        };
-        match store.group_acl_entries(group_id) {
-            Ok(entries) => Response::Acl(entries),
-            Err(_) => Response::Failed {
-                reason: "internal error".into(),
-            },
-        }
-    }
-
-    fn list_identity_names(store: &Store, ident: &Identity, group: &str) -> Response {
-        if Self::authorize_group(store, ident, group, PERM_ADMIN).is_none() {
-            return Response::Denied;
-        }
-        match store.list_identities() {
-            Ok(ids) => Response::IdentityNames(ids.into_iter().map(|i| i.name).collect()),
-            Err(_) => Response::Failed {
-                reason: "internal error".into(),
-            },
-        }
-    }
-
-    /// Resolve a group and check that `ident` holds all bits in `needed`.
-    /// Service admins implicitly hold every bit on every group.
-    fn authorize_group(store: &Store, ident: &Identity, group: &str, needed: u8) -> Option<i64> {
-        let group_id = store.group_id(group).ok()??;
-        if ident.service_admin {
-            return Some(group_id);
-        }
-        let perms = store.perms(ident.id, group_id).ok()?;
-        (perms & needed == needed).then_some(group_id)
     }
 
     fn unwrap_dek(
@@ -377,31 +347,6 @@ impl Bunker {
         crypto::unwrap_dek(&wrapped, &inner.op_identity)
     }
 
-    fn get(inner: &Inner, store: &Store, ident: &Identity, group: &str, name: &str) -> Response {
-        let Some(group_id) = Self::authorize_group(store, ident, group, PERM_READ) else {
-            return Response::Denied;
-        };
-        let Ok(Some(sv)) = store.secret_current(group_id, name) else {
-            return Response::Denied;
-        };
-        let plaintext = Self::unwrap_dek(inner, store, group_id, sv.dek_version).and_then(|dek| {
-            let aad = crypto::secret_aad(group, name, sv.version, sv.dek_version);
-            crypto::decrypt_secret(&dek, &aad, &sv.nonce, &sv.ciphertext)
-        });
-        match plaintext {
-            Ok(value) => Response::Secret {
-                value,
-                version: sv.version,
-            },
-            Err(err) => {
-                tracing::error!(%err, group, name, "failed to decrypt secret");
-                Response::Failed {
-                    reason: "internal error".into(),
-                }
-            }
-        }
-    }
-
     fn put(
         inner: &Inner,
         store: &mut Store,
@@ -411,7 +356,8 @@ impl Bunker {
         value: &[u8],
         expected_version: u64,
     ) -> Response {
-        let Some(group_id) = Self::authorize_group(store, ident, group, PERM_WRITE) else {
+        let Some(group_id) = authorize_group(store, ident, group, PERM_WRITE, ident.service_admin)
+        else {
             return Response::Denied;
         };
         let Ok(dek_version) = store.current_dek_version(group_id) else {
@@ -495,7 +441,8 @@ impl Bunker {
         name: &str,
         expected_version: u64,
     ) -> Response {
-        let Some(group_id) = Self::authorize_group(store, ident, group, PERM_WRITE) else {
+        let Some(group_id) = authorize_group(store, ident, group, PERM_WRITE, ident.service_admin)
+        else {
             return Response::Denied;
         };
         match store.delete_secret(group_id, name, expected_version) {
@@ -505,21 +452,6 @@ impl Bunker {
             Ok(CasOutcome::Conflict { current }) => Response::VersionConflict { current },
             Err(err) => {
                 tracing::error!(%err, group, name, "failed to delete secret");
-                Response::Failed {
-                    reason: "internal error".into(),
-                }
-            }
-        }
-    }
-
-    fn list(store: &Store, ident: &Identity, group: &str) -> Response {
-        let Some(group_id) = Self::authorize_group(store, ident, group, PERM_READ) else {
-            return Response::Denied;
-        };
-        match store.list_secrets(group_id) {
-            Ok(names) => Response::Names(names),
-            Err(err) => {
-                tracing::error!(%err, group, "failed to list secrets");
                 Response::Failed {
                     reason: "internal error".into(),
                 }
@@ -739,7 +671,8 @@ impl Bunker {
         identity: &str,
         perms: u8,
     ) -> Response {
-        let Some(group_id) = Self::authorize_group(store, ident, group, PERM_ADMIN) else {
+        let Some(group_id) = authorize_group(store, ident, group, PERM_ADMIN, ident.service_admin)
+        else {
             return Response::Denied;
         };
         if perms & !(PERM_READ | PERM_WRITE | PERM_ADMIN) != 0 {
@@ -873,7 +806,8 @@ impl Bunker {
     }
 
     fn rotate_dek(inner: &Inner, store: &mut Store, ident: &Identity, group: &str) -> Response {
-        let Some(group_id) = Self::authorize_group(store, ident, group, PERM_ADMIN) else {
+        let Some(group_id) = authorize_group(store, ident, group, PERM_ADMIN, ident.service_admin)
+        else {
             return Response::Denied;
         };
         let dek = crypto::Dek::generate();
@@ -896,6 +830,165 @@ impl Bunker {
                 }
             }
         }
+    }
+}
+
+// ---- helpers shared with the replica handler ----
+//
+// A replica answers the very same client requests out of its mirror
+// ([`crate::replica::ReplicaServer`]), so authorization and the read
+// paths live here as free functions, parameterized on the two things
+// that differ between the two nodes: whether the service-admin bypass
+// applies, and which recipient's DEK wrap the Get path opens.
+
+/// Resolve a group and check that `ident` holds all bits in `needed`.
+/// `implicit_admin` short-circuits the permission check: the
+/// authoritative node passes `ident.service_admin` there (service admins
+/// implicitly hold every bit on every group), a replica always passes
+/// `false` — its authorization is the synced ACL and nothing else.
+/// `None` covers unknown group, missing permission and internal error
+/// alike, so callers cannot use it as an oracle.
+pub(crate) fn authorize_group(
+    store: &Store,
+    ident: &Identity,
+    group: &str,
+    needed: u8,
+    implicit_admin: bool,
+) -> Option<i64> {
+    let group_id = store.group_id(group).ok()??;
+    if implicit_admin {
+        return Some(group_id);
+    }
+    let perms = store.perms(ident.id, group_id).ok()?;
+    (perms & needed == needed).then_some(group_id)
+}
+
+/// Read one secret's current version: authorize, then unwrap the version's
+/// DEK from the wrap stored under `dek_recipient` and decrypt with
+/// `dek_identity`. The authoritative node reads its operational wrap; a
+/// replica reads the one addressed to its own EndpointId — the only wrap
+/// a mirror ever holds.
+pub(crate) fn read_secret(
+    store: &Store,
+    ident: &Identity,
+    group: &str,
+    name: &str,
+    dek_recipient: &str,
+    dek_identity: &age::x25519::Identity,
+    implicit_admin: bool,
+) -> Response {
+    let Some(group_id) = authorize_group(store, ident, group, PERM_READ, implicit_admin) else {
+        return Response::Denied;
+    };
+    let Ok(Some(sv)) = store.secret_current(group_id, name) else {
+        return Response::Denied;
+    };
+    let plaintext = store
+        .dek_wrap(group_id, sv.dek_version, dek_recipient)
+        .and_then(|wrapped| {
+            let wrapped = wrapped.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no wrap for group {group_id} DEK v{} addressed to {dek_recipient}",
+                    sv.dek_version
+                )
+            })?;
+            let dek = crypto::unwrap_dek(&wrapped, dek_identity)?;
+            let aad = crypto::secret_aad(group, name, sv.version, sv.dek_version);
+            crypto::decrypt_secret(&dek, &aad, &sv.nonce, &sv.ciphertext)
+        });
+    match plaintext {
+        Ok(value) => Response::Secret {
+            value,
+            version: sv.version,
+        },
+        Err(err) => {
+            tracing::error!(%err, group, name, "failed to decrypt secret");
+            Response::Failed {
+                reason: "internal error".into(),
+            }
+        }
+    }
+}
+
+/// List a group's secret names; needs the read bit.
+pub(crate) fn list(store: &Store, ident: &Identity, group: &str, implicit_admin: bool) -> Response {
+    let Some(group_id) = authorize_group(store, ident, group, PERM_READ, implicit_admin) else {
+        return Response::Denied;
+    };
+    match store.list_secrets(group_id) {
+        Ok(names) => Response::Names(names),
+        Err(err) => {
+            tracing::error!(%err, group, "failed to list secrets");
+            Response::Failed {
+                reason: "internal error".into(),
+            }
+        }
+    }
+}
+
+/// A group's ACL; needs the admin bit on that group.
+pub(crate) fn group_acl(
+    store: &Store,
+    ident: &Identity,
+    group: &str,
+    implicit_admin: bool,
+) -> Response {
+    let Some(group_id) = authorize_group(store, ident, group, PERM_ADMIN, implicit_admin) else {
+        return Response::Denied;
+    };
+    match store.group_acl_entries(group_id) {
+        Ok(entries) => Response::Acl(entries),
+        Err(_) => Response::Failed {
+            reason: "internal error".into(),
+        },
+    }
+}
+
+/// Candidate grant targets for a group admin: names only, no endpoint ids
+/// and no service-admin flags.
+pub(crate) fn list_identity_names(
+    store: &Store,
+    ident: &Identity,
+    group: &str,
+    implicit_admin: bool,
+) -> Response {
+    if authorize_group(store, ident, group, PERM_ADMIN, implicit_admin).is_none() {
+        return Response::Denied;
+    }
+    match store.list_identities() {
+        Ok(ids) => Response::IdentityNames(ids.into_iter().map(|i| i.name).collect()),
+        Err(_) => Response::Failed {
+            reason: "internal error".into(),
+        },
+    }
+}
+
+/// The caller's EXPLICIT group grants with their raw stored bitmasks, and
+/// `service_admin: false`. This is the whole of a replica's ListGroups:
+/// a mirror grants no implicit powers and holds no service admins.
+pub(crate) fn list_groups_explicit(store: &Store, ident: &Identity) -> Response {
+    match store.groups_for_identity(ident.id) {
+        Ok(groups) => Response::Groups {
+            service_admin: false,
+            groups: groups
+                .into_iter()
+                .map(|(name, perms)| crate::proto::GroupInfo { name, perms })
+                .collect(),
+        },
+        Err(_) => Response::Failed {
+            reason: "internal error".into(),
+        },
+    }
+}
+
+/// The audit `outcome` string for a response. Shared so the replica's
+/// chain records the same vocabulary as the authoritative one.
+pub(crate) fn audit_outcome(response: &Response) -> &'static str {
+    match response {
+        Response::Denied => "denied",
+        Response::VersionConflict { .. } => "conflict",
+        Response::Failed { .. } => "failed",
+        _ => "ok",
     }
 }
 
@@ -1019,7 +1112,7 @@ async fn handle_sync_stream(
 
 /// Resolve `remote` and require the EXPLICIT read bit on `group`. This is
 /// sync's whole authorization: no service-admin bypass (deliberately not
-/// [`Bunker::authorize_group`]), and unknown identity, unknown group, and
+/// [`authorize_group`]), and unknown identity, unknown group, and
 /// missing permission are indistinguishable (`None` → `SyncDenied`).
 fn sync_read_authorized(store: &Store, remote: &str, group: &str) -> Option<i64> {
     let ident = store.identity_by_endpoint(remote).ok()??;
@@ -1634,6 +1727,97 @@ mod tests {
                 }
             ),
             Response::Denied
+        );
+    }
+
+    /// The shared helpers grant the service-admin bypass only when the
+    /// caller asks for it. A replica always passes `false`, so the very
+    /// same identity row is reduced to its explicit grants there.
+    #[test]
+    fn the_service_admin_bypass_is_opt_in() {
+        let (bunker, admin) = test_bunker();
+        for group in ["g", "h"] {
+            assert_eq!(
+                bunker.handle(&admin, &Request::CreateGroup { name: group.into() }),
+                Response::Ok
+            );
+            assert_eq!(
+                bunker.handle(
+                    &admin,
+                    &Request::Put {
+                        group: group.into(),
+                        name: "s".into(),
+                        value: b"v".to_vec(),
+                        expected_version: 0,
+                    }
+                ),
+                Response::Version { version: 1 }
+            );
+        }
+        // A service admin with an explicit read on "h" and no row on "g".
+        let root = iroh::SecretKey::generate().public().to_string();
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::AddIdentity {
+                    name: "root".into(),
+                    endpoint_id: root.clone(),
+                    service_admin: true,
+                }
+            ),
+            Response::Ok
+        );
+        assert_eq!(
+            bunker.handle(
+                &admin,
+                &Request::Grant {
+                    group: "h".into(),
+                    identity: "root".into(),
+                    perms: PERM_READ,
+                }
+            ),
+            Response::Ok
+        );
+
+        let store = bunker.lock_store();
+        let op = &bunker.0.op_identity;
+        let root = store.identity_by_endpoint(&root).unwrap().unwrap();
+        assert!(root.service_admin);
+
+        // With the bypass on (what `Bunker` passes) the flag opens "g"...
+        assert!(authorize_group(&store, &root, "g", PERM_ADMIN, true).is_some());
+        assert!(matches!(
+            read_secret(&store, &root, "g", "s", RECIPIENT_OPERATIONAL, op, true),
+            Response::Secret { .. }
+        ));
+        // ... and with it off the same row is a stranger to "g".
+        assert!(authorize_group(&store, &root, "g", PERM_READ, false).is_none());
+        for response in [
+            read_secret(&store, &root, "g", "s", RECIPIENT_OPERATIONAL, op, false),
+            list(&store, &root, "g", false),
+            group_acl(&store, &root, "g", false),
+            list_identity_names(&store, &root, "g", false),
+            // Not even where it holds an explicit grant does the flag add
+            // the admin bit.
+            group_acl(&store, &root, "h", false),
+            list_identity_names(&store, &root, "h", false),
+        ] {
+            assert_eq!(response, Response::Denied);
+        }
+        // The explicit read still works, and reports raw stored perms.
+        assert!(matches!(
+            read_secret(&store, &root, "h", "s", RECIPIENT_OPERATIONAL, op, false),
+            Response::Secret { .. }
+        ));
+        assert_eq!(
+            list_groups_explicit(&store, &root),
+            Response::Groups {
+                service_admin: false,
+                groups: vec![crate::proto::GroupInfo {
+                    name: "h".into(),
+                    perms: PERM_READ,
+                }],
+            }
         );
     }
 

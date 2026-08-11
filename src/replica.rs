@@ -18,13 +18,16 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::endpoint::{Connection, presets};
+use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tokio::sync::{broadcast, watch};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::agebridge;
 use crate::crypto;
+use crate::proto::{self, Request, Response};
+use crate::server;
 use crate::store::{AppliedChange, Store};
 use crate::sync::{self, FetchedSecret, GroupSyncState, SYNC_ALPN, SyncMessage, SyncRequest};
 
@@ -209,8 +212,8 @@ impl Replica {
     }
 
     /// The handler serving this replica's mirror to its own clients over
-    /// the client ALPN. Task 9 implements `ProtocolHandler` on it; until
-    /// then it is constructible but not mountable.
+    /// [`crate::proto::ALPN`]. Mount it on a `Router` over the replica's
+    /// endpoint to make the mirror a read-only bunker of its own.
     pub fn protocol_handler(&self) -> ReplicaServer {
         ReplicaServer {
             inner: self.inner.clone(),
@@ -249,11 +252,28 @@ impl Replica {
     }
 }
 
-/// The replica's serving side (client-ALPN reads answered from the local
-/// mirror, writes redirected to the authoritative node). Task 9 gives it
-/// its `ProtocolHandler` impl.
+/// The replica's serving side: the ordinary client protocol
+/// (`secret-bunker/1`), answered from the local mirror, with every
+/// mutation redirected to the authoritative node.
+///
+/// Authorization here is the synced ACL and nothing else. The
+/// service-admin bypass never fires (the flag is pinned to 0 on every
+/// mirrored identity row, and every call below also passes
+/// `implicit_admin: false`), and `ListIdentities` — a service-admin
+/// operation upstream — is always denied. Unregistered peers get the
+/// uniform [`Response::Denied`] for EVERY request, mutations included:
+/// they must not learn that this node is a replica, let alone which
+/// bunker it mirrors.
 pub struct ReplicaServer {
     inner: Arc<ReplicaInner>,
+}
+
+impl Clone for ReplicaServer {
+    fn clone(&self) -> Self {
+        ReplicaServer {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for ReplicaServer {
@@ -261,6 +281,122 @@ impl std::fmt::Debug for ReplicaServer {
         f.debug_struct("ReplicaServer")
             .field("authoritative", &self.inner.authoritative)
             .finish_non_exhaustive()
+    }
+}
+
+impl ReplicaServer {
+    /// Decode and handle one raw request frame from an authenticated
+    /// peer; frames that fail to decode get the uniform denial and an
+    /// audit entry, exactly as on the authoritative node.
+    pub fn handle_raw(&self, remote: &str, bytes: &[u8]) -> Response {
+        match proto::decode::<Request>(bytes) {
+            Ok(mut req) => {
+                let response = self.handle(remote, &req);
+                // Best-effort scrub of the plaintext copy decode made.
+                if let Request::Put { value, .. } = &mut req {
+                    value.zeroize();
+                }
+                response
+            }
+            Err(_) => {
+                let store = self.inner.lock_store();
+                if let Err(err) = store.audit(remote, "malformed", "", "denied") {
+                    tracing::error!(%err, "audit append failed");
+                }
+                Response::Denied
+            }
+        }
+    }
+
+    /// Handle one decoded request and record it in the replica's own
+    /// audit chain. Synchronous: the store lock is never held across an
+    /// await point.
+    pub fn handle(&self, remote: &str, req: &Request) -> Response {
+        let store = self.inner.lock_store();
+        let outcome = dispatch(&self.inner, &store, remote, req);
+        let audit_outcome = server::audit_outcome(&outcome);
+        if let Err(err) = store.audit(remote, req.op(), &req.target(), audit_outcome) {
+            tracing::error!(%err, "audit append failed");
+        }
+        outcome
+    }
+}
+
+/// Route one request from an authenticated peer. An endpoint with no
+/// identity row in the mirror is denied everything — the ACL travels with
+/// the groups this replica syncs, so "unknown here" and "unknown
+/// upstream" are indistinguishable, which is the point.
+fn dispatch(inner: &ReplicaInner, store: &Store, remote: &str, req: &Request) -> Response {
+    let Ok(Some(ident)) = store.identity_by_endpoint(remote) else {
+        return Response::Denied;
+    };
+    // `false` everywhere: belt and suspenders next to the pinned flag.
+    match req {
+        Request::Get { group, name } => server::read_secret(
+            store,
+            &ident,
+            group,
+            name,
+            &inner.endpoint_hex,
+            &inner.age_identity,
+            false,
+        ),
+        Request::List { group } => server::list(store, &ident, group, false),
+        Request::ListGroups => server::list_groups_explicit(store, &ident),
+        Request::GroupAcl { group } => server::group_acl(store, &ident, group, false),
+        Request::ListIdentityNames { group } => {
+            server::list_identity_names(store, &ident, group, false)
+        }
+        // Service-admin gated upstream; a mirror holds no service admins.
+        Request::ListIdentities => Response::Denied,
+        // Deliberately exhaustive: a new Request variant must decide here
+        // whether the mirror can answer it, rather than silently falling
+        // into the redirect.
+        Request::Put { .. }
+        | Request::Delete { .. }
+        | Request::CreateGroup { .. }
+        | Request::AddIdentity { .. }
+        | Request::RemoveIdentity { .. }
+        | Request::Grant { .. }
+        | Request::RotateDek { .. }
+        | Request::SetServiceAdmin { .. } => Response::ReadOnlyReplica {
+            authoritative: inner.authoritative.to_string(),
+        },
+    }
+}
+
+impl ProtocolHandler for ReplicaServer {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let remote = connection.remote_id().to_string();
+        tracing::debug!(remote, "replica client connection accepted");
+        // One frame per stream, mirroring `Bunker`'s accept loop: serve
+        // until the peer closes, and let per-stream errors end only this
+        // connection.
+        loop {
+            let (mut send, mut recv) = match connection.accept_bi().await {
+                Ok(pair) => pair,
+                Err(_) => break, // peer closed (or connection error): done
+            };
+            let mut response = match recv.read_to_end(proto::MAX_MSG).await {
+                Ok(mut bytes) => {
+                    let response = self.handle_raw(&remote, &bytes);
+                    bytes.zeroize(); // may hold a Put plaintext
+                    response
+                }
+                Err(_) => break,
+            };
+            let mut encoded =
+                proto::encode(&response).map_err(|e| std::io::Error::other(e.to_string()))?;
+            // Best-effort scrub of plaintext copies once encoded/sent.
+            if let Response::Secret { value, .. } = &mut response {
+                value.zeroize();
+            }
+            let sent = send.write_all(&encoded).await;
+            encoded.zeroize();
+            sent.map_err(std::io::Error::other)?;
+            send.finish()?;
+        }
+        Ok(())
     }
 }
 
@@ -944,6 +1080,108 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("supplied endpoint"), "unhelpful error: {err}");
+        ep.close().await;
+    }
+
+    /// Even a mirrored identity row that somehow carries the
+    /// service-admin flag (sync pins it to 0, but a legacy or tampered
+    /// database might not) buys nothing: the handler passes
+    /// `implicit_admin: false` on every path.
+    #[tokio::test]
+    async fn a_service_admin_row_grants_no_implicit_powers() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = fresh_secret();
+        let authoritative = fresh_secret().public(); // unreachable: fine
+        let ep = Endpoint::builder(presets::Minimal)
+            .secret_key(secret.clone())
+            .bind()
+            .await
+            .unwrap();
+        let replica = Replica::builder()
+            .store_path(dir.path().join("replica.sqlite"))
+            .secret_key(secret.clone())
+            .authoritative(authoritative)
+            .endpoint(ep.clone())
+            .spawn()
+            .await
+            .unwrap();
+        let handler = replica.protocol_handler();
+
+        // One mirrored group whose ACL grants "root" a plain read; then
+        // the local flag is flipped behind sync's back.
+        let root = fresh_secret().public().to_string();
+        {
+            let mut store = replica.inner.lock_store();
+            store
+                .apply_group_sync(
+                    &secret.public().to_string(),
+                    &GroupSyncState {
+                        name: "g".into(),
+                        acl: vec![sync::AclEntry {
+                            identity_name: "root".into(),
+                            endpoint_id: root.clone(),
+                            perms: crate::store::PERM_READ,
+                        }],
+                        deks: Vec::new(),
+                        secrets: Vec::new(),
+                    },
+                    &[],
+                )
+                .unwrap();
+            assert!(store.set_service_admin("root", true).unwrap());
+        }
+
+        // The explicit read works; nothing above it does.
+        assert_eq!(
+            handler.handle(&root, &Request::List { group: "g".into() }),
+            Response::Names(Vec::new())
+        );
+        assert_eq!(
+            handler.handle(&root, &Request::ListGroups),
+            Response::Groups {
+                service_admin: false,
+                groups: vec![crate::proto::GroupInfo {
+                    name: "g".into(),
+                    perms: crate::store::PERM_READ,
+                }],
+            }
+        );
+        for req in [
+            Request::GroupAcl { group: "g".into() },
+            Request::ListIdentityNames { group: "g".into() },
+            Request::ListIdentities,
+        ] {
+            assert_eq!(handler.handle(&root, &req), Response::Denied, "{req:?}");
+        }
+        // Registered identities get the redirect on mutations...
+        assert_eq!(
+            handler.handle(
+                &root,
+                &Request::CreateGroup {
+                    name: "elsewhere".into()
+                }
+            ),
+            Response::ReadOnlyReplica {
+                authoritative: authoritative.to_string(),
+            }
+        );
+        // ... unregistered ones learn nothing, not even the role.
+        let stranger = fresh_secret().public().to_string();
+        for req in [
+            Request::Get {
+                group: "g".into(),
+                name: "s".into(),
+            },
+            Request::CreateGroup {
+                name: "elsewhere".into(),
+            },
+        ] {
+            assert_eq!(handler.handle(&stranger, &req), Response::Denied, "{req:?}");
+        }
+        // A frame that is not a request at all is denied and audited.
+        assert_eq!(handler.handle_raw(&root, b"\xffnot-cbor"), Response::Denied);
+
+        replica.shutdown().await;
         ep.close().await;
     }
 

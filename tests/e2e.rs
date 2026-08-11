@@ -8,10 +8,10 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 
 use secret_bunker_iroh::client::Client;
-use secret_bunker_iroh::proto::{ALPN, Request, Response};
+use secret_bunker_iroh::proto::{ALPN, GroupInfo, Request, Response};
 use secret_bunker_iroh::replica::{Replica, ReplicaEvent};
 use secret_bunker_iroh::server::Bunker;
-use secret_bunker_iroh::store::{RECIPIENT_BACKUP, Store};
+use secret_bunker_iroh::store::{AuditVerification, RECIPIENT_BACKUP, Store};
 use secret_bunker_iroh::sync::{self, SYNC_ALPN, SyncMessage, SyncRequest};
 
 async fn client_endpoint(secret: SecretKey) -> Endpoint {
@@ -1040,6 +1040,349 @@ async fn replica_serves_reads_while_authoritative_down() {
 
     replica.shutdown().await;
     ep.close().await;
+}
+
+#[tokio::test]
+async fn replica_serves_the_client_protocol() {
+    // The replica answers `secret-bunker/1` itself: reads out of the
+    // mirror, mutations redirected, and authorization from the synced ACL
+    // alone — no service-admin bypass, no ListIdentities, and unregistered
+    // peers learn nothing about the node's role.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bunker.sqlite");
+    let replica_db = dir.path().join("replica.sqlite");
+
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+    let replica_secret = SecretKey::generate();
+    let reader_secret = SecretKey::generate();
+    let gadmin_secret = SecretKey::generate();
+    let root_secret = SecretKey::generate();
+    let stranger_secret = SecretKey::generate();
+
+    let store = init_store(&db, &op, &backup, &admin_secret.public());
+    let (router, addr) = spawn_authoritative(store, op).await;
+
+    let admin = Client::with_endpoint(client_endpoint(admin_secret).await, addr.clone())
+        .await
+        .unwrap();
+    for group in ["g1", "g2"] {
+        assert_eq!(
+            admin
+                .request(&Request::CreateGroup { name: group.into() })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+    }
+    // "root" is a service admin upstream; on the replica that flag must
+    // buy it exactly nothing beyond its explicit read on g1.
+    for (name, secret, service_admin) in [
+        ("replica", &replica_secret, false),
+        ("reader", &reader_secret, false),
+        ("gadmin", &gadmin_secret, false),
+        ("root", &root_secret, true),
+    ] {
+        assert_eq!(
+            admin
+                .request(&Request::AddIdentity {
+                    name: name.into(),
+                    endpoint_id: secret.public().to_string(),
+                    service_admin,
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+    }
+    for (identity, perms) in [("replica", 1), ("reader", 1), ("gadmin", 7), ("root", 1)] {
+        assert_eq!(
+            admin
+                .request(&Request::Grant {
+                    group: "g1".into(),
+                    identity: identity.into(),
+                    perms,
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+    }
+    for (group, name, value) in [("g1", "s1", "mirrored"), ("g2", "sx", "never-mirrored")] {
+        assert_eq!(
+            admin
+                .request(&Request::Put {
+                    group: group.into(),
+                    name: name.into(),
+                    value: value.as_bytes().to_vec(),
+                    expected_version: 0,
+                })
+                .await
+                .unwrap(),
+            Response::Version { version: 1 }
+        );
+    }
+
+    // --- the replica, mirroring g1, serving the client ALPN itself ---
+    let ep = replica_endpoint(replica_secret.clone(), &addr).await;
+    let replica = Replica::builder()
+        .store_path(&replica_db)
+        .secret_key(replica_secret)
+        .authoritative(addr.id)
+        .endpoint(ep.clone())
+        .spawn()
+        .await
+        .unwrap();
+    // Poll the mirror rather than the event channel: this test is about
+    // what the replica SERVES once converged, and polling cannot race the
+    // subscribe-after-spawn window.
+    for attempt in 0.. {
+        if replica.get("g1", "s1").is_ok() {
+            break;
+        }
+        assert!(attempt < 300, "the mirror never converged on g1/s1");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let replica_router = Router::builder(ep.clone())
+        .accept(ALPN, replica.protocol_handler())
+        .spawn();
+    let replica_addr = replica_router.endpoint().addr();
+
+    // --- a plain reader in the synced ACL ---
+    let reader = Client::with_endpoint(client_endpoint(reader_secret).await, replica_addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        reader
+            .request(&Request::Get {
+                group: "g1".into(),
+                name: "s1".into(),
+            })
+            .await
+            .unwrap(),
+        Response::Secret {
+            value: b"mirrored".to_vec(),
+            version: 1,
+        },
+        "the mirror must serve the same plaintext as the authoritative node"
+    );
+    assert_eq!(
+        reader
+            .request(&Request::List { group: "g1".into() })
+            .await
+            .unwrap(),
+        Response::Names(vec![("s1".into(), 1)])
+    );
+    // Only explicit grants, raw stored perms, never service_admin.
+    assert_eq!(
+        reader.request(&Request::ListGroups).await.unwrap(),
+        Response::Groups {
+            service_admin: false,
+            groups: vec![GroupInfo {
+                name: "g1".into(),
+                perms: 1,
+            }],
+        }
+    );
+    // A group outside the mirror is a uniform denial, like any other.
+    assert_eq!(
+        reader
+            .request(&Request::Get {
+                group: "g2".into(),
+                name: "sx".into(),
+            })
+            .await
+            .unwrap(),
+        Response::Denied
+    );
+    // Group-level admin operations still need the admin bit.
+    assert_eq!(
+        reader
+            .request(&Request::GroupAcl { group: "g1".into() })
+            .await
+            .unwrap(),
+        Response::Denied
+    );
+    // ListIdentities is service-admin gated upstream; a replica has none.
+    assert_eq!(
+        reader.request(&Request::ListIdentities).await.unwrap(),
+        Response::Denied
+    );
+    // Every mutation is redirected, naming the authoritative node.
+    let read_only = Response::ReadOnlyReplica {
+        authoritative: addr.id.to_string(),
+    };
+    for req in [
+        Request::Put {
+            group: "g1".into(),
+            name: "s1".into(),
+            value: b"nope".to_vec(),
+            expected_version: 1,
+        },
+        Request::Delete {
+            group: "g1".into(),
+            name: "s1".into(),
+            expected_version: 1,
+        },
+        Request::Grant {
+            group: "g1".into(),
+            identity: "reader".into(),
+            perms: 7,
+        },
+        Request::RotateDek { group: "g1".into() },
+        Request::CreateGroup { name: "g3".into() },
+        Request::AddIdentity {
+            name: "mallory".into(),
+            endpoint_id: stranger_secret.public().to_string(),
+            service_admin: true,
+        },
+        Request::RemoveIdentity {
+            name: "gadmin".into(),
+        },
+        Request::SetServiceAdmin {
+            name: "reader".into(),
+            service_admin: true,
+        },
+    ] {
+        assert_eq!(
+            reader.request(&req).await.unwrap(),
+            read_only,
+            "{req:?} must be redirected to the authoritative node"
+        );
+    }
+
+    // --- a group admin in the synced ACL ---
+    let gadmin = Client::with_endpoint(client_endpoint(gadmin_secret).await, replica_addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        gadmin
+            .request(&Request::GroupAcl { group: "g1".into() })
+            .await
+            .unwrap(),
+        Response::Acl(vec![
+            ("admin".into(), 7),
+            ("gadmin".into(), 7),
+            ("reader".into(), 1),
+            ("replica".into(), 1),
+            ("root".into(), 1),
+        ])
+    );
+    assert_eq!(
+        gadmin
+            .request(&Request::ListIdentityNames { group: "g1".into() })
+            .await
+            .unwrap(),
+        Response::IdentityNames(vec![
+            "admin".into(),
+            "gadmin".into(),
+            "reader".into(),
+            "replica".into(),
+            "root".into(),
+        ])
+    );
+
+    // --- a service admin gets no implicit powers here ---
+    let root = Client::with_endpoint(client_endpoint(root_secret).await, replica_addr.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        root.request(&Request::Get {
+            group: "g1".into(),
+            name: "s1".into(),
+        })
+        .await
+        .unwrap(),
+        Response::Secret {
+            value: b"mirrored".to_vec(),
+            version: 1,
+        },
+        "its explicit read grant still works"
+    );
+    assert_eq!(
+        root.request(&Request::GroupAcl { group: "g1".into() })
+            .await
+            .unwrap(),
+        Response::Denied,
+        "a service admin holds no implicit admin on a replica"
+    );
+    assert_eq!(
+        root.request(&Request::Get {
+            group: "g2".into(),
+            name: "sx".into(),
+        })
+        .await
+        .unwrap(),
+        Response::Denied,
+        "a service admin holds no implicit read on a replica"
+    );
+    assert_eq!(
+        root.request(&Request::ListIdentities).await.unwrap(),
+        Response::Denied
+    );
+    assert_eq!(
+        root.request(&Request::ListGroups).await.unwrap(),
+        Response::Groups {
+            service_admin: false,
+            groups: vec![GroupInfo {
+                name: "g1".into(),
+                perms: 1,
+            }],
+        },
+        "the replica never reports a caller as a service admin"
+    );
+
+    // --- an unregistered key learns nothing at all, not even the role ---
+    let stranger =
+        Client::with_endpoint(client_endpoint(stranger_secret).await, replica_addr.clone())
+            .await
+            .unwrap();
+    for req in [
+        Request::Get {
+            group: "g1".into(),
+            name: "s1".into(),
+        },
+        Request::List { group: "g1".into() },
+        Request::ListGroups,
+        Request::ListIdentities,
+        Request::GroupAcl { group: "g1".into() },
+        Request::ListIdentityNames { group: "g1".into() },
+        Request::Put {
+            group: "g1".into(),
+            name: "s1".into(),
+            value: b"nope".to_vec(),
+            expected_version: 1,
+        },
+        Request::CreateGroup { name: "g4".into() },
+        Request::RotateDek { group: "g1".into() },
+    ] {
+        assert_eq!(
+            stranger.request(&req).await.unwrap(),
+            Response::Denied,
+            "{req:?} from an unregistered key must be a plain denial"
+        );
+    }
+
+    for client in [reader, gadmin, root, stranger] {
+        client.close().await;
+    }
+    replica_router.shutdown().await.unwrap();
+    replica.shutdown().await;
+    ep.close().await;
+    admin.close().await;
+    router.shutdown().await.unwrap();
+
+    // Every one of those 30 requests — denials and redirects included —
+    // went into the replica's own hash chain (alongside its sync applies).
+    let verified = Store::open(&replica_db)
+        .unwrap()
+        .verify_audit_chain()
+        .unwrap();
+    let AuditVerification::Valid { entries, .. } = verified else {
+        panic!("the replica's audit chain must verify, got {verified:?}");
+    };
+    assert!(entries >= 30, "only {entries} audit entries on the replica");
 }
 
 /// A fake authoritative node that walks one replica into the fetch phase
