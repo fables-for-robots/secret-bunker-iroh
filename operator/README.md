@@ -15,8 +15,10 @@ in [`docs/superpowers/specs/2026-08-11-k8s-operator-design.md`](../docs/superpow
 
 Scope for v1: one bunker per operator installation (no multi-bunker
 `SecretStore`-style indirection), read-only (no write-back into the
-bunker), no templating, no Helm chart — plain manifests in
-[`deploy/`](deploy/).
+bunker), no templating, installable via the Helm chart in
+[`../charts/secret-bunker-operator`](../charts/secret-bunker-operator)
+(published to `oci://ghcr.io/fables-for-robots/charts`) or the plain
+manifests in [`deploy/`](deploy/).
 
 ## The `BunkerSecret` CRD
 
@@ -139,7 +141,44 @@ SHA-256 over the rendered Secret data; low-entropy values (short passwords,
 PINs, etc.) are offline-guessable by anyone who can read the Secret's
 metadata, without needing `get` on its data.
 
-## Identity provisioning (runbook)
+## Installing with Helm
+
+```sh
+helm install bunker oci://ghcr.io/fables-for-robots/charts/secret-bunker-operator \
+  --namespace secret-bunker-system --create-namespace \
+  --set bunker.id=<the bunker's 64-char hex EndpointId>
+```
+
+By default the operator manages its own identity: on first boot it generates
+an iroh key and stores it in the `secret-bunker-operator-identity` Secret in
+the release namespace — restarts and redeployments reuse it, never mint a new
+one (deleting that Secret is the explicit "start over with a fresh identity"
+action). Grant the new identity read access on the bunker:
+
+```sh
+kubectl -n secret-bunker-system get secret secret-bunker-operator-identity \
+  -o jsonpath='{.metadata.annotations.bunker\.fables-for-robots\.ch/endpoint-id}'
+bunker add-identity --name k8s-operator --id <EndpointId printed above>
+bunker grant --group prod --identity k8s-operator --perms r
+```
+
+Until granted, the pod runs but `/readyz` stays 503 and `BunkerSecret`s
+report `AwaitingSync`. To bring your own key instead (the runbook below),
+set `identity.existingSecret` — the chart then mounts that Secret and passes
+`--key-file`; nothing is ever generated.
+
+Helm never touches `crds/` after install: on chart upgrades apply the CRD
+manually first (`kubectl apply -f operator/deploy/crd.yaml`).
+
+Container images are published to
+`ghcr.io/fables-for-robots/secret-bunker-operator` (linux/amd64 + arm64):
+`vX.Y.Z` releases as `X.Y.Z` + `latest`, every main push as `edge` +
+`sha-<commit>`.
+
+## Bring-your-own-key provisioning (runbook)
+
+Only needed with `identity.existingSecret` (or the plain manifests); the
+Helm default is managed identity, above.
 
 The operator needs its own iroh identity, registered with the bunker and
 granted `read` on every group it should sync — never `service_admin`.
@@ -223,14 +262,15 @@ and retiring the old one.
 ## Configuration
 
 Flags (all settable as environment variables too — the env var name is
-the flag name upper-cased with `-` → `_`, with the two bunker-identity
-flags additionally prefixed `BUNKER_`):
+the flag name upper-cased with `-` → `_`, with `--key-file`,
+`--identity-secret` and `--mirror-path` additionally prefixed `BUNKER_`):
 
 | Flag | Env var | Required | Default | Meaning |
 |---|---|---|---|---|
 | `--bunker-id` | `BUNKER_ID` | yes | — | EndpointId (64-char hex) of the authoritative bunker |
 | `--bunker-addr` | `BUNKER_ADDR` | no | (n0 relay/discovery) | Direct `host:port` of the bunker; disables relays/discovery. Repeatable on the CLI for more than one address — the env var only carries a single value, so use repeated `--bunker-addr` flags (e.g. in `args:`) if you need more than one |
-| `--key-file` | `BUNKER_KEY_FILE` | yes | — | Path to the operator's iroh ed25519 key (mounted from the identity Secret; must already exist, never auto-generated) |
+| `--key-file` | `BUNKER_KEY_FILE` | one of the two | — | Path to the operator's iroh ed25519 key (mounted from the identity Secret; must already exist, never auto-generated) |
+| `--identity-secret` | `BUNKER_IDENTITY_SECRET` | one of the two | — | Name of a Secret in the operator's own namespace holding its identity key; generated and stored there on first boot when missing. Mutually exclusive with `--key-file` |
 | `--mirror-path` | `BUNKER_MIRROR_PATH` | yes | — | Replica SQLite mirror path (on the `emptyDir` volume) |
 | `--resync-interval` | `RESYNC_INTERVAL` | no | `1h` | Level-reconcile backstop applied to every `BunkerSecret`; sync itself is push-driven, this only guards against a missed event |
 | `--staleness-threshold` | `STALENESS_THRESHOLD` | no | `10m` | Once the sync session has been down this long, CRs degrade to `Ready=False/StaleReplica` |
@@ -305,37 +345,9 @@ events` for the history, not a flood on every resync).
 
 No `ServiceMonitor` ships in `deploy/` (it would require a `Service` and a
 hard dependency on the Prometheus Operator CRDs neither of which v1
-assumes). If your cluster runs one, something like this scrapes `/metrics`:
-
-```yaml
-# apiVersion: v1
-# kind: Service
-# metadata:
-#   name: secret-bunker-operator
-#   namespace: secret-bunker-system
-#   labels:
-#     app: secret-bunker-operator
-# spec:
-#   selector:
-#     app: secret-bunker-operator
-#   ports:
-#     - name: http
-#       port: 8080
-#       targetPort: http
-# ---
-# apiVersion: monitoring.coreos.com/v1
-# kind: ServiceMonitor
-# metadata:
-#   name: secret-bunker-operator
-#   namespace: secret-bunker-system
-# spec:
-#   selector:
-#     matchLabels:
-#       app: secret-bunker-operator
-#   endpoints:
-#     - port: http
-#       path: /metrics
-```
+assumes). The Helm chart renders both when `metrics.service.enabled` /
+`metrics.serviceMonitor.enabled` are set. With plain manifests, create the
+equivalent Service + ServiceMonitor by hand.
 
 ## High availability
 
@@ -366,9 +378,13 @@ ServiceAccount/ClusterRole/ClusterRoleBinding, and the Deployment
 (`operator/deploy/crd.yaml`, `rbac.yaml`, `deployment.yaml` — order among
 these three doesn't matter). It assumes the
 `secret-bunker-operator-identity` Secret already exists (step 3 of
-[Identity provisioning](#identity-provisioning-runbook)) and that
+[Bring-your-own-key provisioning](#bring-your-own-key-provisioning-runbook))
+and that
 `deployment.yaml`'s `BUNKER_ID` and container `image` have been edited for
 your bunker and registry.
+
+Or skip all of this with the Helm chart (see
+[Installing with Helm](#installing-with-helm)).
 
 ## License
 
