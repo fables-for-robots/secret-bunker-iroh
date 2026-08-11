@@ -20,8 +20,34 @@
             # Set here the env vars you want to be available in the shell
           '';
 
-          packages = with pkgs; [ rustc cargo rustfmt clippy rust-analyzer ];
+          packages = with pkgs; [ rustc cargo rustfmt clippy rust-analyzer kind kubectl ];
         };
       });
+
+      packages = eachSystem (system: pkgs:
+        let
+          operator = pkgs.rustPlatform.buildRustPackage {
+            pname = "secret-bunker-operator";
+            version = "0.1.0";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            buildAndTestSubdir = "operator";
+            # Tests run in CI via the cargo-native `test` job; skip them in the
+            # nix sandbox, which blocks the real UDP/QUIC socket binds the
+            # iroh integration tests need (EPERM under sandbox-exec on Darwin).
+            doCheck = false;
+          };
+        in
+        {
+          inherit operator;
+        }
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          operator-image = pkgs.dockerTools.buildLayeredImage {
+            name = "secret-bunker-operator";
+            tag = "latest";
+            contents = [ pkgs.dockerTools.caCertificates ];
+            config.Entrypoint = [ "${operator}/bin/operator" ];
+          };
+        });
     };
 }

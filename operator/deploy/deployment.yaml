@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secret-bunker-operator
+  namespace: secret-bunker-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # one identity, one replica: never two at once
+  selector:
+    matchLabels:
+      app: secret-bunker-operator
+  template:
+    metadata:
+      labels:
+        app: secret-bunker-operator
+    spec:
+      serviceAccountName: secret-bunker-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: operator
+          image: secret-bunker-operator:latest   # replace with your registry
+          args:
+            - --bunker-id=$(BUNKER_ID)
+          env:
+            - name: BUNKER_ID
+              value: "REPLACE_WITH_BUNKER_ENDPOINT_ID"
+            # Optional direct dial (in-cluster or fixed-address bunker):
+            # - name: BUNKER_ADDR
+            #   value: "10.0.0.5:4433"
+            - name: BUNKER_KEY_FILE
+              value: /etc/secret-bunker/identity.key
+            - name: BUNKER_MIRROR_PATH
+              value: /var/lib/secret-bunker/replica.sqlite
+          ports:
+            - containerPort: 8080
+              name: http
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - name: identity
+              mountPath: /etc/secret-bunker
+              readOnly: true
+            - name: mirror
+              mountPath: /var/lib/secret-bunker
+      volumes:
+        - name: identity
+          secret:
+            secretName: secret-bunker-operator-identity
+            defaultMode: 0400
+        - name: mirror
+          emptyDir: {}      # full resync each start, by design

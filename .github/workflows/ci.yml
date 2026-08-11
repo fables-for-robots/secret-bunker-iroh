@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,13 +22,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests (unit + end-to-end over in-process iroh endpoints)
-        run: cargo test
+        run: cargo test --workspace
+
+      - name: CRD drift check (generated CRD must match the checked-in manifest)
+        run: cargo run -p secret-bunker-operator --bin crdgen | diff - operator/deploy/crd.yaml
 
   audit:
     runs-on: ubuntu-latest
@@ -43,3 +47,29 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  e2e-kind:
+    # Manual-only heavyweight smoke test: run from the Actions tab.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Build operator container image
+        run: nix build .#operator-image
+
+      - uses: helm/kind-action@v1
+
+      - name: Load operator image into kind
+        run: |
+          docker load < result
+          kind load docker-image secret-bunker-operator:latest --name chart-testing
+
+      - name: Install CRD and validate registration
+        run: |
+          kubectl create secret generic secret-bunker-operator-identity \
+            --namespace default --from-literal=identity.key=placeholder || true
+          kubectl apply -f operator/deploy/crd.yaml
+          kubectl get crd bunkersecrets.bunker.fables-for-robots.ch

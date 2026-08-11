@@ -7,6 +7,10 @@ license = "AGPL-3.0-or-later"
 description = "Secrets bunker over iroh: p2p QUIC transport, EndpointId ACLs, age at-rest crypto"
 repository = "https://github.com/fables-for-robots/secret-bunker-iroh"
 
+[workspace]
+members = ["operator"]
+resolver = "3"
+
 [dependencies]
 age = "0.11"
 anyhow = "1"
