@@ -4,12 +4,15 @@
 //! The store holds only public key material, ciphertext, and wrapped DEKs.
 //! See design/crypto-design.md section 4.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+
+use crate::sync::{FetchedSecret, GroupSyncState};
 
 pub const PERM_READ: u8 = 1;
 pub const PERM_WRITE: u8 = 2;
@@ -896,6 +899,259 @@ impl Store {
             .optional()?)
     }
 
+    // ---- replica sync apply (spec 4.4) ----
+
+    /// The names in `state` whose local current version differs in any of
+    /// `(current_version, dek_version, nonce)`, plus those absent locally —
+    /// exactly the fetch list for [`Store::apply_group_sync`], in the
+    /// state's own order. Names whose local state already matches are
+    /// omitted, so re-applying an unchanged state fetches nothing.
+    ///
+    /// The nonce is what makes delete-then-recreate detectable: a
+    /// recreated secret can land on the same `(version, dek_version)`
+    /// (versions restart at 1 and deletion does not rotate the DEK), but
+    /// every encryption draws a fresh random nonce. `created_at` is no
+    /// substitute — it has one-second resolution.
+    pub fn secrets_needing_fetch(&self, state: &GroupSyncState) -> Result<Vec<String>> {
+        let Some(group_id) = self.group_id(&state.name)? else {
+            // Nothing of this group is mirrored yet: fetch all of it.
+            return Ok(state.secrets.iter().map(|e| e.name.clone()).collect());
+        };
+        let mut names = Vec::new();
+        for entry in &state.secrets {
+            let current = self.secret_current(group_id, &entry.name)?;
+            let unchanged = current.is_some_and(|local| {
+                local.version == entry.current_version
+                    && local.dek_version == entry.dek_version
+                    && local.nonce == entry.nonce
+            });
+            if !unchanged {
+                names.push(entry.name.clone());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Converge the local mirror of one group onto `state` in ONE
+    /// transaction — a replica reader never observes a half-applied group.
+    /// Implements spec 4.4 rules 1–5 in dependency order and returns the
+    /// secret-level changes, for the caller to publish after the commit.
+    ///
+    /// `own_endpoint` is this replica's own lowercase-hex endpoint id: the
+    /// only `dek_wrap` recipient a replica ever holds, since the manifest
+    /// only ever carries wraps addressed to the caller.
+    ///
+    /// Replica-only. It replaces the group's ACL wholesale from `state`
+    /// and never sets `service_admin` (a replica authorizes strictly by
+    /// explicit ACL rows, spec 5.2); on an authoritative database it would
+    /// destroy local truth.
+    pub fn apply_group_sync(
+        &mut self,
+        own_endpoint: &str,
+        state: &GroupSyncState,
+        fetched: &[FetchedSecret],
+    ) -> Result<Vec<AppliedChange>> {
+        let ts = now();
+        let tx = self.conn.transaction()?;
+
+        // The group row itself: created on first sight, kept afterwards
+        // (its id is what every other row here hangs off).
+        tx.execute(
+            "INSERT INTO secret_group (name, created_at) VALUES (?1, ?2)
+             ON CONFLICT (name) DO NOTHING",
+            params![state.name, ts],
+        )?;
+        let group_id: i64 = tx.query_row(
+            "SELECT id FROM secret_group WHERE name = ?1",
+            [&state.name],
+            |r| r.get(0),
+        )?;
+
+        // Rule 1: identity rows referenced by the ACL, keyed by endpoint
+        // id, taking the authoritative node's names.
+        for entry in &state.acl {
+            // Names are unique upstream, so a local row holding this name
+            // under a *different* endpoint id is by definition stale — a
+            // key replacement (RemoveIdentity + AddIdentity under the same
+            // name). Without this delete the group's apply would livelock
+            // forever on the UNIQUE(name) constraint.
+            //
+            // INSERT OR REPLACE must never be used here: its
+            // delete-and-reinsert would cascade `group_acl` rows in
+            // unrelated groups and reassign `identity.id`.
+            tx.execute(
+                "DELETE FROM identity WHERE name = ?1 AND endpoint_id <> ?2",
+                params![entry.identity_name, entry.endpoint_id],
+            )?;
+            // `service_admin` is pinned to 0 on both paths: it is never
+            // synced (AclEntry carries no such field) and a replica must
+            // not honour a stale local flag either.
+            tx.execute(
+                "INSERT INTO identity (endpoint_id, name, service_admin, created_at)
+                 VALUES (?1, ?2, 0, ?3)
+                 ON CONFLICT (endpoint_id) DO UPDATE SET name = excluded.name, service_admin = 0",
+                params![entry.endpoint_id, entry.identity_name, ts],
+            )?;
+        }
+
+        // Rule 2: the ACL, wholesale.
+        tx.execute("DELETE FROM group_acl WHERE group_id = ?1", [group_id])?;
+        for entry in &state.acl {
+            let identity_id: i64 = tx.query_row(
+                "SELECT id FROM identity WHERE endpoint_id = ?1",
+                [&entry.endpoint_id],
+                |r| r.get(0),
+            )?;
+            // ON CONFLICT: a state repeating one endpoint id must not
+            // wedge this group's apply forever on the primary key.
+            tx.execute(
+                "INSERT INTO group_acl (identity_id, group_id, perms) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (identity_id, group_id) DO UPDATE SET perms = excluded.perms",
+                params![identity_id, group_id, entry.perms as i64],
+            )?;
+        }
+
+        // Rule 3: DEK version rows and this replica's wraps.
+        for dek in &state.deks {
+            tx.execute(
+                "INSERT INTO group_dek (group_id, version, created_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (group_id, version) DO NOTHING",
+                params![group_id, dek.version as i64, ts],
+            )?;
+            // Wrap blobs are stable at rest, so a differing blob means the
+            // DEK version was reissued upstream (an authoritative restore
+            // rewound it) — the local one is the stale copy.
+            tx.execute(
+                "INSERT INTO dek_wrap (group_id, dek_version, recipient, wrapped, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (group_id, dek_version, recipient)
+                   DO UPDATE SET wrapped = excluded.wrapped",
+                params![group_id, dek.version as i64, own_endpoint, dek.wrapped, ts],
+            )?;
+        }
+        // Wraps absent from the state go: versions it no longer carries
+        // (revoked or forgotten upstream) and anything addressed to
+        // another recipient, which a replica has no business holding.
+        // `group_dek` rows are left alone — a version we hold no wrap for
+        // is a legitimate state (the wrap may come back next round).
+        let stale_wraps: Vec<(i64, String)> = {
+            let keep: BTreeSet<i64> = state.deks.iter().map(|d| d.version as i64).collect();
+            let mut stmt =
+                tx.prepare("SELECT dek_version, recipient FROM dek_wrap WHERE group_id = ?1")?;
+            let rows = stmt.query_map([group_id], |r| Ok((r.get::<_, i64>(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<Vec<(i64, String)>, _>>()?
+                .into_iter()
+                .filter(|(version, recipient)| recipient != own_endpoint || !keep.contains(version))
+                .collect()
+        };
+        for (version, recipient) in stale_wraps {
+            tx.execute(
+                "DELETE FROM dek_wrap WHERE group_id = ?1 AND dek_version = ?2 AND recipient = ?3",
+                params![group_id, version, recipient],
+            )?;
+        }
+
+        // Rule 4: every fetched secret replaces whatever is local. The
+        // delete cascades the old version rows, so a recreated secret
+        // (whose versions restarted at 1) can never collide with them.
+        let mut changes = Vec::new();
+        for secret in fetched {
+            tx.execute(
+                "DELETE FROM secret WHERE group_id = ?1 AND name = ?2",
+                params![group_id, secret.name],
+            )?;
+            tx.execute(
+                "INSERT INTO secret (group_id, name, current_version) VALUES (?1, ?2, ?3)",
+                params![group_id, secret.name, secret.version as i64],
+            )?;
+            let secret_id = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO secret_version
+                   (secret_id, version, dek_version, nonce, ciphertext, created_at, created_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    secret_id,
+                    secret.version as i64,
+                    secret.dek_version as i64,
+                    secret.nonce,
+                    secret.ciphertext,
+                    secret.created_at,
+                    secret.created_by,
+                ],
+            )?;
+            changes.push(AppliedChange::SecretChanged {
+                name: secret.name.clone(),
+                version: secret.version,
+            });
+        }
+
+        // Rule 5: local secrets the state does not list are gone upstream.
+        // A listed name that simply was not fetched this round is left
+        // alone — it is either already current or waiting for the next.
+        let removed: Vec<String> = {
+            let listed: BTreeSet<&str> = state.secrets.iter().map(|e| e.name.as_str()).collect();
+            let mut stmt =
+                tx.prepare("SELECT name FROM secret WHERE group_id = ?1 ORDER BY name")?;
+            let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<String>, _>>()?
+                .into_iter()
+                .filter(|name| !listed.contains(name.as_str()))
+                .collect()
+        };
+        for name in removed {
+            tx.execute(
+                "DELETE FROM secret WHERE group_id = ?1 AND name = ?2",
+                params![group_id, name],
+            )?;
+            changes.push(AppliedChange::SecretDeleted { name });
+        }
+
+        tx.commit()?;
+        Ok(changes)
+    }
+
+    /// Drop a group from the local mirror: its ACL rows, DEK versions,
+    /// wraps, secrets and secret versions all go with it through the
+    /// foreign-key cascades. False when the group is not mirrored locally.
+    /// Identity rows stay (they may be shared with other groups);
+    /// [`Store::gc_unreferenced_identities`] sweeps the orphans.
+    ///
+    /// Replica-only, and only on a *completed* resync: a group missing
+    /// from a partial manifest stream has not been revoked, merely not
+    /// mentioned yet.
+    pub fn drop_group_local(&mut self, name: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM secret_group WHERE name = ?1", [name])?;
+        Ok(n > 0)
+    }
+
+    /// Delete identity rows no `group_acl` row references, returning how
+    /// many went. Run at the end of a full replica resync, where an
+    /// identity can lose its last group.
+    ///
+    /// Replica-only: on an authoritative database identities exist
+    /// independently of any ACL row, and this would delete them.
+    pub fn gc_unreferenced_identities(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM identity WHERE NOT EXISTS
+               (SELECT 1 FROM group_acl WHERE group_acl.identity_id = identity.id)",
+            [],
+        )?)
+    }
+
+    /// Every group name in the local mirror, ascending. On a replica that
+    /// is exactly the mirrored scope, so it is also the set to diff a full
+    /// manifest against when deciding what [`Store::drop_group_local`]
+    /// should remove.
+    pub fn replica_group_names(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM secret_group ORDER BY name")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     // ---- secrets ----
 
     pub fn secret_current(&self, group_id: i64, name: &str) -> Result<Option<SecretVersion>> {
@@ -1103,6 +1359,14 @@ pub enum CasOutcome {
     Conflict { current: u64 },
 }
 
+/// What one [`Store::apply_group_sync`] changed about a group's secrets,
+/// for the caller to publish once the transaction has committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliedChange {
+    SecretChanged { name: String, version: u64 },
+    SecretDeleted { name: String },
+}
+
 /// Result of [`Store::verify_audit_chain`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuditVerification {
@@ -1119,6 +1383,7 @@ pub enum AuditVerification {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::{AclEntry, DekEntry, SecretEntry};
 
     fn store() -> Store {
         let mut s = Store::open_in_memory().unwrap();
@@ -1720,5 +1985,489 @@ mod tests {
             panic!("truncated chain still verifies, got {truncated:?}");
         };
         assert_ne!(full_head, truncated_head);
+    }
+
+    // ---- replica sync apply (spec 4.4) ----
+
+    /// A replica-shaped store: schema only, never `init`ed — no
+    /// operational or backup key, no bootstrap admin identity.
+    fn replica() -> Store {
+        Store::open_in_memory().unwrap()
+    }
+
+    fn sync_state(
+        name: &str,
+        acl: Vec<(&str, &str, u8)>,
+        deks: Vec<(u64, &[u8])>,
+        secrets: Vec<(&str, u64, u64, &[u8])>,
+    ) -> GroupSyncState {
+        GroupSyncState {
+            name: name.into(),
+            acl: acl
+                .into_iter()
+                .map(|(identity_name, endpoint_id, perms)| AclEntry {
+                    identity_name: identity_name.into(),
+                    endpoint_id: endpoint_id.into(),
+                    perms,
+                })
+                .collect(),
+            deks: deks
+                .into_iter()
+                .map(|(version, wrapped)| DekEntry {
+                    version,
+                    wrapped: wrapped.to_vec(),
+                })
+                .collect(),
+            secrets: secrets
+                .into_iter()
+                .map(|(name, current_version, dek_version, nonce)| SecretEntry {
+                    name: name.into(),
+                    current_version,
+                    dek_version,
+                    nonce: nonce.to_vec(),
+                })
+                .collect(),
+        }
+    }
+
+    fn fetched_secret(
+        name: &str,
+        version: u64,
+        dek_version: u64,
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> FetchedSecret {
+        FetchedSecret {
+            name: name.into(),
+            version,
+            dek_version,
+            nonce: nonce.to_vec(),
+            ciphertext: ciphertext.to_vec(),
+            created_at: 5,
+            created_by: "alice".into(),
+        }
+    }
+
+    /// How many `secret_version` rows one secret has locally — a
+    /// delete-and-recreate must not leave the old ones behind.
+    fn version_row_count(s: &Store, group_id: i64, name: &str) -> i64 {
+        s.conn
+            .query_row(
+                "SELECT COUNT(*) FROM secret_version sv JOIN secret s ON s.id = sv.secret_id
+                 WHERE s.group_id = ?1 AND s.name = ?2",
+                params![group_id, name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn apply_group_sync_creates_and_updates() {
+        let mut s = Store::open_in_memory().unwrap(); // replica stores are never `init`ed
+        let state = sync_state(
+            "g",
+            vec![("alice", "eidalice", 1)],
+            vec![(1, b"wrapA")],
+            vec![("tok", 1, 1, b"nonce1")],
+        );
+        assert_eq!(
+            s.secrets_needing_fetch(&state).unwrap(),
+            vec!["tok".to_string()]
+        );
+        let fetched = vec![FetchedSecret {
+            name: "tok".into(),
+            version: 1,
+            dek_version: 1,
+            nonce: b"nonce1".to_vec(),
+            ciphertext: b"ct".to_vec(),
+            created_at: 5,
+            created_by: "alice".into(),
+        }];
+        let changes = s.apply_group_sync("myid", &state, &fetched).unwrap();
+        assert!(
+            matches!(changes[..], [AppliedChange::SecretChanged { ref name, version: 1 }] if name == "tok"),
+            "unexpected changes: {changes:?}"
+        );
+        let gid = s.group_id("g").unwrap().unwrap();
+        assert_eq!(s.replica_group_names().unwrap(), vec!["g".to_string()]);
+        let cur = s.secret_current(gid, "tok").unwrap().unwrap();
+        assert_eq!(cur.ciphertext, b"ct");
+        assert_eq!((cur.version, cur.dek_version), (1, 1));
+        assert_eq!(cur.nonce, b"nonce1");
+        // created_at / created_by are mirrored verbatim, not re-stamped.
+        let (created_at, created_by): (i64, String) = s
+            .conn
+            .query_row(
+                "SELECT sv.created_at, sv.created_by FROM secret s
+                 JOIN secret_version sv ON sv.secret_id = s.id AND sv.version = s.current_version
+                 WHERE s.group_id = ?1 AND s.name = ?2",
+                params![gid, "tok"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((created_at, created_by.as_str()), (5, "alice"));
+        let alice = s.identity_by_name("alice").unwrap().unwrap();
+        assert!(!alice.service_admin);
+        assert_eq!(alice.endpoint_id, "eidalice");
+        assert_eq!(s.perms(alice.id, gid).unwrap(), 1);
+        assert_eq!(s.dek_wrap(gid, 1, "myid").unwrap().unwrap(), b"wrapA");
+        // Re-applying the same state fetches nothing and changes nothing.
+        assert!(s.secrets_needing_fetch(&state).unwrap().is_empty());
+        assert!(s.apply_group_sync("myid", &state, &[]).unwrap().is_empty());
+        // ... and leaves the identity row itself in place (same rowid, so
+        // no ACL row in any other group was cascaded away).
+        assert_eq!(s.identity_by_name("alice").unwrap().unwrap().id, alice.id);
+        assert_eq!(s.group_id("g").unwrap().unwrap(), gid);
+
+        // A newer upstream version is fetched and replaces the old one.
+        let state2 = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ | PERM_WRITE)],
+            vec![(1, b"wrapA")],
+            vec![("tok", 2, 1, b"nonce2")],
+        );
+        assert_eq!(
+            s.secrets_needing_fetch(&state2).unwrap(),
+            vec!["tok".to_string()]
+        );
+        let changes = s
+            .apply_group_sync(
+                "myid",
+                &state2,
+                &[fetched_secret("tok", 2, 1, b"nonce2", b"ct2")],
+            )
+            .unwrap();
+        assert_eq!(
+            changes,
+            vec![AppliedChange::SecretChanged {
+                name: "tok".into(),
+                version: 2
+            }]
+        );
+        let cur = s.secret_current(gid, "tok").unwrap().unwrap();
+        assert_eq!((cur.version, cur.ciphertext), (2, b"ct2".to_vec()));
+        assert_eq!(version_row_count(&s, gid, "tok"), 1);
+        assert_eq!(s.perms(alice.id, gid).unwrap(), PERM_READ | PERM_WRITE);
+    }
+
+    /// The ABA case: same (version, dek_version), different nonce ⇒ refetch.
+    #[test]
+    fn nonce_mismatch_forces_replace() {
+        let mut s = replica();
+        let state = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w")],
+            vec![("tok", 1, 1, b"nonce1")],
+        );
+        s.apply_group_sync(
+            "myid",
+            &state,
+            &[fetched_secret("tok", 1, 1, b"nonce1", b"ct1")],
+        )
+        .unwrap();
+        let gid = s.group_id("g").unwrap().unwrap();
+
+        // Upstream deleted and recreated "tok": versions restart at 1 and
+        // deletion does not rotate the DEK, so only the nonce differs.
+        let recreated = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w")],
+            vec![("tok", 1, 1, b"nonce2")],
+        );
+        assert_eq!(
+            s.secrets_needing_fetch(&recreated).unwrap(),
+            vec!["tok".to_string()]
+        );
+        let changes = s
+            .apply_group_sync(
+                "myid",
+                &recreated,
+                &[fetched_secret("tok", 1, 1, b"nonce2", b"ct2")],
+            )
+            .unwrap();
+        assert_eq!(
+            changes,
+            vec![AppliedChange::SecretChanged {
+                name: "tok".into(),
+                version: 1
+            }]
+        );
+        let cur = s.secret_current(gid, "tok").unwrap().unwrap();
+        assert_eq!(cur.nonce, b"nonce2");
+        assert_eq!(cur.ciphertext, b"ct2");
+        // The old row went with its secret (one version row, not two).
+        assert_eq!(version_row_count(&s, gid, "tok"), 1);
+        assert!(s.secrets_needing_fetch(&recreated).unwrap().is_empty());
+    }
+
+    /// Absent-from-manifest secrets are deleted (rule 5).
+    #[test]
+    fn absent_secret_is_deleted() {
+        let mut s = replica();
+        let state = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w")],
+            vec![("keep", 1, 1, b"n1"), ("gone", 1, 1, b"n2")],
+        );
+        s.apply_group_sync(
+            "myid",
+            &state,
+            &[
+                fetched_secret("keep", 1, 1, b"n1", b"c1"),
+                fetched_secret("gone", 1, 1, b"n2", b"c2"),
+            ],
+        )
+        .unwrap();
+        let gid = s.group_id("g").unwrap().unwrap();
+
+        let shrunk = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w")],
+            vec![("keep", 1, 1, b"n1")],
+        );
+        assert!(s.secrets_needing_fetch(&shrunk).unwrap().is_empty());
+        let changes = s.apply_group_sync("myid", &shrunk, &[]).unwrap();
+        assert_eq!(
+            changes,
+            vec![AppliedChange::SecretDeleted {
+                name: "gone".into()
+            }]
+        );
+        assert!(s.secret_current(gid, "gone").unwrap().is_none());
+        assert_eq!(version_row_count(&s, gid, "gone"), 0);
+        assert!(s.secret_current(gid, "keep").unwrap().is_some());
+        // An emptied group keeps the group row itself; only a manifest that
+        // drops the group entirely does that (drop_group_local).
+        let empty = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w")],
+            vec![],
+        );
+        assert_eq!(
+            s.apply_group_sync("myid", &empty, &[]).unwrap(),
+            vec![AppliedChange::SecretDeleted {
+                name: "keep".into()
+            }]
+        );
+        assert_eq!(s.list_secrets(gid).unwrap(), vec![]);
+        assert_eq!(s.replica_group_names().unwrap(), vec!["g".to_string()]);
+    }
+
+    /// A state-listed secret that was not fetched this round is left
+    /// exactly as it is — rule 5 only deletes names the state omits, so a
+    /// name the server did not ship (a mid-race vanish) is treated as
+    /// locally unchanged rather than as a deletion.
+    #[test]
+    fn listed_but_unfetched_secret_is_left_alone() {
+        let mut s = replica();
+        let state = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w")],
+            vec![("tok", 1, 1, b"n1")],
+        );
+        s.apply_group_sync("myid", &state, &[fetched_secret("tok", 1, 1, b"n1", b"c1")])
+            .unwrap();
+        let gid = s.group_id("g").unwrap().unwrap();
+
+        let newer = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w")],
+            vec![("tok", 2, 1, b"n2")],
+        );
+        assert_eq!(
+            s.secrets_needing_fetch(&newer).unwrap(),
+            vec!["tok".to_string()]
+        );
+        // The fetch came back empty (the server no longer had it).
+        assert!(s.apply_group_sync("myid", &newer, &[]).unwrap().is_empty());
+        let cur = s.secret_current(gid, "tok").unwrap().unwrap();
+        assert_eq!((cur.version, cur.ciphertext), (1, b"c1".to_vec()));
+    }
+
+    /// Key replacement: stale local identity row with same name, different
+    /// endpoint id, is deleted before upsert (rule 1) — no UNIQUE(name)
+    /// livelock.
+    #[test]
+    fn identity_key_replacement_converges() {
+        let mut s = replica();
+        let st1 = sync_state("g", vec![("alice", "eid-old", 1)], vec![(1, b"w")], vec![]);
+        s.apply_group_sync("myid", &st1, &[]).unwrap();
+        let st2 = sync_state("g", vec![("alice", "eid-new", 1)], vec![(1, b"w")], vec![]);
+        s.apply_group_sync("myid", &st2, &[]).unwrap();
+        assert_eq!(
+            s.identity_by_name("alice").unwrap().unwrap().endpoint_id,
+            "eid-new"
+        );
+        assert!(
+            s.identity_by_endpoint("eid-old").unwrap().is_none()
+                || s.gc_unreferenced_identities().unwrap() >= 1
+        );
+        // The new key holds the ACL row, and it is the only one.
+        let gid = s.group_id("g").unwrap().unwrap();
+        let alice = s.identity_by_endpoint("eid-new").unwrap().unwrap();
+        assert_eq!(s.perms(alice.id, gid).unwrap(), PERM_READ);
+        assert_eq!(
+            s.group_acl_entries(gid).unwrap(),
+            vec![("alice".to_string(), PERM_READ)]
+        );
+        assert!(s.identity_by_endpoint("eid-old").unwrap().is_none());
+        // A rename in place (same endpoint id, new name) converges too.
+        let st3 = sync_state("g", vec![("alicia", "eid-new", 1)], vec![(1, b"w")], vec![]);
+        s.apply_group_sync("myid", &st3, &[]).unwrap();
+        assert!(s.identity_by_name("alice").unwrap().is_none());
+        assert_eq!(
+            s.identity_by_name("alicia").unwrap().unwrap().id,
+            alice.id,
+            "a rename must reuse the row, not reassign identity.id"
+        );
+    }
+
+    /// service_admin never set locally even if upstream lies; ACL replaced
+    /// wholesale.
+    #[test]
+    fn acl_replaced_wholesale_and_no_service_admin() {
+        let mut s = replica();
+        let st1 = sync_state(
+            "g",
+            vec![
+                ("alice", "eidalice", PERM_READ | PERM_WRITE),
+                ("bob", "eidbob", PERM_READ),
+            ],
+            vec![(1, b"w")],
+            vec![],
+        );
+        s.apply_group_sync("myid", &st1, &[]).unwrap();
+        let gid = s.group_id("g").unwrap().unwrap();
+        assert_eq!(
+            s.group_acl_entries(gid).unwrap(),
+            vec![
+                ("alice".to_string(), PERM_READ | PERM_WRITE),
+                ("bob".to_string(), PERM_READ),
+            ]
+        );
+        assert!(!s.identity_by_name("alice").unwrap().unwrap().service_admin);
+        assert!(!s.identity_by_name("bob").unwrap().unwrap().service_admin);
+
+        // Even a locally set flag (nothing upstream can set it — AclEntry
+        // carries no such field — but a stale row might) is cleared on the
+        // next apply: a replica authorizes strictly by explicit ACL rows.
+        assert!(s.set_service_admin("bob", true).unwrap());
+        let st2 = sync_state(
+            "g",
+            vec![("bob", "eidbob", PERM_READ | PERM_WRITE | PERM_ADMIN)],
+            vec![(1, b"w")],
+            vec![],
+        );
+        s.apply_group_sync("myid", &st2, &[]).unwrap();
+        assert_eq!(
+            s.group_acl_entries(gid).unwrap(),
+            vec![("bob".to_string(), PERM_READ | PERM_WRITE | PERM_ADMIN)]
+        );
+        let bob = s.identity_by_name("bob").unwrap().unwrap();
+        assert!(!bob.service_admin);
+        // Alice lost her only ACL row but keeps her identity row until the
+        // end-of-resync sweep.
+        let alice = s.identity_by_name("alice").unwrap().unwrap();
+        assert_eq!(s.perms(alice.id, gid).unwrap(), 0);
+        assert_eq!(s.gc_unreferenced_identities().unwrap(), 1);
+        assert!(s.identity_by_name("alice").unwrap().is_none());
+        assert!(s.identity_by_name("bob").unwrap().is_some());
+        assert_eq!(s.gc_unreferenced_identities().unwrap(), 0);
+    }
+
+    /// Wrap blob replaced when it differs (restore-rewind), absent wraps
+    /// deleted.
+    #[test]
+    fn wrap_blob_differs_is_replaced() {
+        let mut s = replica();
+        let st1 = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w1")],
+            vec![],
+        );
+        s.apply_group_sync("myid", &st1, &[]).unwrap();
+        let gid = s.group_id("g").unwrap().unwrap();
+        assert_eq!(s.dek_wrap(gid, 1, "myid").unwrap().unwrap(), b"w1");
+
+        // Same version, different blob: upstream reissued the DEK version
+        // (an authoritative restore rewound it).
+        let st2 = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w2"), (2, b"w2b")],
+            vec![],
+        );
+        s.apply_group_sync("myid", &st2, &[]).unwrap();
+        assert_eq!(s.dek_wrap(gid, 1, "myid").unwrap().unwrap(), b"w2");
+        assert_eq!(s.dek_wrap(gid, 2, "myid").unwrap().unwrap(), b"w2b");
+        assert_eq!(s.dek_versions(gid).unwrap(), vec![1, 2]);
+
+        // A version the state no longer carries loses its wrap; the
+        // group_dek row stays (the version exists upstream, we just hold
+        // no wrap for it any more).
+        let st3 = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(2, b"w2b")],
+            vec![],
+        );
+        s.apply_group_sync("myid", &st3, &[]).unwrap();
+        assert!(s.dek_wrap(gid, 1, "myid").unwrap().is_none());
+        assert_eq!(s.dek_wrap(gid, 2, "myid").unwrap().unwrap(), b"w2b");
+        assert_eq!(s.dek_versions(gid).unwrap(), vec![1, 2]);
+
+        // Wraps addressed to anyone but this replica are not ours to keep.
+        s.add_dek_wrap(gid, 2, RECIPIENT_OPERATIONAL, b"nope")
+            .unwrap();
+        s.apply_group_sync("myid", &st3, &[]).unwrap();
+        assert!(s.dek_wrap(gid, 2, RECIPIENT_OPERATIONAL).unwrap().is_none());
+        assert_eq!(s.dek_wrap(gid, 2, "myid").unwrap().unwrap(), b"w2b");
+    }
+
+    #[test]
+    fn drop_group_removes_everything() {
+        let mut s = replica();
+        let state = sync_state(
+            "g",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w")],
+            vec![("tok", 1, 1, b"n1")],
+        );
+        s.apply_group_sync("myid", &state, &[fetched_secret("tok", 1, 1, b"n1", b"c1")])
+            .unwrap();
+        let other = sync_state(
+            "h",
+            vec![("alice", "eidalice", PERM_READ)],
+            vec![(1, b"w")],
+            vec![],
+        );
+        s.apply_group_sync("myid", &other, &[]).unwrap();
+        let gid = s.group_id("g").unwrap().unwrap();
+
+        assert!(s.drop_group_local("g").unwrap());
+        assert!(s.group_id("g").unwrap().is_none());
+        assert_eq!(s.replica_group_names().unwrap(), vec!["h".to_string()]);
+        assert_eq!(s.list_secrets(gid).unwrap(), vec![]);
+        assert_eq!(version_row_count(&s, gid, "tok"), 0);
+        assert!(s.dek_wrap(gid, 1, "myid").unwrap().is_none());
+        assert_eq!(s.dek_versions(gid).unwrap(), vec![]);
+        assert_eq!(s.group_acl_entries(gid).unwrap(), vec![]);
+        // The identity survives: it still holds a row in the other group.
+        assert!(s.identity_by_name("alice").unwrap().is_some());
+        assert_eq!(s.gc_unreferenced_identities().unwrap(), 0);
+        assert!(s.drop_group_local("h").unwrap());
+        assert_eq!(s.gc_unreferenced_identities().unwrap(), 1);
+        assert!(s.identity_by_name("alice").unwrap().is_none());
+        // Dropping a group that is not mirrored locally is not an error.
+        assert!(!s.drop_group_local("g").unwrap());
+        assert_eq!(s.replica_group_names().unwrap(), Vec::<String>::new());
     }
 }

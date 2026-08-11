@@ -85,6 +85,32 @@ pub struct SecretEntry {
     pub nonce: Vec<u8>,
 }
 
+/// The latest received state of one group — the manifest's `Group` and
+/// `GroupSecrets` messages assembled into the target a replica's local
+/// mirror converges onto (see [`crate::store::Store::apply_group_sync`]).
+/// Not a wire type: it is only ever built locally from received messages.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupSyncState {
+    pub name: String,
+    pub acl: Vec<AclEntry>,
+    pub deks: Vec<DekEntry>,
+    pub secrets: Vec<SecretEntry>,
+}
+
+/// One secret's full current version as fetched from the authoritative
+/// node: the payload of a [`SyncMessage::SecretData`], ready to apply.
+/// Still ciphertext — sync never decrypts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedSecret {
+    pub name: String,
+    pub version: u64,
+    pub dek_version: u64,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub created_at: i64,
+    pub created_by: String,
+}
+
 /// Rejects a body length declaring more than [`SYNC_MAX_MSG`] bytes. Shared
 /// by [`frame`] (checked on the encoded body, before send) and [`deframe`]
 /// and [`read_msg`] (checked on the declared length, before allocating a
