@@ -101,7 +101,7 @@ async fn delete_policy_leaves_gc_to_owner_reference() {
 }
 
 #[tokio::test]
-async fn retain_tolerates_missing_or_unowned_secret() {
+async fn retain_tolerates_missing_secret() {
     // 404 → nothing to orphan; done.
     let script = vec![expect(
         "GET",
@@ -109,6 +109,31 @@ async fn retain_tolerates_missing_or_unowned_secret() {
         404,
         json!({
             "kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": "NotFound", "code": 404
+        }),
+    )];
+    let (client, join) = scripted(script);
+    let (ctx, _dir) = ctx_with(client).await;
+    cleanup_bunker_secret(&deleting_cr("Retain"), &ctx)
+        .await
+        .unwrap();
+    join.await.unwrap();
+}
+
+/// Secret exists but is owned by a different BunkerSecret (different uid) —
+/// Retain must leave it alone entirely. The script contains only the GET; no
+/// further expectation follows, so any PATCH or DELETE the code might issue
+/// fails the test (closed/exhausted mock).
+#[tokio::test]
+async fn retain_leaves_unowned_secret_alone() {
+    let script = vec![expect(
+        "GET",
+        "/api/v1/namespaces/ns/secrets/app",
+        200,
+        json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {"name": "app", "namespace": "ns",
+                "ownerReferences": [{"apiVersion": "bunker.fables-for-robots.ch/v1alpha1",
+                    "kind": "BunkerSecret", "name": "app", "uid": "some-other-uid", "controller": true}]}
         }),
     )];
     let (client, join) = scripted(script);
