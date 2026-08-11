@@ -1,0 +1,19 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+{{- if not .Values.metrics.service.enabled }}
+{{- fail "metrics.serviceMonitor.enabled requires metrics.service.enabled" }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "secret-bunker-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "secret-bunker-operator.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "secret-bunker-operator.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+{{- end }}
