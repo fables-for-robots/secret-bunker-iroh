@@ -163,6 +163,11 @@ pub enum Response {
     Failed {
         reason: String,
     },
+    /// The node is a read-only replica; mutations must go to the
+    /// authoritative bunker. Sent only to registered identities.
+    ReadOnlyReplica {
+        authoritative: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,6 +310,13 @@ mod tests {
             (
                 encode(&Response::VersionConflict { current: 65535 }).unwrap(),
                 "a16f56657273696f6e436f6e666c696374a16763757272656e7419ffff",
+            ),
+            (
+                encode(&Response::ReadOnlyReplica {
+                    authoritative: "ab".into(),
+                })
+                .unwrap(),
+                "a16f526561644f6e6c795265706c696361a16d617574686f7269746174697665626162",
             ),
         ];
         for (bytes, expected) in cases {

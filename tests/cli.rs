@@ -15,6 +15,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_secret-bunker-iroh");
 /// Exit codes the CLI maps responses to.
 const EXIT_CONFLICT: i32 = 2;
 const EXIT_DENIED: i32 = 3;
+const EXIT_READ_ONLY: i32 = 4;
 
 /// One CLI actor: a set of invocations sharing an XDG data directory
 /// (and therefore an auto-generated identity).
@@ -60,6 +61,27 @@ impl Actor {
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
+    /// Run until the command succeeds or `timeout` elapses. For steps that
+    /// wait on an asynchronous convergence — a replica finding the
+    /// authoritative node and applying its manifest — where a single sleep
+    /// would be a guess.
+    fn expect_ok_within<S: AsRef<OsStr> + Debug>(&self, timeout: Duration, args: &[S]) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let out = self.run(args, None);
+            if out.status.success() {
+                return String::from_utf8(out.stdout).unwrap().trim().to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "command {args:?} never succeeded (last status {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
     /// Run and require the given failure exit code.
     fn expect_exit<S: AsRef<OsStr> + Debug>(&self, code: i32, args: &[S]) {
         let out = self.run(args, None);
@@ -85,15 +107,21 @@ impl Drop for ServerGuard {
 
 /// Spawn `serve` and wait until it logs its listening port.
 fn spawn_server(server: &Actor, db: &Path, log_path: &Path) -> (ServerGuard, u16) {
+    spawn_serve(
+        server,
+        log_path,
+        &["--db", db.to_str().unwrap(), "--no-relay", "--no-mdns"],
+    )
+}
+
+/// Spawn `serve` with arbitrary flags and wait until it logs the IPv4
+/// socket it bound. Both roles announce the same `bound: ` lines, so this
+/// gates readiness for an authoritative node and a replica alike.
+fn spawn_serve(server: &Actor, log_path: &Path, args: &[&str]) -> (ServerGuard, u16) {
     let log = std::fs::File::create(log_path).unwrap();
     let child = Command::new(BIN)
-        .args([
-            "serve",
-            "--db",
-            db.to_str().unwrap(),
-            "--no-relay",
-            "--no-mdns",
-        ])
+        .arg("serve")
+        .args(args)
         .env("XDG_DATA_HOME", &server.xdg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -588,5 +616,201 @@ fn cli_init_autogenerates_backup_and_admin_keys() {
     assert!(
         identities.contains(&client_id) && identities.contains("admin"),
         "unexpected identities: {identities}"
+    );
+}
+
+/// Two processes, one mirror: `serve --replica-of` syncs from the
+/// authoritative bunker, answers ordinary `client get` calls with
+/// plaintext, refuses writes with the replica exit code, and keeps
+/// serving once the authoritative process is gone — issue #1's headline
+/// scenario, through the binary.
+#[test]
+fn cli_replica_serves_reads_and_outlives_the_authoritative() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let db = root.join("bunker.sqlite");
+    let replica_db = root.join("replica.sqlite");
+
+    let server = Actor::new(root, "xdg-server");
+    let admin = Actor::new(root, "xdg-admin");
+    let replica = Actor::new(root, "xdg-replica");
+    let user = Actor::new(root, "xdg-user");
+
+    let admin_id = admin.expect_ok(&["key", "generate", "client"], None);
+    let user_id = user.expect_ok(&["key", "generate", "client"], None);
+    let server_id = server.expect_ok(&["key", "generate", "server"], None);
+    // The replica is registered under its SERVER key: that is the endpoint
+    // `serve --replica-of` binds, hence the recipient its DEK wraps are
+    // addressed to.
+    let replica_id = replica.expect_ok(&["key", "generate", "server"], None);
+
+    let backup_path = root.join("backup.age");
+    let backup_pub = server.expect_ok(
+        &["keygen-age", "--out", backup_path.to_str().unwrap()],
+        None,
+    );
+    server.expect_ok(
+        &[
+            "init",
+            "--db",
+            db.to_str().unwrap(),
+            "--backup-pubkey",
+            &backup_pub,
+            "--admin-id",
+            &admin_id,
+        ],
+        None,
+    );
+
+    // No relays, no mDNS, no DNS — as hermetic as the rest of the suite.
+    // The replica is handed the authoritative node's socket with
+    // --replica-addr, which is what --server-addr does for clients.
+    let (auth_guard, auth_port) = spawn_server(&server, &db, &root.join("serve.log"));
+    let auth_addr = format!("127.0.0.1:{auth_port}");
+    let to_auth = |rest: &[&str]| -> Vec<String> {
+        [
+            "client",
+            "--server",
+            &server_id,
+            "--server-addr",
+            &auth_addr,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(rest.iter().map(|s| s.to_string()))
+        .collect()
+    };
+
+    assert_eq!(
+        admin.expect_ok(&to_auth(&["create-group", "team"]), None),
+        "ok"
+    );
+    assert_eq!(
+        admin.expect_ok(
+            &to_auth(&["put", "--group", "team", "--name", "api-key"]),
+            Some(b"secret-v1"),
+        ),
+        "version 1"
+    );
+    for (name, id) in [("mirror", &replica_id), ("remote-user", &user_id)] {
+        assert_eq!(
+            admin.expect_ok(
+                &to_auth(&["add-identity", "--name", name, "--id", id]),
+                None
+            ),
+            "ok"
+        );
+        assert_eq!(
+            admin.expect_ok(
+                &to_auth(&[
+                    "grant",
+                    "--group",
+                    "team",
+                    "--identity",
+                    name,
+                    "--perms",
+                    "r",
+                ]),
+                None
+            ),
+            "ok"
+        );
+    }
+
+    // That address hint is replica-only: an authoritative `serve` refuses
+    // it rather than silently ignoring it.
+    let out = server.run(
+        &[
+            "serve",
+            "--db",
+            db.to_str().unwrap(),
+            "--replica-addr",
+            &auth_addr,
+        ],
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--replica-addr without --replica-of must fail: {stderr}"
+    );
+    assert!(
+        stderr.contains("--replica-of"),
+        "the error must point at --replica-of: {stderr}"
+    );
+
+    let (_replica_guard, replica_port) = spawn_serve(
+        &replica,
+        &root.join("replica.log"),
+        &[
+            "--db",
+            replica_db.to_str().unwrap(),
+            "--replica-of",
+            &server_id,
+            "--replica-addr",
+            &auth_addr,
+            "--no-relay",
+            "--no-mdns",
+        ],
+    );
+    let replica_addr = format!("127.0.0.1:{replica_port}");
+    let to_replica = |rest: &[&str]| -> Vec<String> {
+        [
+            "client",
+            "--server",
+            &replica_id,
+            "--server-addr",
+            &replica_addr,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(rest.iter().map(|s| s.to_string()))
+        .collect()
+    };
+    let get = to_replica(&["get", "--quiet", "--group", "team", "--name", "api-key"]);
+
+    // Discovery and the first sync are asynchronous, so poll rather than
+    // guess a sleep: the mirror answers with the same plaintext the
+    // authoritative node holds.
+    assert_eq!(
+        user.expect_ok_within(Duration::from_secs(120), &get),
+        "secret-v1",
+        "the replica must serve the mirrored plaintext"
+    );
+
+    // Writes are refused with the replica-specific exit code, and the
+    // message names the node to write to instead.
+    let out = user.run(
+        &to_replica(&[
+            "put",
+            "--group",
+            "team",
+            "--name",
+            "api-key",
+            "--value",
+            "nope",
+            "--expected-version",
+            "1",
+        ]),
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_READ_ONLY),
+        "a write to a replica must exit {EXIT_READ_ONLY}: {stderr}"
+    );
+    assert!(
+        stderr.contains(&server_id),
+        "the redirect must name the authoritative node: {stderr}"
+    );
+
+    // The authoritative process dies; the mirror keeps answering reads.
+    drop(auth_guard);
+    assert_eq!(
+        user.expect_ok(&get, None),
+        "secret-v1",
+        "the replica must serve reads with the authoritative node down"
     );
 }

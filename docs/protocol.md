@@ -28,6 +28,11 @@ Anyone may connect. A peer whose EndpointId is unknown to the server can
 open streams and send requests, but every one of them is answered with the
 uniform `"Denied"` response (section 6).
 
+An authoritative bunker mounts a second ALPN on the same endpoint,
+`secret-bunker-sync/1`, for replication to read-only replicas; it is
+specified separately in [`sync-protocol.md`](sync-protocol.md) and is
+invisible to clients.
+
 ## 2. Framing
 
 One request/response exchange per **bidirectional QUIC stream**:
@@ -77,7 +82,7 @@ serde's **externally-tagged enum representation**:
 
 **Variant and field names are the wire contract.** Decoders match them as
 strings; unknown variants are an error, unknown fields inside a known
-variant should be ignored. See section 7.
+variant should be ignored. See section 8.
 
 Examples below use CBOR diagnostic notation, with `h'..'` for byte
 strings.
@@ -123,7 +128,8 @@ Service-level operations require the caller's identity to carry the
 **service-admin** flag. Service admins additionally hold an implicit
 `read|write|admin` on every group, so every "on the group" requirement
 below is also satisfied by the flag. "→" lists the success responses;
-every request can also produce `Denied` or `Failed` (section 6).
+every request can also produce `Denied` or `Failed` (section 6), and every
+mutating one can produce `ReadOnlyReplica` (section 7).
 
 ### Secrets
 
@@ -222,6 +228,7 @@ one cannot be administered over the wire.
 {"Acl":             [["admin", 7], ["ci", 1]]}
 {"IdentityNames":   ["admin", "ci"]}
 {"Failed":          {"reason": "group 'prod' already exists"}}
+{"ReadOnlyReplica": {"authoritative": "1a98…(64 hex chars)…27b6"}}
 ```
 
 Notes:
@@ -238,11 +245,60 @@ Notes:
   implies seeing which secrets exist there and at what version, even
   without `read`; `read` gates values and `List`.
 - `Groups.service_admin` reports the *caller's* role; each entry's
-  `perms` is the caller's effective bitmask on that group (service
-  admins see every group, always with the full implicit `7`).
+  `perms` is the caller's effective bitmask on that group (on the
+  authoritative node, service admins see every group, always with the
+  full implicit `7`; on a replica see section 7).
 - `Version` answers a successful `Put`; `Ok` answers the other mutations.
+- **`ReadOnlyReplica` is registration-gated.** It answers a mutating
+  request on a read-only replica, and carries the EndpointId of the
+  authoritative bunker to retry against. Only *registered* identities
+  ever see it; an unregistered peer receives the uniform `Denied` for
+  every request, mutations included, so it cannot learn a node's role or
+  the id it mirrors. See section 7.
 
-## 7. Compatibility
+## 7. Replicas
+
+A **read-only replica** (`serve --replica-of <id-or-alias>`, or the
+`Replica` library component) mirrors the groups its own key can read from
+an authoritative bunker over a separate protocol,
+[`sync-protocol.md`](sync-protocol.md), and answers `secret-bunker/1` from
+that mirror. Clients are byte-for-byte oblivious to which they are talking
+to, so pointing `--server` at a local replica just works — including while
+the authoritative node is down.
+
+Replicas differ from the authoritative node in four documented ways:
+
+- **Read path only.** `Get`, `List`, `ListGroups`, `GroupAcl` and
+  `ListIdentityNames` are answered from the mirror. `Get` returns
+  plaintext, decrypted locally with the replica's own key.
+- **Authorization is the synced ACL and nothing else.** A replica never
+  consults the service-admin flag: no identity row in a mirror ever has
+  it set, and every permission check is made with the implicit bypass
+  disabled. Consequently `Groups.service_admin` is **always `false`** on a
+  replica and each entry's `perms` is the caller's *explicit* bitmask —
+  the note in section 6 about service admins seeing every group holds on
+  the authoritative node only. `ListIdentities`, being service-admin
+  gated, is uniformly `Denied` on a replica.
+- **Mutations are redirected, not proxied.** `Put`, `Delete`,
+  `CreateGroup`, `Grant`, `RotateDek`, `AddIdentity`, `RemoveIdentity`
+  and `SetServiceAdmin` are answered with `ReadOnlyReplica` when the
+  caller is registered, and with `Denied` when it is not. The mirror is
+  never written by a client. Staleness is absorbed by the existing CAS
+  flow: an edit based on a stale replica read hits `VersionConflict` at
+  the authoritative node and refreshes. The CLI prints the redirect and
+  exits **4** (1 = generic failure, 2 = CAS conflict, 3 = denied); a
+  client that predates the variant sees a decode error, i.e. a generic
+  failure, rather than a misleading `Denied`.
+- **Its own audit chain.** A replica logs the requests it serves with the
+  same vocabulary as the authoritative node, plus the outcome `readonly`
+  for redirected mutations and `sync-apply` rows for applied syncs.
+
+An ACL change reaches a replica only when the replica applies the sync
+carrying it; there is no staleness bound. See
+[`../design/crypto-design.md`](../design/crypto-design.md) sections 2
+and 7.
+
+## 8. Compatibility
 
 - Variant and field **names are the contract** — never rename them.
   Adding new variants or fields is backwards-compatible; decoders must
@@ -254,7 +310,10 @@ Notes:
 - Protocol revisions that break these rules must bump the ALPN
   (`secret-bunker/2`), not mutate `secret-bunker/1`.
 
-## 8. What the protocol does *not* do
+## 9. What the protocol does *not* do
+
+Replication between bunkers is a separate protocol on its own ALPN; see
+[`sync-protocol.md`](sync-protocol.md).
 
 For the security model — encryption at rest, key lifecycle, threat model,
 and why there is no application-layer crypto in these messages — see

@@ -1,8 +1,11 @@
+pub mod agebridge;
 pub mod client;
 pub mod crypto;
 pub mod keys;
 pub mod proto;
+pub mod replica;
 pub mod server;
 pub mod servers;
 pub mod store;
+pub mod sync;
 pub mod tui;
