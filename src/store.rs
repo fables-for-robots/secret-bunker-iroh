@@ -206,12 +206,8 @@ impl Store {
         let conn = Connection::open(path)
             .with_context(|| format!("opening database {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        // The migration rebuilds group_dek, which secret_group and dek_wrap
-        // both reference; SQLite refuses to drop a table other tables
-        // reference unless foreign key enforcement is off for the duration.
-        conn.pragma_update(None, "foreign_keys", "OFF")?;
-        migrate(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        migrate(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Store { conn })
     }
@@ -219,9 +215,8 @@ impl Store {
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.pragma_update(None, "foreign_keys", "OFF")?;
-        migrate(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        migrate(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Store { conn })
     }
@@ -241,10 +236,17 @@ impl Store {
     ) -> Result<()> {
         anyhow::ensure!(!self.is_initialized()?, "database is already initialized");
         let tx = self.conn.transaction()?;
+        // ON CONFLICT DO UPDATE: a schema-only v1 database (created but
+        // never initialized) already has a `schema_version` row from
+        // `migrate()` by the time `init` runs, since `open` always
+        // migrates before the caller gets a chance to check
+        // `is_initialized`. A plain INSERT would collide on that row and
+        // brick the database for every future init attempt.
         tx.execute(
             "INSERT INTO meta (key, value) VALUES
                ('operational_pubkey', ?1), ('backup_pubkey', ?2),
-               ('schema_version', '2'), ('role', 'authoritative')",
+               ('schema_version', '2'), ('role', 'authoritative')
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             params![operational_pubkey, backup_pubkey],
         )?;
         tx.execute(
@@ -1103,23 +1105,93 @@ mod tests {
     }
 
     #[test]
-    fn apply_recovery_updates_operational_wrap_rows() {
+    fn init_succeeds_on_schema_only_v1_database_migrated_but_never_initialized() {
+        // A v1-shaped database that was created (schema only, empty meta)
+        // but never initialized: ordinary v1 usage reaches `Store::open`
+        // (which migrates) before the initialized check, e.g. both `serve`
+        // and `init` open the store first. Migration must not leave the
+        // database unable to complete a subsequent `init`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-empty.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE identity (id INTEGER PRIMARY KEY, endpoint_id TEXT NOT NULL UNIQUE,
+                  name TEXT NOT NULL UNIQUE, service_admin INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+                CREATE TABLE secret_group (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
+                CREATE TABLE group_acl (identity_id INTEGER NOT NULL REFERENCES identity(id) ON DELETE CASCADE,
+                  group_id INTEGER NOT NULL REFERENCES secret_group(id) ON DELETE CASCADE,
+                  perms INTEGER NOT NULL, PRIMARY KEY (identity_id, group_id));
+                CREATE TABLE group_dek (group_id INTEGER NOT NULL REFERENCES secret_group(id) ON DELETE CASCADE,
+                  version INTEGER NOT NULL, wrapped_operational BLOB NOT NULL, wrapped_backup BLOB NOT NULL,
+                  created_at INTEGER NOT NULL, PRIMARY KEY (group_id, version));
+                CREATE TABLE secret (id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL REFERENCES secret_group(id) ON DELETE CASCADE,
+                  name TEXT NOT NULL, current_version INTEGER NOT NULL, UNIQUE (group_id, name));
+                CREATE TABLE secret_version (secret_id INTEGER NOT NULL REFERENCES secret(id) ON DELETE CASCADE,
+                  version INTEGER NOT NULL, dek_version INTEGER NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL,
+                  created_at INTEGER NOT NULL, created_by TEXT NOT NULL, PRIMARY KEY (secret_id, version));
+                CREATE TABLE audit_log (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                  endpoint_id TEXT NOT NULL, op TEXT NOT NULL, target TEXT NOT NULL, outcome TEXT NOT NULL,
+                  prev_hash BLOB NOT NULL, hash BLOB NOT NULL);
+            "#,
+            )
+            .unwrap();
+            // meta intentionally left empty: schema created, never initialized.
+        }
+        let mut s = Store::open(&path).unwrap();
+        // The migration ran (it detects the old columns regardless of row
+        // count) and already wrote a `schema_version` row into `meta`; the
+        // database is still uninitialized (no operational_pubkey).
+        assert!(!s.is_initialized().unwrap());
+        s.init("age1op", "age1backup", "endpoint-admin", "admin")
+            .unwrap();
+        assert!(s.is_initialized().unwrap());
+        assert_eq!(s.meta_get("schema_version").unwrap().unwrap(), "2");
+        assert_eq!(s.meta_get("role").unwrap().unwrap(), "authoritative");
+        assert_eq!(s.meta_get("operational_pubkey").unwrap().unwrap(), "age1op");
+    }
+
+    #[test]
+    fn apply_recovery_updates_operational_wrap_rows_atomically() {
         let mut s = store();
         let g1 = create_group(&mut s, "g1");
-        s.apply_recovery(&[(g1, 1, b"new-op".to_vec())], "age1new")
-            .unwrap();
+        let g2 = create_group(&mut s, "g2");
+        s.apply_recovery(
+            &[(g1, 1, b"new-op-1".to_vec()), (g2, 1, b"new-op-2".to_vec())],
+            "age1new",
+        )
+        .unwrap();
         assert_eq!(
             s.dek_wrap(g1, 1, RECIPIENT_OPERATIONAL).unwrap().unwrap(),
-            b"new-op"
+            b"new-op-1"
+        );
+        assert_eq!(
+            s.dek_wrap(g2, 1, RECIPIENT_OPERATIONAL).unwrap().unwrap(),
+            b"new-op-2"
         );
         assert_eq!(s.dek_wrap(g1, 1, RECIPIENT_BACKUP).unwrap().unwrap(), b"bk");
         assert_eq!(
             s.meta_get("operational_pubkey").unwrap().unwrap(),
             "age1new"
         );
+        // A bad row (nonexistent version in g2) aborts the whole batch:
+        // nothing is applied, not even g1's otherwise-valid update.
         assert!(
-            s.apply_recovery(&[(g1, 99, b"x".to_vec())], "age1x")
-                .is_err()
+            s.apply_recovery(
+                &[(g1, 1, b"newer".to_vec()), (g2, 99, b"missing".to_vec())],
+                "age1newer",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            s.dek_wrap(g1, 1, RECIPIENT_OPERATIONAL).unwrap().unwrap(),
+            b"new-op-1"
+        );
+        assert_eq!(
+            s.meta_get("operational_pubkey").unwrap().unwrap(),
+            "age1new"
         );
     }
 
