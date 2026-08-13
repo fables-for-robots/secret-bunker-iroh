@@ -734,6 +734,14 @@ async fn main() -> Result<()> {
                         eprintln!("warning: no relay confirmed within 15s; continuing anyway")
                     }
                 }
+                // Watchdogs for the relay path staying silently broken:
+                // log home-relay transitions, and warn when the published
+                // discovery record stops matching a connected relay.
+                secret_bunker_iroh::relayhealth::spawn_relay_status_log(router.endpoint());
+                secret_bunker_iroh::relayhealth::spawn_record_self_check(
+                    router.endpoint(),
+                    std::time::Duration::from_secs(300),
+                );
             }
             tokio::signal::ctrl_c().await?;
             eprintln!("shutting down");

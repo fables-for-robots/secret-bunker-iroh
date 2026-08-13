@@ -575,14 +575,47 @@ enum SessionEnd {
     Shutdown,
 }
 
+/// Whether the `n`-th consecutive connection failure since the last
+/// healthy session deserves a `warn` (the rest stay at `debug`): the
+/// first one, then every tenth, so a dead bunker is visible in default-
+/// level logs without a line per retry.
+fn should_warn_reconnect(n: u64) -> bool {
+    n == 1 || n.is_multiple_of(10)
+}
+
 /// The reconnect loop: one [`run_connection`] per attempt, exponential
 /// backoff between failures, until shutdown.
 async fn run_sync(inner: Arc<ReplicaInner>, mut shutdown: watch::Receiver<bool>) {
     let mut backoff = BACKOFF_INITIAL;
+    let mut consecutive_failures: u64 = 0;
     loop {
         match run_connection(&inner, &mut shutdown, &mut backoff).await {
             Ok(()) => return, // shutdown requested
-            Err(err) => tracing::debug!(%err, "sync connection lost"),
+            Err(err) => {
+                let (was_connected, last_synced) = {
+                    let status = inner.lock_status();
+                    (status.connected, status.last_synced)
+                };
+                if was_connected {
+                    consecutive_failures = 0;
+                }
+                consecutive_failures += 1;
+                if should_warn_reconnect(consecutive_failures) {
+                    let last_synced = match last_synced.and_then(|t| t.elapsed().ok()) {
+                        Some(age) => format!("{}s ago", age.as_secs()),
+                        None => "never".into(),
+                    };
+                    tracing::warn!(
+                        %err,
+                        consecutive_failures,
+                        %last_synced,
+                        authoritative = %inner.authoritative,
+                        "sync to authoritative node failing; retrying with backoff"
+                    );
+                } else {
+                    tracing::debug!(%err, "sync connection lost");
+                }
+            }
         }
         set_disconnected(&inner);
         tokio::select! {
@@ -1018,6 +1051,25 @@ mod tests {
 
     fn fresh_secret() -> SecretKey {
         SecretKey::generate()
+    }
+
+    #[test]
+    fn reconnect_warns_on_first_failure_after_health() {
+        assert!(should_warn_reconnect(1));
+    }
+
+    #[test]
+    fn reconnect_stays_quiet_between_escalation_points() {
+        for n in [2, 3, 9, 11, 19, 101] {
+            assert!(!should_warn_reconnect(n), "failure {n} must stay at debug");
+        }
+    }
+
+    #[test]
+    fn reconnect_warns_every_tenth_failure() {
+        for n in [10, 20, 100] {
+            assert!(should_warn_reconnect(n), "failure {n} must warn");
+        }
     }
 
     #[tokio::test]

@@ -112,11 +112,22 @@ async fn drive_bridge(
                 }
             },
             _ = tick.tick() => {
-                let stale = staleness
-                    .disconnected_for()
-                    .is_some_and(|d| d >= staleness_threshold);
+                let disconnected = staleness.disconnected_for();
+                let stale = disconnected.is_some_and(|d| d >= staleness_threshold);
+                if stale {
+                    // One line per tick (≤1/min) while broken: the stale
+                    // mirror keeps a heartbeat in default-level logs
+                    // instead of failing silently for hours.
+                    tracing::warn!(
+                        disconnected_for_secs = disconnected.unwrap_or_default().as_secs(),
+                        "replica sync stale; serving cached mirror data"
+                    );
+                }
                 if stale != was_stale {
                     was_stale = stale;
+                    if !stale {
+                        tracing::info!("replica sync recovered");
+                    }
                     trigger_all(if stale { "went-stale" } else { "recovered" }, &crs, &tx);
                 }
             }

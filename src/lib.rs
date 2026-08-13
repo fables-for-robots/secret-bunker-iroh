@@ -4,6 +4,7 @@ mod connlog;
 pub mod crypto;
 pub mod keys;
 pub mod proto;
+pub mod relayhealth;
 pub mod replica;
 pub mod server;
 pub mod servers;
