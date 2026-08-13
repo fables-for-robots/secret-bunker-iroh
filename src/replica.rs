@@ -374,7 +374,12 @@ fn dispatch(inner: &ReplicaInner, store: &Store, remote: &str, req: &Request) ->
 impl ProtocolHandler for ReplicaServer {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote = connection.remote_id().to_string();
-        tracing::info!(client = remote, "client connected");
+        tracing::info!(
+            client = remote,
+            path = crate::connlog::selected_path(&connection),
+            "client connected"
+        );
+        crate::connlog::log_path_changes(&connection, format!("client {remote}"));
         // One frame per stream, mirroring `Bunker`'s accept loop: serve
         // until the peer closes, and let per-stream errors end only this
         // connection.
@@ -610,6 +615,7 @@ async fn run_connection(
         conn.close(0u32.into(), b"shutdown");
         return Ok(());
     }
+    crate::connlog::log_path_changes(&conn, format!("authoritative node {}", inner.authoritative));
     loop {
         match run_session(inner, &conn, shutdown, backoff).await? {
             SessionEnd::CycleStream => continue,
@@ -659,7 +665,7 @@ async fn run_session(
             }
             hello_ok = true;
             *backoff = BACKOFF_INITIAL;
-            set_connected(inner);
+            set_connected(inner, conn);
         }
         match msg {
             SyncMessage::Group { name, acl, deks } => {
@@ -976,13 +982,17 @@ fn drop_group_and_gc(inner: &ReplicaInner, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn set_connected(inner: &ReplicaInner) {
+fn set_connected(inner: &ReplicaInner, conn: &Connection) {
     let flipped = {
         let mut status = inner.lock_status();
         !std::mem::replace(&mut status.connected, true)
     };
     if flipped {
-        tracing::info!(authoritative = %inner.authoritative, "connected to authoritative node");
+        tracing::info!(
+            authoritative = %inner.authoritative,
+            path = crate::connlog::selected_path(conn),
+            "connected to authoritative node"
+        );
         inner.emit(ReplicaEvent::Connected);
     }
 }

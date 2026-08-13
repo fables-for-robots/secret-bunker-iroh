@@ -1,5 +1,6 @@
 pub mod agebridge;
 pub mod client;
+mod connlog;
 pub mod crypto;
 pub mod keys;
 pub mod proto;
