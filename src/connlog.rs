@@ -47,7 +47,11 @@ pub(crate) fn log_path_changes(conn: &Connection, peer: String) {
             if let PathEvent::Selected { remote_addr, .. } = event
                 && last.as_ref() != Some(&remote_addr)
             {
-                tracing::info!(peer, path = describe(&remote_addr), "connection path changed");
+                tracing::info!(
+                    peer,
+                    path = describe(&remote_addr),
+                    "connection path changed"
+                );
                 last = Some(remote_addr);
             }
         }
