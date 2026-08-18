@@ -382,6 +382,19 @@ async fn bind_serve_endpoint(
         .map_err(|e| anyhow::anyhow!("binding endpoint: {e}"))
 }
 
+/// The serve loop's shutdown future: resolves on ctrl-c. If the signal
+/// handler cannot be installed there is no clean way to ever stop, so
+/// keep serving and leave termination to SIGTERM/SIGKILL.
+async fn ctrl_c_shutdown() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => eprintln!("shutting down"),
+        Err(err) => {
+            tracing::error!(%err, "ctrl-c handler failed; serving until killed");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 fn run_key_cmd(cmd: KeyCmd) -> Result<()> {
     match cmd {
         KeyCmd::Show => {
@@ -664,35 +677,78 @@ async fn main() -> Result<()> {
                 );
                 let authoritative = secret_bunker_iroh::servers::resolve(Some(&target))?;
                 let secret = resolve_endpoint_key(endpoint_key, KeyRole::Server)?;
-                let endpoint = bind_serve_endpoint(secret.clone(), no_relay, no_mdns).await?;
-                eprintln!("replica endpoint id: {}", endpoint.id());
-                for addr in endpoint.bound_sockets() {
-                    eprintln!("bound: {addr}");
-                }
-                let replica = secret_bunker_iroh::replica::Replica::builder()
-                    .store_path(&db)
-                    .secret_key(secret)
-                    .authoritative(authoritative)
-                    .authoritative_addrs(replica_addr)
-                    .endpoint(endpoint.clone())
-                    .spawn()
-                    .await?;
-                let router = Router::builder(endpoint)
-                    .accept(secret_bunker_iroh::proto::ALPN, replica.protocol_handler())
-                    .spawn();
-                tokio::signal::ctrl_c().await?;
-                eprintln!("shutting down");
-                // `Router::shutdown` closes the endpoint it was built over
-                // (see iroh::protocol::Router::shutdown's docs), and that's
-                // the same endpoint the replica was handed — so
-                // `replica.shutdown()` must not close it again. It won't:
-                // a caller-supplied endpoint leaves the replica's internal
-                // `owned_endpoint` false, so its shutdown skips the close.
-                router
-                    .shutdown()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("router shutdown: {e}"))?;
-                replica.shutdown().await;
+                // Same self-healing loop as the authoritative path below;
+                // each generation respawns the sync engine over the fresh
+                // endpoint (the mirror database carries all state).
+                secret_bunker_iroh::serveloop::serve_with_rebind(
+                    move |generation| {
+                        let secret = secret.clone();
+                        let db = db.clone();
+                        let replica_addr = replica_addr.clone();
+                        async move {
+                            let endpoint =
+                                bind_serve_endpoint(secret.clone(), no_relay, no_mdns).await?;
+                            if generation == 1 {
+                                eprintln!("replica endpoint id: {}", endpoint.id());
+                                for addr in endpoint.bound_sockets() {
+                                    eprintln!("bound: {addr}");
+                                }
+                            } else {
+                                tracing::info!(
+                                    generation,
+                                    "rebound endpoint over a fresh transport"
+                                );
+                            }
+                            let replica = secret_bunker_iroh::replica::Replica::builder()
+                                .store_path(&db)
+                                .secret_key(secret)
+                                .authoritative(authoritative)
+                                .authoritative_addrs(replica_addr)
+                                .endpoint(endpoint.clone())
+                                .spawn()
+                                .await?;
+                            let router = Router::builder(endpoint)
+                                .accept(secret_bunker_iroh::proto::ALPN, replica.protocol_handler())
+                                .spawn();
+                            let wedged = if no_relay {
+                                None
+                            } else {
+                                let (wedge_tx, wedge_rx) = tokio::sync::mpsc::channel(2);
+                                secret_bunker_iroh::relayhealth::spawn_relay_status_log(
+                                    router.endpoint(),
+                                );
+                                secret_bunker_iroh::relayhealth::spawn_relay_down_watch(
+                                    router.endpoint(),
+                                    secret_bunker_iroh::relayhealth::RELAY_DOWN_REBIND_AFTER,
+                                    wedge_tx.clone(),
+                                );
+                                secret_bunker_iroh::relayhealth::spawn_record_self_check(
+                                    router.endpoint(),
+                                    std::time::Duration::from_secs(300),
+                                    wedge_tx,
+                                );
+                                Some(wedge_rx)
+                            };
+                            // `Router::shutdown` (run by the serve loop)
+                            // closes the endpoint it was built over — the
+                            // same endpoint the replica was handed — so
+                            // `replica.shutdown()` must not close it again.
+                            // It won't: a caller-supplied endpoint leaves
+                            // the replica's internal `owned_endpoint`
+                            // false, so its shutdown skips the close. The
+                            // loop awaits this teardown strictly after the
+                            // router's shutdown.
+                            Ok(secret_bunker_iroh::serveloop::Generation {
+                                router,
+                                wedged,
+                                teardown: Some(Box::pin(async move { replica.shutdown().await })),
+                            })
+                        }
+                    },
+                    ctrl_c_shutdown(),
+                    std::time::Duration::from_secs(30),
+                )
+                .await?;
                 return Ok(());
             }
             anyhow::ensure!(
@@ -711,44 +767,76 @@ async fn main() -> Result<()> {
             if backfilled > 0 {
                 eprintln!("backfilled {backfilled} reader DEK wrap(s)");
             }
-            let endpoint = bind_serve_endpoint(secret, no_relay, no_mdns).await?;
-            eprintln!("bunker endpoint id: {}", endpoint.id());
-            for addr in endpoint.bound_sockets() {
-                eprintln!("bound: {addr}");
-            }
-            let router = Router::builder(endpoint)
-                .accept(secret_bunker_iroh::proto::ALPN, bunker.clone())
-                .accept(secret_bunker_iroh::sync::SYNC_ALPN, bunker.sync_handler())
-                .spawn();
-            if !no_relay {
-                // Wait until at least one relay handshake completes, so the
-                // printed EndpointId is actually dialable through NATs.
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(15),
-                    router.endpoint().online(),
-                )
-                .await
-                {
-                    Ok(()) => eprintln!("online: reachable via relay"),
-                    Err(_) => {
-                        eprintln!("warning: no relay confirmed within 15s; continuing anyway")
+            // Self-healing serve loop: generation 1 is plain startup;
+            // every later generation replaces an endpoint whose relay
+            // state wedged (iroh#4476, the 2026-08-17 incident) with a
+            // fresh one over the same key and the same open store.
+            secret_bunker_iroh::serveloop::serve_with_rebind(
+                move |generation| {
+                    let secret = secret.clone();
+                    let bunker = bunker.clone();
+                    async move {
+                        let endpoint = bind_serve_endpoint(secret, no_relay, no_mdns).await?;
+                        if generation == 1 {
+                            eprintln!("bunker endpoint id: {}", endpoint.id());
+                            for addr in endpoint.bound_sockets() {
+                                eprintln!("bound: {addr}");
+                            }
+                        } else {
+                            tracing::info!(generation, "rebound endpoint over a fresh transport");
+                        }
+                        let router = Router::builder(endpoint)
+                            .accept(secret_bunker_iroh::proto::ALPN, bunker.clone())
+                            .accept(secret_bunker_iroh::sync::SYNC_ALPN, bunker.sync_handler())
+                            .spawn();
+                        let wedged = if no_relay {
+                            None
+                        } else {
+                            // Wait until at least one relay handshake
+                            // completes, so the printed EndpointId is
+                            // actually dialable through NATs.
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(15),
+                                router.endpoint().online(),
+                            )
+                            .await
+                            {
+                                Ok(()) => eprintln!("online: reachable via relay"),
+                                Err(_) => eprintln!(
+                                    "warning: no relay confirmed within 15s; continuing anyway"
+                                ),
+                            }
+                            // Watchdogs for the relay path staying silently
+                            // broken: log home-relay transitions, and rebind
+                            // (via the wedge channel) when the relay set or
+                            // the published discovery record stays dead.
+                            let (wedge_tx, wedge_rx) = tokio::sync::mpsc::channel(2);
+                            secret_bunker_iroh::relayhealth::spawn_relay_status_log(
+                                router.endpoint(),
+                            );
+                            secret_bunker_iroh::relayhealth::spawn_relay_down_watch(
+                                router.endpoint(),
+                                secret_bunker_iroh::relayhealth::RELAY_DOWN_REBIND_AFTER,
+                                wedge_tx.clone(),
+                            );
+                            secret_bunker_iroh::relayhealth::spawn_record_self_check(
+                                router.endpoint(),
+                                std::time::Duration::from_secs(300),
+                                wedge_tx,
+                            );
+                            Some(wedge_rx)
+                        };
+                        Ok(secret_bunker_iroh::serveloop::Generation {
+                            router,
+                            wedged,
+                            teardown: None,
+                        })
                     }
-                }
-                // Watchdogs for the relay path staying silently broken:
-                // log home-relay transitions, and warn when the published
-                // discovery record stops matching a connected relay.
-                secret_bunker_iroh::relayhealth::spawn_relay_status_log(router.endpoint());
-                secret_bunker_iroh::relayhealth::spawn_record_self_check(
-                    router.endpoint(),
-                    std::time::Duration::from_secs(300),
-                );
-            }
-            tokio::signal::ctrl_c().await?;
-            eprintln!("shutting down");
-            router
-                .shutdown()
-                .await
-                .map_err(|e| anyhow::anyhow!("router shutdown: {e}"))?;
+                },
+                ctrl_c_shutdown(),
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
         }
         Cmd::Recover {
             db,

@@ -6,6 +6,7 @@ pub mod keys;
 pub mod proto;
 pub mod relayhealth;
 pub mod replica;
+pub mod serveloop;
 pub mod server;
 pub mod servers;
 pub mod store;
