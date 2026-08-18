@@ -738,9 +738,13 @@ async fn main() -> Result<()> {
                 // log home-relay transitions, and warn when the published
                 // discovery record stops matching a connected relay.
                 secret_bunker_iroh::relayhealth::spawn_relay_status_log(router.endpoint());
+                // Throwaway sink until the serve loop consumes the wedge
+                // signal (next commit).
+                let (wedge_tx, _wedge_rx) = tokio::sync::mpsc::channel(2);
                 secret_bunker_iroh::relayhealth::spawn_record_self_check(
                     router.endpoint(),
                     std::time::Duration::from_secs(300),
+                    wedge_tx,
                 );
             }
             tokio::signal::ctrl_c().await?;

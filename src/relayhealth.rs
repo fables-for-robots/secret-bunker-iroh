@@ -16,6 +16,20 @@ use std::time::Duration;
 use iroh::address_lookup::dns::N0_DNS_ENDPOINT_ORIGIN_PROD;
 use iroh::endpoint::RelayStatus;
 use iroh::{Endpoint, RelayUrl, Watcher as _};
+use tokio::sync::mpsc;
+
+/// Which watchdog concluded the endpoint is wedged (iroh#4476) and needs
+/// rebinding. Sent at most once per watchdog per endpoint generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WedgeReason {
+    /// [`spawn_relay_down_watch`]: had a relay, none connected for
+    /// [`RELAY_DOWN_REBIND_AFTER`].
+    RelayDown,
+    /// [`spawn_record_self_check`]: [`MISMATCH_REBIND_THRESHOLD`]
+    /// consecutive self-checks saw the published record advertising no
+    /// connected relay.
+    RecordMismatch,
+}
 
 /// One line per relay: `<url> (connected)` / `<url> (down: <err>)`.
 fn describe_statuses(statuses: &[RelayStatus]) -> String {
@@ -70,11 +84,18 @@ const LOOKUP_FAILURES_BEFORE_WARN: u32 = 3;
 
 /// Every `interval`, resolves this endpoint's own discovery record from
 /// the n0 DNS origin and warns when the advertised relays don't include
-/// one we are actually connected to (see [`record_mismatch`]).
-pub fn spawn_record_self_check(endpoint: &Endpoint, interval: Duration) {
+/// one we are actually connected to (see [`record_mismatch`]). After
+/// [`MISMATCH_REBIND_THRESHOLD`] consecutive mismatches the state is a
+/// wedge, not weather: the task escalates once and ends.
+pub fn spawn_record_self_check(
+    endpoint: &Endpoint,
+    interval: Duration,
+    escalate: mpsc::Sender<WedgeReason>,
+) {
     let endpoint = endpoint.clone();
     tokio::spawn(async move {
         let mut failed_lookups: u32 = 0;
+        let mut streak = MismatchStreak::new(MISMATCH_REBIND_THRESHOLD);
         loop {
             tokio::time::sleep(interval).await;
             let Ok(resolver) = endpoint.dns_resolver() else {
@@ -94,14 +115,28 @@ pub fn spawn_record_self_check(endpoint: &Endpoint, interval: Duration) {
                         .map(|s| (s.url().clone(), s.is_connected()))
                         .collect();
                     match record_mismatch(&advertised, &live) {
-                        Some(msg) => tracing::warn!("{msg}"),
-                        None => tracing::debug!(
-                            relays = ?advertised.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
-                            "published discovery record matches a connected relay"
-                        ),
+                        Some(msg) => {
+                            tracing::warn!("{msg}");
+                            if streak.observe(Observation::Mismatch) {
+                                tracing::warn!(
+                                    consecutive = MISMATCH_REBIND_THRESHOLD,
+                                    "record mismatch persists — escalating for an endpoint rebind"
+                                );
+                                let _ = escalate.try_send(WedgeReason::RecordMismatch);
+                                return;
+                            }
+                        }
+                        None => {
+                            streak.observe(Observation::Match);
+                            tracing::debug!(
+                                relays = ?advertised.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+                                "published discovery record matches a connected relay"
+                            );
+                        }
                     }
                 }
                 Err(err) => {
+                    streak.observe(Observation::Inconclusive);
                     failed_lookups += 1;
                     if failed_lookups >= LOOKUP_FAILURES_BEFORE_WARN {
                         tracing::warn!(
@@ -114,6 +149,43 @@ pub fn spawn_record_self_check(endpoint: &Endpoint, interval: Duration) {
                     }
                 }
             }
+        }
+    });
+}
+
+/// How often [`spawn_relay_down_watch`] samples the home-relay set.
+const RELAY_DOWN_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Watches for the endpoint losing its home relay and not getting one
+/// back (see [`RelayDownTracker`] for the exact semantics): escalates
+/// once for an endpoint rebind, then ends. Also ends quietly when the
+/// endpoint closes (a rebind spawns a fresh watch on the new endpoint).
+pub fn spawn_relay_down_watch(
+    endpoint: &Endpoint,
+    down_after: Duration,
+    escalate: mpsc::Sender<WedgeReason>,
+) {
+    let endpoint = endpoint.clone();
+    tokio::spawn(async move {
+        let mut tracker = RelayDownTracker::new(down_after);
+        loop {
+            if endpoint.is_closed() {
+                return;
+            }
+            let any_connected = endpoint
+                .home_relay_status()
+                .get()
+                .iter()
+                .any(|s| s.is_connected());
+            if tracker.observe(any_connected, std::time::Instant::now()) {
+                tracing::warn!(
+                    down_for = ?down_after,
+                    "no home relay connected for too long — escalating for an endpoint rebind"
+                );
+                let _ = escalate.try_send(WedgeReason::RelayDown);
+                return;
+            }
+            tokio::time::sleep(RELAY_DOWN_SAMPLE_INTERVAL).await;
         }
     });
 }
