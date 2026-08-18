@@ -118,6 +118,92 @@ pub fn spawn_record_self_check(endpoint: &Endpoint, interval: Duration) {
     });
 }
 
+/// How long the endpoint may sit with no connected home relay — after
+/// having had one — before the serve loop should rebind it. Ten minutes
+/// is far past any healthy reconnect (they complete in seconds; see the
+/// 2026-08-17 incident log) yet quick next to the 15-hour outage a wedge
+/// causes unattended.
+pub const RELAY_DOWN_REBIND_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// Consecutive mismatched record self-checks (at the 5-minute interval)
+/// before escalating: one is DNS/registry propagation weather, three in a
+/// row (~15 min) is a peer-visible outage.
+pub(crate) const MISMATCH_REBIND_THRESHOLD: u32 = 3;
+
+/// Tracks "the endpoint HAD a relay and has been without one too long".
+///
+/// Firing requires a prior connected relay on this endpoint: a fresh
+/// endpoint that never reaches any relay looks identical to a dead
+/// uplink (offline LAN deployment), and rebinding there would cut live
+/// LAN connections every cycle for nothing. The record self-check covers
+/// the wedge-at-bind case instead — a successful lookup of our own
+/// record proves the internet path works.
+pub struct RelayDownTracker {
+    down_after: Duration,
+    was_connected: bool,
+    down_since: Option<std::time::Instant>,
+}
+
+impl RelayDownTracker {
+    pub fn new(down_after: Duration) -> Self {
+        RelayDownTracker {
+            down_after,
+            was_connected: false,
+            down_since: None,
+        }
+    }
+
+    /// Feed one sample of "is any home relay connected"; returns true
+    /// when the endpoint should be rebound.
+    pub fn observe(&mut self, any_connected: bool, now: std::time::Instant) -> bool {
+        if any_connected {
+            self.was_connected = true;
+            self.down_since = None;
+            return false;
+        }
+        if !self.was_connected {
+            return false;
+        }
+        let since = *self.down_since.get_or_insert(now);
+        now.duration_since(since) >= self.down_after
+    }
+}
+
+/// One record self-check's verdict, as [`MismatchStreak`] counts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Observation {
+    /// An advertised relay is connected: healthy.
+    Match,
+    /// The record points at no connected relay: peers cannot reach us.
+    Mismatch,
+    /// The lookup itself failed — no evidence either way.
+    Inconclusive,
+}
+
+/// Counts consecutive [`Observation::Mismatch`] verdicts; fires at the
+/// threshold. Inconclusive lookups neither extend nor reset the streak.
+pub struct MismatchStreak {
+    threshold: u32,
+    n: u32,
+}
+
+impl MismatchStreak {
+    pub fn new(threshold: u32) -> Self {
+        MismatchStreak { threshold, n: 0 }
+    }
+
+    /// Record one self-check outcome; returns true when the streak
+    /// reaches the threshold.
+    pub fn observe(&mut self, obs: Observation) -> bool {
+        match obs {
+            Observation::Match => self.n = 0,
+            Observation::Mismatch => self.n += 1,
+            Observation::Inconclusive => {}
+        }
+        self.n >= self.threshold
+    }
+}
+
 /// Compares the relays a discovery record advertises against the live
 /// home-relay state `(url, is_connected)`. Returns a warning message
 /// when a remote peer following the record could not reach us — i.e.
@@ -149,10 +235,85 @@ pub fn record_mismatch(advertised: &[RelayUrl], live: &[(RelayUrl, bool)]) -> Op
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     fn url(s: &str) -> RelayUrl {
         s.parse().expect("relay url")
+    }
+
+    fn t(base: Instant, secs: u64) -> Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn never_connected_endpoint_never_triggers_relay_down() {
+        let base = Instant::now();
+        let mut tr = RelayDownTracker::new(Duration::from_secs(600));
+        assert!(!tr.observe(false, t(base, 0)));
+        assert!(
+            !tr.observe(false, t(base, 6000)),
+            "no prior relay: must not fire"
+        );
+    }
+
+    #[test]
+    fn relay_down_triggers_after_threshold_once_connected() {
+        let base = Instant::now();
+        let mut tr = RelayDownTracker::new(Duration::from_secs(600));
+        assert!(!tr.observe(true, t(base, 0)));
+        assert!(!tr.observe(false, t(base, 10)));
+        assert!(!tr.observe(false, t(base, 609)), "1s short of threshold");
+        assert!(tr.observe(false, t(base, 610)));
+    }
+
+    #[test]
+    fn reconnect_resets_the_relay_down_clock() {
+        let base = Instant::now();
+        let mut tr = RelayDownTracker::new(Duration::from_secs(600));
+        tr.observe(true, t(base, 0));
+        tr.observe(false, t(base, 10));
+        tr.observe(true, t(base, 300)); // came back
+        // The outage clock restarts at the first down sample after the
+        // reconnect (700), not at the reconnect itself.
+        assert!(!tr.observe(false, t(base, 700)), "clock restarted");
+        assert!(
+            !tr.observe(false, t(base, 1299)),
+            "1s short of the restarted threshold"
+        );
+        assert!(tr.observe(false, t(base, 1300)));
+    }
+
+    #[test]
+    fn mismatch_streak_fires_at_threshold() {
+        let mut s = MismatchStreak::new(3);
+        assert!(!s.observe(Observation::Mismatch));
+        assert!(!s.observe(Observation::Mismatch));
+        assert!(s.observe(Observation::Mismatch));
+    }
+
+    #[test]
+    fn a_match_resets_the_streak() {
+        let mut s = MismatchStreak::new(3);
+        s.observe(Observation::Mismatch);
+        s.observe(Observation::Mismatch);
+        assert!(!s.observe(Observation::Match));
+        assert!(!s.observe(Observation::Mismatch));
+        assert!(!s.observe(Observation::Mismatch));
+        assert!(s.observe(Observation::Mismatch));
+    }
+
+    #[test]
+    fn inconclusive_lookups_freeze_the_streak() {
+        let mut s = MismatchStreak::new(3);
+        s.observe(Observation::Mismatch);
+        s.observe(Observation::Mismatch);
+        assert!(!s.observe(Observation::Inconclusive));
+        assert!(
+            s.observe(Observation::Mismatch),
+            "inconclusive neither reset nor advanced"
+        );
     }
 
     const USE1: &str = "https://use1-1.relay.n0.iroh.link./";
