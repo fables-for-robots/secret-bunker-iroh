@@ -1,6 +1,6 @@
 [package]
 name = "secret-bunker-operator"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.91"
 license = "AGPL-3.0-or-later"
