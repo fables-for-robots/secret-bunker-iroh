@@ -187,6 +187,10 @@ pub struct BunkerSecretStatus {
     pub last_sync_time: Option<Time>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+    /// `metadata.generation` of the spec that `lastSyncTime` refers to.
+    /// Unlike `observedGeneration` it only moves on a successful apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_generation: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub synced_secret_keys: Vec<String>,
     /// Name of the Secret last applied — used to clean up on target rename.

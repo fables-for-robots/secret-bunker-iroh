@@ -67,15 +67,23 @@ pub fn default_key_path(role: KeyRole) -> Result<PathBuf> {
 }
 
 pub(crate) fn ensure_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        // Created 0700 from the start (mode applies to every new directory);
-        // the set_permissions repairs pre-existing lax directories.
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    ensure_parent_with(parent, data_dir().ok().as_deref())
+}
+
+fn ensure_parent_with(parent: &Path, data_dir: Option<&Path>) -> Result<()> {
+    // New directories are 0700. A pre-existing lax data dir is repaired;
+    // any other existing parent (cwd, ~, /tmp via --out) is the user's.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .with_context(|| format!("creating {}", parent.display()))?;
+    if data_dir == Some(parent) {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 700 {}", parent.display()))?;
     }
     Ok(())
 }
@@ -282,6 +290,19 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn ensure_parent_only_tightens_the_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_parent_with(dir.path(), None).unwrap();
+        assert_eq!(mode(dir.path()), 0o755);
+        ensure_parent_with(dir.path(), Some(dir.path())).unwrap();
+        assert_eq!(mode(dir.path()), 0o700);
+        // Bare filename: parent is "".
+        ensure_parent(Path::new("x.key")).unwrap();
     }
 
     #[test]

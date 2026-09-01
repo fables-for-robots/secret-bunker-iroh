@@ -297,21 +297,27 @@ impl ReplicaServer {
     pub fn handle_raw(&self, remote: &str, bytes: &[u8]) -> Response {
         match proto::decode::<Request>(bytes) {
             Ok(mut req) => {
-                let response = self.handle(remote, &req);
+                let response = if req.names_ok() {
+                    self.handle(remote, &req)
+                } else {
+                    self.deny_malformed(remote)
+                };
                 // Best-effort scrub of the plaintext copy decode made.
                 if let Request::Put { value, .. } = &mut req {
                     value.zeroize();
                 }
                 response
             }
-            Err(_) => {
-                let store = self.inner.lock_store();
-                if let Err(err) = store.audit(remote, "malformed", "", "denied") {
-                    tracing::error!(%err, "audit append failed");
-                }
-                Response::Denied
-            }
+            Err(_) => self.deny_malformed(remote),
         }
+    }
+
+    fn deny_malformed(&self, remote: &str) -> Response {
+        let store = self.inner.lock_store();
+        if let Err(err) = store.audit(remote, "malformed", "", "denied") {
+            tracing::error!(%err, "audit append failed");
+        }
+        Response::Denied
     }
 
     /// Handle one decoded request and record it in the replica's own
@@ -820,9 +826,11 @@ async fn sync_group_via_fetch(
     group: &str,
 ) -> Result<()> {
     match fetch_group_state(conn, group).await? {
-        Some(state) => sync_one_group(inner, conn, &state).await,
-        None => drop_group_and_gc(inner, group),
+        Some(state) => sync_one_group(inner, conn, &state).await?,
+        None => drop_group_and_gc(inner, group)?,
     }
+    touch_last_synced(inner);
+    Ok(())
 }
 
 enum ApplyOutcome {
@@ -840,7 +848,8 @@ enum ApplyOutcome {
 
 /// Fetch the secrets `state` obsoletes and apply the whole state in one
 /// local transaction; publish `GroupAdded` and per-secret events strictly
-/// after the commit.
+/// after the commit. Does not stamp `last_synced`; callers do, once
+/// their whole round is applied.
 async fn apply_group_state(
     inner: &Arc<ReplicaInner>,
     conn: &Connection,
@@ -895,7 +904,6 @@ async fn apply_group_state(
             },
         });
     }
-    touch_last_synced(inner);
     Ok(ApplyOutcome::Applied {
         skipped_undecryptable,
     })
@@ -910,17 +918,32 @@ async fn fetch_secrets(
     group: &str,
     names: Vec<String>,
 ) -> Result<Option<Vec<FetchedSecret>>> {
+    let mut out = Vec::new();
+    for chunk in names.chunks(sync::SYNC_FETCH_CHUNK) {
+        if !fetch_secrets_chunk(conn, group, chunk, &mut out).await? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// One `FetchSecrets` stream; `false` on `SyncDenied`.
+async fn fetch_secrets_chunk(
+    conn: &Connection,
+    group: &str,
+    names: &[String],
+    out: &mut Vec<FetchedSecret>,
+) -> Result<bool> {
     let (mut send, mut recv) = conn.open_bi().await.context("opening fetch stream")?;
     sync::write_msg(
         &mut send,
         &SyncRequest::FetchSecrets {
             group: group.to_string(),
-            names,
+            names: names.to_vec(),
         },
     )
     .await?;
     send.finish().context("finishing fetch stream")?;
-    let mut out = Vec::new();
     loop {
         match sync::read_msg::<SyncMessage>(&mut recv).await? {
             Some(SyncMessage::SecretData {
@@ -940,8 +963,8 @@ async fn fetch_secrets(
                 created_at,
                 created_by,
             }),
-            Some(SyncMessage::FetchDone) => return Ok(Some(out)),
-            Some(SyncMessage::SyncDenied) => return Ok(None),
+            Some(SyncMessage::FetchDone) => return Ok(true),
+            Some(SyncMessage::SyncDenied) => return Ok(false),
             Some(other) => bail!("unexpected message during secret fetch: {other:?}"),
             None => bail!("secret fetch stream ended before FetchDone"),
         }

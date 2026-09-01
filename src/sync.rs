@@ -19,6 +19,13 @@ pub const SYNC_ALPN: &[u8] = b"secret-bunker-sync/1";
 /// fits one SecretData frame (ciphertext = plaintext + 16B tag + metadata).
 pub const SYNC_MAX_MSG: usize = 8 * 1024 * 1024;
 
+/// Cap on a `SyncRequest`, read before any authorization. Replicas chunk
+/// `FetchSecrets` to [`SYNC_FETCH_CHUNK`] names so requests stay under it.
+pub const SYNC_MAX_REQ: usize = 512 * 1024;
+
+/// Maximum names per `FetchSecrets` request.
+pub const SYNC_FETCH_CHUNK: usize = 1000;
+
 // WIRE CONTRACT: variant and field NAMES are the CBOR encoding. No
 // non-Rust implementation of this protocol exists yet, but any that
 // appears will match them as strings — never rename a variant or field;
@@ -113,9 +120,8 @@ pub struct FetchedSecret {
 }
 
 /// Rejects a body length declaring more than [`SYNC_MAX_MSG`] bytes. Shared
-/// by [`frame`] (checked on the encoded body, before send) and [`deframe`]
-/// and [`read_msg`] (checked on the declared length, before allocating a
-/// buffer to read the body into).
+/// by [`frame`] (checked on the encoded body, before send) and
+/// [`deframe`].
 fn check_cap(len: usize) -> anyhow::Result<()> {
     anyhow::ensure!(
         len <= SYNC_MAX_MSG,
@@ -175,6 +181,20 @@ pub async fn write_msg<T: Serialize>(
 pub async fn read_msg<T: DeserializeOwned>(
     recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<Option<T>> {
+    read_capped(recv, SYNC_MAX_MSG).await
+}
+
+/// [`read_msg`] for the unauthenticated request side: [`SYNC_MAX_REQ`].
+pub async fn read_req<T: DeserializeOwned>(
+    recv: &mut iroh::endpoint::RecvStream,
+) -> anyhow::Result<Option<T>> {
+    read_capped(recv, SYNC_MAX_REQ).await
+}
+
+async fn read_capped<T: DeserializeOwned>(
+    recv: &mut iroh::endpoint::RecvStream,
+    max: usize,
+) -> anyhow::Result<Option<T>> {
     let mut len_buf = [0u8; 4];
     match recv.read_exact(&mut len_buf).await {
         Ok(()) => {}
@@ -182,7 +202,10 @@ pub async fn read_msg<T: DeserializeOwned>(
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
-    check_cap(len)?;
+    anyhow::ensure!(
+        len <= max,
+        "sync frame of {len} bytes exceeds {max}-byte cap"
+    );
     let mut body = vec![0u8; len];
     recv.read_exact(&mut body).await?;
     Ok(Some(proto::decode(&body)?))

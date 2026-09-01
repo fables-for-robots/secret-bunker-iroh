@@ -53,10 +53,21 @@ pub enum RenderError {
         group: String,
         name: String,
     },
+    TooLarge {
+        bytes: usize,
+    },
 }
 
+/// apiserver's `MaxSecretSize`.
+pub const MAX_SECRET_SIZE: usize = 1024 * 1024;
+
+/// Mirrors apiserver `IsConfigMapKey` so a key it would 422 fails render.
 pub fn valid_key(k: &str) -> bool {
     !k.is_empty()
+        && k.len() <= 253
+        && k != "."
+        && k != ".."
+        && !k.starts_with("..")
         && k.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
@@ -191,6 +202,10 @@ pub fn render(
         invalid.sort();
         invalid.dedup();
         return Err(RenderError::InvalidKey { keys: invalid });
+    }
+    let bytes: usize = out.values().map(Vec::len).sum();
+    if bytes > MAX_SECRET_SIZE {
+        return Err(RenderError::TooLarge { bytes });
     }
     Ok(out)
 }
@@ -391,10 +406,22 @@ mod tests {
     }
 
     #[test]
+    fn oversized_render_fails() {
+        let big = vec![0u8; MAX_SECRET_SIZE];
+        let src = Fixture::new(&[("g", "a", &big), ("g", "b", b"x")]);
+        let err = render(&spec("dataFrom: [{group: {name: g}}]"), &src).unwrap_err();
+        assert!(matches!(err, RenderError::TooLarge { .. }), "{err:?}");
+    }
+
+    #[test]
     fn valid_key_charset() {
         assert!(valid_key("a-b_c.D9"));
         assert!(!valid_key("a/b"));
         assert!(!valid_key(""));
         assert!(!valid_key("a b"));
+        assert!(!valid_key(".."));
+        assert!(!valid_key("..x"));
+        assert!(valid_key(&"k".repeat(253)));
+        assert!(!valid_key(&"k".repeat(254)));
     }
 }

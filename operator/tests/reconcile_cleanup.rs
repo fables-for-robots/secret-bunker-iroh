@@ -95,10 +95,18 @@ async fn delete_policy_leaves_gc_to_owner_reference() {
     // No API calls at all: GC cascades via the ownerReference.
     let (client, join) = scripted(vec![]);
     let (ctx, _dir) = ctx_with(client).await;
+    ctx.metrics.ready.with_label_values(&["ns", "app"]).set(1);
     cleanup_bunker_secret(&deleting_cr("Delete"), &ctx)
         .await
         .unwrap();
     join.await.unwrap();
+    // The deleted CR's series is gone, not pinned at 0.
+    let fams = ctx.metrics.registry.gather();
+    assert!(
+        fams.iter()
+            .filter(|f| f.name() == "bunker_secret_ready")
+            .all(|f| f.metric.is_empty())
+    );
 }
 
 #[tokio::test]
@@ -142,5 +150,44 @@ async fn retain_leaves_unowned_secret_alone() {
     cleanup_bunker_secret(&deleting_cr("Retain"), &ctx)
         .await
         .unwrap();
+    join.await.unwrap();
+}
+
+/// CR deleted mid-rename: the Secret it actually owns is the one in
+/// status.targetSecretName, and Retain must orphan that one too.
+#[tokio::test]
+async fn retain_orphans_pending_rename_source() {
+    let not_found = json!({
+        "kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": "NotFound", "code": 404
+    });
+    let script = vec![
+        expect("GET", "/api/v1/namespaces/ns/secrets/app", 404, not_found),
+        expect(
+            "GET",
+            "/api/v1/namespaces/ns/secrets/old",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "old", "namespace": "ns",
+                    "ownerReferences": [{"apiVersion": "bunker.fables-for-robots.ch/v1alpha1",
+                        "kind": "BunkerSecret", "name": "app", "uid": "uid-1", "controller": true}]}
+            }),
+        ),
+        expect_checked(
+            "PATCH",
+            "/api/v1/namespaces/ns/secrets/old",
+            200,
+            json!({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "old", "namespace": "ns"}}),
+            |body| assert!(body["metadata"]["ownerReferences"].is_null()),
+        ),
+    ];
+    let (client, join) = scripted(script);
+    let (ctx, _dir) = ctx_with(client).await;
+    let mut cr = deleting_cr("Retain");
+    cr.status = Some(secret_bunker_operator::crd::BunkerSecretStatus {
+        target_secret_name: Some("old".into()),
+        ..Default::default()
+    });
+    cleanup_bunker_secret(&cr, &ctx).await.unwrap();
     join.await.unwrap();
 }

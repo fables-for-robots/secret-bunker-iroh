@@ -56,6 +56,11 @@ each direction and EOF is the delimiter, a sync stream carries a
   byte is written*, and on the declared length *before a receive buffer is
   allocated*. A frame that would exceed it is a protocol error that ends
   the stream — never a silent omission.
+- Requests (`SyncRequest`, replica → authoritative) have a tighter cap
+  of **512 KiB** (`SYNC_MAX_REQ`): they are read before any authorization,
+  so the cap bounds what an ungranted peer can make the server buffer. A
+  replica splits `FetchSecrets` into requests of at most **1000 names**
+  (`SYNC_FETCH_CHUNK`), each on its own stream.
 - A clean end-of-stream where the next length prefix would have started is
   a normal stream termination, not an error. A prefix or body cut short is
   an error.

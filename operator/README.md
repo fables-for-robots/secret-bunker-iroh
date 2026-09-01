@@ -63,7 +63,8 @@ status:
       reason: Synced
       message: ""
   lastSyncTime: "2026-08-11T12:00:00Z"
-  observedGeneration: 3
+  observedGeneration: 3      # last generation reconciled (any outcome)
+  syncedGeneration: 3        # generation lastSyncTime refers to
   syncedSecretKeys: [DB_PASSWORD, SMTP_PASS, ...]
 ```
 
@@ -333,11 +334,14 @@ Every `BunkerSecret` carries a single condition of `type: Ready`. The
 | `AwaitingSync` | The embedded replica hasn't completed its initial sync yet; nothing has been rendered |
 | `InvalidKey` | A rendered key isn't a valid k8s Secret key name; fix with `rewrite` or an explicit `data` entry |
 | `JsonError` | A `property`/`extract` reference failed to parse as JSON, a JSON Pointer didn't resolve, or an `extract` target wasn't a JSON object |
+| `TooLarge` | The rendered data exceeds Kubernetes' 1 MiB Secret limit |
 | `MissingSecret` | A `data` hard reference points at a bunker secret that doesn't exist |
 | `MissingGroup` | A referenced group has never appeared in the mirror (no read grant, or the group doesn't exist yet) |
 | `AccessRevoked` | A group that had synced successfully disappeared from the mirror (revocation); the Secret is frozen at its last good content |
 | `StaleReplica` | The sync session has been down longer than `--staleness-threshold`; the Secret is still serving its last synced content |
 | `Conflict` | The target Secret exists and isn't owned by this CR; the operator refuses to adopt or overwrite it |
+| `TypeMismatch` | `target.type` differs from the existing Secret's type, which Kubernetes makes immutable; delete the Secret or revert the spec |
+| `ApplyFailed` | The apiserver rejected the rendered Secret (4xx); the message carries its reason |
 
 The operator emits a Warning Kubernetes Event on every **transition** into
 a failure reason (repeated reconciles that land on the same reason again

@@ -209,6 +209,22 @@ fn status_with(cr: &BunkerSecret, condition: Condition) -> BunkerSecretStatus {
     }
 }
 
+/// Warn (on transition), write `Ready=False/<reason>`, and requeue.
+async fn degrade(
+    cr: &BunkerSecret,
+    ctx: &Context,
+    reason: &str,
+    message: &str,
+) -> Result<(), Error> {
+    publish_warning_on_transition(cr, ctx, reason, message).await;
+    patch_status(
+        cr,
+        ctx,
+        status_with(cr, ready_condition(cr, false, reason, message)),
+    )
+    .await
+}
+
 fn owned_by(secret: &Secret, cr: &BunkerSecret) -> bool {
     let Some(uid) = &cr.metadata.uid else {
         return false;
@@ -231,13 +247,7 @@ pub async fn apply_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<Act
     // must not look like mass deletion). Tests pre-converge, production waits.
     if ctx.replica.status().last_synced.is_none() {
         let message = "replica has not completed its initial sync";
-        publish_warning_on_transition(cr, ctx, "AwaitingSync", message).await;
-        patch_status(
-            cr,
-            ctx,
-            status_with(cr, ready_condition(cr, false, "AwaitingSync", message)),
-        )
-        .await?;
+        degrade(cr, ctx, "AwaitingSync", message).await?;
         return Ok(Action::requeue(Duration::from_secs(5)));
     }
 
@@ -266,17 +276,24 @@ pub async fn apply_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<Act
         let message = format!(
             "Secret {ns}/{target} exists and is not owned by this BunkerSecret; refusing to adopt"
         );
-        publish_warning_on_transition(cr, ctx, "Conflict", &message).await;
-        patch_status(
-            cr,
-            ctx,
-            status_with(cr, ready_condition(cr, false, "Conflict", &message)),
-        )
-        .await?;
+        degrade(cr, ctx, "Conflict", &message).await?;
         return Ok(Action::requeue(ctx.resync));
     }
 
     let desired = build_secret(cr, &data);
+    // Secret.type is immutable: the data-only hash below can't see a type
+    // edit, and applying it would 422.
+    if let Some(existing) = &existing {
+        let have = existing.type_.as_deref().unwrap_or("Opaque");
+        let want = desired.type_.as_deref().unwrap_or("Opaque");
+        if have != want {
+            let message = format!(
+                "Secret {ns}/{target} has immutable type '{have}', spec wants '{want}'; delete the Secret or revert target.type"
+            );
+            degrade(cr, ctx, "TypeMismatch", &message).await?;
+            return Ok(Action::requeue(ctx.resync));
+        }
+    }
     let desired_hash = desired.metadata.annotations.as_ref().unwrap()[HASH_ANNOTATION].clone();
     // Compare CONTENT, not the (informational-only) annotation: the
     // annotation on a manually-edited Secret is left untouched by the hand
@@ -299,13 +316,23 @@ pub async fn apply_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<Act
             .with_label_values(&["skipped"])
             .inc();
     } else {
-        secrets
+        let applied = secrets
             .patch(
                 &target,
                 &PatchParams::apply(FIELD_MANAGER).force(),
                 &Patch::Apply(&desired),
             )
-            .await?;
+            .await;
+        // 4xx: the apiserver rejects this object; retrying won't help, and
+        // bailing here would leave a stale Ready=True. 5xx/transport → backoff.
+        if let Err(kube::Error::Api(ae)) = &applied
+            && (400..500).contains(&ae.code)
+        {
+            let message = format!("apiserver rejected Secret {ns}/{target}: {}", ae.message);
+            degrade(cr, ctx, "ApplyFailed", &message).await?;
+            return Ok(Action::requeue(ctx.resync));
+        }
+        applied?;
         ctx.metrics
             .applies_total
             .with_label_values(&["applied"])
@@ -351,6 +378,7 @@ pub async fn apply_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<Act
         conditions: vec![condition],
         last_sync_time: last_synced,
         observed_generation: cr.metadata.generation,
+        synced_generation: cr.metadata.generation,
         synced_secret_keys: data.keys().cloned().collect(),
         target_secret_name: Some(target),
     };
@@ -376,13 +404,12 @@ async fn handle_render_error(
     // AccessRevoked is a diagnosis about a group that USED to be readable —
     // it only applies while the CR's spec hasn't moved since the last
     // successful sync. Without this, editing a synced CR to reference a
-    // group that never existed (generation bumped, observedGeneration still
-    // stale) would misreport as "revoked" instead of the more accurate
-    // MissingGroup.
+    // group that never existed would misreport as "revoked" instead of the
+    // more accurate MissingGroup.
     let spec_unchanged_since_sync = cr
         .status
         .as_ref()
-        .is_some_and(|s| s.observed_generation == cr.metadata.generation);
+        .is_some_and(|s| s.synced_generation == cr.metadata.generation);
     let (reason, message) = match &e {
         RenderError::MissingGroup { group } if previously_synced && spec_unchanged_since_sync => (
             "AccessRevoked",
@@ -420,6 +447,10 @@ async fn handle_render_error(
             "JsonError",
             format!("'{group}/{name}' is not a JSON object; extract requires one"),
         ),
+        RenderError::TooLarge { bytes } => (
+            "TooLarge",
+            format!("rendered data is {bytes} bytes; Kubernetes caps Secrets at 1 MiB"),
+        ),
         RenderError::NotYetSynced { group, name, msg } => {
             return Err(Error::Transient(format!(
                 "'{group}/{name}' not yet decryptable: {msg}"
@@ -429,13 +460,7 @@ async fn handle_render_error(
     if reason == "AccessRevoked" {
         tracing::warn!(cr = %cr.name_any(), "access revoked; freezing synced Secret");
     }
-    publish_warning_on_transition(cr, ctx, reason, &message).await;
-    patch_status(
-        cr,
-        ctx,
-        status_with(cr, ready_condition(cr, false, reason, &message)),
-    )
-    .await?;
+    degrade(cr, ctx, reason, &message).await?;
     Ok(Action::requeue(ctx.resync))
 }
 
@@ -499,23 +524,22 @@ async fn cleanup_target(secrets: &Api<Secret>, cr: &BunkerSecret, name: &str) ->
 /// Retain policy: orphan the Secret by clearing its ownerReferences.
 pub async fn cleanup_bunker_secret(cr: &BunkerSecret, ctx: &Context) -> Result<Action, Error> {
     let ns = cr.namespace().unwrap_or_default();
-    ctx.metrics
+    let _ = ctx
+        .metrics
         .ready
-        .with_label_values(&[&ns, &cr.name_any()])
-        .set(0);
+        .remove_label_values(&[&ns, &cr.name_any()]);
     if cr.spec.deletion_policy == DeletionPolicy::Retain {
         let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
         let target = cr.target_name();
-        match secrets.get(&target).await {
-            Ok(existing) if owned_by(&existing, cr) => {
-                let patch = json!({"metadata": {"ownerReferences": null}});
-                secrets
-                    .patch(&target, &PatchParams::default(), &Patch::Merge(&patch))
-                    .await?;
-            }
-            Ok(_) => {}                                       // not ours — leave it
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {} // already gone
-            Err(e) => return Err(e.into()),
+        cleanup_target(&secrets, cr, &target).await?;
+        // Mid-rename the owned Secret still carries the old name.
+        if let Some(prev) = cr
+            .status
+            .as_ref()
+            .and_then(|s| s.target_secret_name.as_deref())
+            && prev != target
+        {
+            cleanup_target(&secrets, cr, prev).await?;
         }
     }
     Ok(Action::await_change())

@@ -373,7 +373,11 @@ impl App {
             name: name.clone(),
         }) {
             Some(Response::Secret { value, version }) => {
-                let current = String::from_utf8_lossy(&value).into_owned();
+                let Ok(current) = String::from_utf8(value) else {
+                    self.status =
+                        format!("'{name}' is not UTF-8; edit it via `client put` instead");
+                    return;
+                };
                 self.mode = Mode::Form(Form::new(
                     FormKind::EditSecret {
                         name: name.clone(),

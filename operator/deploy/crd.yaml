@@ -156,6 +156,13 @@ spec:
                 format: int64
                 nullable: true
                 type: integer
+              syncedGeneration:
+                description: |-
+                  `metadata.generation` of the spec that `lastSyncTime` refers to.
+                  Unlike `observedGeneration` it only moves on a successful apply.
+                format: int64
+                nullable: true
+                type: integer
               syncedSecretKeys:
                 items:
                   type: string

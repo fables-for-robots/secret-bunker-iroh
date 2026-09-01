@@ -83,7 +83,33 @@ pub enum Request {
     },
 }
 
+/// Cap on group/secret/identity names. Keeps audit rows and sync
+/// manifest frames bounded regardless of the 4 MiB request cap.
+pub const MAX_NAME: usize = 255;
+
 impl Request {
+    /// All name fields within [`MAX_NAME`].
+    pub fn names_ok(&self) -> bool {
+        let names: &[&String] = match self {
+            Request::Get { group, name }
+            | Request::Put { group, name, .. }
+            | Request::Delete { group, name, .. } => &[group, name],
+            Request::List { group }
+            | Request::RotateDek { group }
+            | Request::GroupAcl { group }
+            | Request::ListIdentityNames { group } => &[group],
+            Request::CreateGroup { name }
+            | Request::AddIdentity { name, .. }
+            | Request::RemoveIdentity { name }
+            | Request::SetServiceAdmin { name, .. } => &[name],
+            Request::ListIdentities | Request::ListGroups => &[],
+            Request::Grant {
+                group, identity, ..
+            } => &[group, identity],
+        };
+        names.iter().all(|n| n.len() <= MAX_NAME)
+    }
+
     /// Short operation name for the audit log.
     pub fn op(&self) -> &'static str {
         match self {

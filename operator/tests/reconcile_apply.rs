@@ -213,6 +213,125 @@ async fn hash_match_skips_apply() {
     assert_eq!(m.counter.value() as u64, 1);
 }
 
+/// Secret.type is immutable: a target.type edit against an existing owned
+/// Secret cannot be applied, and must not be reported as Synced.
+#[tokio::test]
+async fn type_change_on_existing_secret_is_reported_not_claimed_synced() {
+    let bunker = TestBunker::spawn().await;
+    bunker.create_group("prod").await;
+    let reader = SecretKey::generate();
+    bunker.add_reader("op", &reader).await;
+    bunker.grant_read("prod", "op").await;
+    bunker.put("prod", "pw", b"hunter2", 0).await;
+
+    let cr = test_cr(
+        "data: [{secretKey: PW, remoteRef: {group: prod, name: pw}}]\ntarget: {type: kubernetes.io/dockerconfigjson}",
+    );
+    let script = vec![
+        expect(
+            "GET",
+            "/api/v1/namespaces/ns/secrets/app",
+            200,
+            json!({
+                "apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+                "metadata": {
+                    "name": "app", "namespace": "ns",
+                    "ownerReferences": [{"apiVersion": "bunker.fables-for-robots.ch/v1alpha1",
+                        "kind": "BunkerSecret", "name": "app", "uid": "uid-1", "controller": true}]
+                },
+                "data": {"PW": base64_encode(b"hunter2")}
+            }),
+        ),
+        expect(
+            "POST",
+            "events",
+            201,
+            json!({
+                "apiVersion": "events.k8s.io/v1", "kind": "Event",
+                "metadata": {"name": "app.warn", "namespace": "ns"}
+            }),
+        ),
+        expect_checked(
+            "PATCH",
+            "/bunkersecrets/app/status",
+            200,
+            json!({"apiVersion": "bunker.fables-for-robots.ch/v1alpha1", "kind": "BunkerSecret",
+                   "metadata": {"name": "app", "namespace": "ns"}, "spec": {}}),
+            |body| {
+                assert_eq!(body["status"]["conditions"][0]["status"], json!("False"));
+                assert_eq!(
+                    body["status"]["conditions"][0]["reason"],
+                    json!("TypeMismatch")
+                );
+            },
+        ),
+    ];
+    let (client, join) = scripted(script);
+    let (ctx, _dir) = synced_context(&bunker, reader, client).await;
+    common::await_mirrored(&ctx.replica, "prod", "pw").await;
+
+    apply_bunker_secret(&cr, &ctx).await.unwrap();
+    join.await.unwrap();
+}
+
+/// A 4xx from the Secret apply is a verdict on the object, not a transient:
+/// surface it as Ready=False/ApplyFailed instead of erroring out before any
+/// status write (which would leave a stale Ready=True standing).
+#[tokio::test]
+async fn apiserver_rejection_sets_apply_failed() {
+    let bunker = TestBunker::spawn().await;
+    bunker.create_group("prod").await;
+    let reader = SecretKey::generate();
+    bunker.add_reader("op", &reader).await;
+    bunker.grant_read("prod", "op").await;
+    bunker.put("prod", "pw", b"hunter2", 0).await;
+
+    let cr = test_cr("data: [{secretKey: PW, remoteRef: {group: prod, name: pw}}]");
+    let not_found = json!({
+        "kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": "NotFound", "code": 404
+    });
+    let script = vec![
+        expect("GET", "/api/v1/namespaces/ns/secrets/app", 404, not_found),
+        expect(
+            "PATCH",
+            "/api/v1/namespaces/ns/secrets/app",
+            422,
+            json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                   "reason": "Invalid", "code": 422, "message": "Secret \"app\" is invalid"}),
+        ),
+        expect(
+            "POST",
+            "events",
+            201,
+            json!({
+                "apiVersion": "events.k8s.io/v1", "kind": "Event",
+                "metadata": {"name": "app.warn", "namespace": "ns"}
+            }),
+        ),
+        expect_checked(
+            "PATCH",
+            "/bunkersecrets/app/status",
+            200,
+            json!({"apiVersion": "bunker.fables-for-robots.ch/v1alpha1", "kind": "BunkerSecret",
+                   "metadata": {"name": "app", "namespace": "ns"}, "spec": {}}),
+            |body| {
+                assert_eq!(body["status"]["conditions"][0]["status"], json!("False"));
+                assert_eq!(
+                    body["status"]["conditions"][0]["reason"],
+                    json!("ApplyFailed")
+                );
+                assert!(body["status"].get("syncedGeneration").is_none());
+            },
+        ),
+    ];
+    let (client, join) = scripted(script);
+    let (ctx, _dir) = synced_context(&bunker, reader, client).await;
+    common::await_mirrored(&ctx.replica, "prod", "pw").await;
+
+    apply_bunker_secret(&cr, &ctx).await.unwrap();
+    join.await.unwrap();
+}
+
 /// A manually-edited Secret data value must be reverted even though its
 /// content-hash annotation still carries the CORRECT desired hash (the hand
 /// edit touched `data` but left the annotation alone) — the skip gate has to
@@ -365,7 +484,7 @@ async fn revocation_freezes_previously_synced_cr() {
     bunker.put("prod", "pw", b"x", 0).await;
 
     let mut cr = test_cr("data: [{secretKey: PW, remoteRef: {group: prod, name: pw}}]");
-    // Previously synced: lastSyncTime present, and observedGeneration
+    // Previously synced: lastSyncTime present, and syncedGeneration
     // matches the CR's current (unedited) generation — AccessRevoked only
     // applies while the spec hasn't moved since that sync (see the
     // never-existing-group distinction test below).
@@ -374,6 +493,7 @@ async fn revocation_freezes_previously_synced_cr() {
             k8s_openapi::jiff::Timestamp::now(),
         )),
         observed_generation: cr.metadata.generation,
+        synced_generation: cr.metadata.generation,
         ..Default::default()
     });
 
@@ -434,7 +554,7 @@ async fn revocation_freezes_previously_synced_cr() {
 
 /// AccessRevoked is a diagnosis about a group that USED to be readable, and
 /// only holds while the spec hasn't moved since the last successful sync.
-/// Here the CR was synced once (generation 1, observedGeneration 1), then
+/// Here the CR was synced once (generation 1, syncedGeneration 1), then
 /// hand-edited (generation bumped to 2) to reference a group that was NEVER
 /// created — a fresh mistake, not a revoked grant. Despite `previously_synced`
 /// being true (lastSyncTime is still set from the earlier sync), the
@@ -454,10 +574,16 @@ async fn edit_to_never_existing_group_after_sync_reports_missing_group_not_acces
         last_sync_time: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
             k8s_openapi::jiff::Timestamp::now(),
         )),
-        observed_generation: Some(1), // stale: the edit to generation 2 hasn't been observed yet
+        // The controller may well have observed generation 2 already (e.g.
+        // an AwaitingSync round after a restart); what matters is that it
+        // never SYNCED it.
+        observed_generation: Some(2),
+        synced_generation: Some(1),
         ..Default::default()
     });
 
+    let written = Arc::new(std::sync::Mutex::new(None));
+    let sink = written.clone();
     let script = vec![
         expect(
             "POST",
@@ -474,21 +600,28 @@ async fn edit_to_never_existing_group_after_sync_reports_missing_group_not_acces
             200,
             json!({"apiVersion": "bunker.fables-for-robots.ch/v1alpha1", "kind": "BunkerSecret",
                    "metadata": {"name": "app", "namespace": "ns"}, "spec": {}}),
-            |body| {
+            move |body| {
                 assert_eq!(
                     body["status"]["conditions"][0]["reason"],
                     json!("MissingGroup")
                 );
+                *sink.lock().unwrap() = Some(body["status"].clone());
             },
         )
         .with_query_contains("fieldManager=secret-bunker-operator")
         .with_query_contains("force=true")
         .with_content_type("application/apply-patch+yaml"),
+        // Second reconcile with the written status: same diagnosis, so no
+        // Event and no status write. A flip to AccessRevoked would call out.
     ];
     let (client, join) = scripted(script);
     let (ctx, _dir) = synced_context(&bunker, reader, client).await;
     common::await_mirrored(&ctx.replica, "prod", "pw").await;
 
+    apply_bunker_secret(&cr, &ctx).await.unwrap();
+    let status: BunkerSecretStatus =
+        serde_json::from_value(written.lock().unwrap().take().unwrap()).unwrap();
+    cr.status = Some(status);
     apply_bunker_secret(&cr, &ctx).await.unwrap();
     join.await.unwrap();
 }

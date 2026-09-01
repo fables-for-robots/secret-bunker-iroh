@@ -2751,3 +2751,178 @@ async fn replacing_an_identitys_key_converges_on_the_replica() {
     admin.close().await;
     router.shutdown().await.unwrap();
 }
+
+/// Authoritative node with `groups` created, a "replica" identity holding
+/// read on each, and one secret `s`=v1 per group. Returns the pieces a
+/// replica test needs; the replica itself is not yet spawned.
+async fn granted_replica_fixture(
+    dir: &Path,
+    groups: &[&str],
+) -> (Router, EndpointAddr, Client, SecretKey) {
+    let op = age::x25519::Identity::generate();
+    let backup = age::x25519::Identity::generate();
+    let admin_secret = SecretKey::generate();
+    let replica_secret = SecretKey::generate();
+    let store = init_store(
+        &dir.join("bunker.sqlite"),
+        &op,
+        &backup,
+        &admin_secret.public(),
+    );
+    let (router, addr) = spawn_authoritative(store, op).await;
+    let admin = Client::with_endpoint(client_endpoint(admin_secret).await, addr.clone())
+        .await
+        .unwrap();
+    let ok = |r: Response| assert_eq!(r, Response::Ok);
+    ok(admin
+        .request(&Request::AddIdentity {
+            name: "replica".into(),
+            endpoint_id: replica_secret.public().to_string(),
+            service_admin: false,
+        })
+        .await
+        .unwrap());
+    for group in groups {
+        ok(admin
+            .request(&Request::CreateGroup {
+                name: group.to_string(),
+            })
+            .await
+            .unwrap());
+        ok(admin
+            .request(&Request::Grant {
+                group: group.to_string(),
+                identity: "replica".into(),
+                perms: 1,
+            })
+            .await
+            .unwrap());
+        put(&admin, group, "s", b"v", 0).await;
+    }
+    (router, addr, admin, replica_secret)
+}
+
+async fn put(client: &Client, group: &str, name: &str, value: &[u8], expected_version: u64) {
+    assert_eq!(
+        client
+            .request(&Request::Put {
+                group: group.into(),
+                name: name.into(),
+                value: value.to_vec(),
+                expected_version,
+            })
+            .await
+            .unwrap(),
+        Response::Version {
+            version: expected_version + 1
+        }
+    );
+}
+
+async fn spawn_replica(dir: &Path, secret: SecretKey, addr: &EndpointAddr) -> (Replica, Endpoint) {
+    let ep = replica_endpoint(secret.clone(), addr).await;
+    let replica = Replica::builder()
+        .store_path(dir.join("replica.sqlite"))
+        .secret_key(secret)
+        .authoritative(addr.id)
+        .endpoint(ep.clone())
+        .spawn()
+        .await
+        .unwrap();
+    (replica, ep)
+}
+
+async fn await_last_synced(replica: &Replica) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while replica.status().last_synced.is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "never synced");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// `last_synced` gates readiness downstream; it must stay `None` until the
+/// whole initial manifest is applied, not flip after the first group.
+#[tokio::test]
+async fn replica_last_synced_waits_for_full_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let (router, addr, admin, secret) = granted_replica_fixture(dir.path(), &["g1", "g2"]).await;
+    let (replica, ep) = spawn_replica(dir.path(), secret, &addr).await;
+    let mut rx = replica.subscribe();
+    // After the first GroupAdded the sync task is parked fetching the
+    // second group's secrets: one group applied, manifest incomplete.
+    await_replica_event(&mut rx, &ReplicaEvent::GroupAdded { group: "g1".into() }).await;
+    assert!(
+        replica.status().last_synced.is_none(),
+        "last_synced set before the initial manifest completed"
+    );
+    await_last_synced(&replica).await;
+
+    replica.shutdown().await;
+    ep.close().await;
+    admin.close().await;
+    router.shutdown().await.unwrap();
+}
+
+/// Steady writes to one group must not starve live pushes for another
+/// (the debounce window is capped).
+#[tokio::test]
+async fn replica_push_not_starved_by_unrelated_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (router, addr, admin, secret) = granted_replica_fixture(dir.path(), &["g1", "g2"]).await;
+    let (replica, ep) = spawn_replica(dir.path(), secret, &addr).await;
+    let mut rx = replica.subscribe();
+    await_last_synced(&replica).await;
+
+    let noise = async {
+        let mut v = 0u64;
+        loop {
+            v += 1;
+            put(&admin, "g2", "s", b"n", v).await;
+            if v == 2 {
+                put(&admin, "g1", "s", b"v2", 1).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    let want = ReplicaEvent::SecretChanged {
+        group: "g1".into(),
+        name: "s".into(),
+        version: 2,
+    };
+    tokio::select! {
+        _ = noise => unreachable!(),
+        _ = await_replica_event(&mut rx, &want) => {}
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            panic!("live push starved by unrelated writes")
+        }
+    }
+
+    replica.shutdown().await;
+    ep.close().await;
+    admin.close().await;
+    router.shutdown().await.unwrap();
+}
+
+/// More secrets than SYNC_FETCH_CHUNK: the replica must split FetchSecrets
+/// across streams and still converge on all of them.
+#[tokio::test]
+async fn replica_fetches_large_groups_in_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (router, addr, admin, secret) = granted_replica_fixture(dir.path(), &["g"]).await;
+    let total = sync::SYNC_FETCH_CHUNK + 5;
+    for i in 1..total {
+        put(&admin, "g", &format!("s{i}"), &[i as u8], 0).await;
+    }
+    let (replica, ep) = spawn_replica(dir.path(), secret, &addr).await;
+    await_last_synced(&replica).await;
+    assert_eq!(replica.list("g").unwrap().len(), total);
+    assert_eq!(
+        &*replica.get("g", &format!("s{}", total - 1)).unwrap(),
+        &[(total - 1) as u8]
+    );
+
+    replica.shutdown().await;
+    ep.close().await;
+    admin.close().await;
+    router.shutdown().await.unwrap();
+}

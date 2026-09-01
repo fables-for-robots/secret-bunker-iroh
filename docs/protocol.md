@@ -47,7 +47,9 @@ One request/response exchange per **bidirectional QUIC stream**:
 
 Streams are independent; a client may run many requests concurrently on
 one connection, and a connection stays usable for any number of requests.
-Either side rejects messages larger than **4 MiB** (`MAX_MSG`).
+Either side rejects messages larger than **4 MiB** (`MAX_MSG`). Group, secret, and
+identity names longer than **255 bytes** (`MAX_NAME`) are treated as a
+malformed request.
 
 Permission changes take effect immediately: the identity is re-checked on
 every request, so revoking an ACL entry affects the very next stream on an

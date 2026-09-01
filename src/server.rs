@@ -175,21 +175,27 @@ impl Bunker {
     pub fn handle_raw(&self, remote: &str, bytes: &[u8]) -> Response {
         match proto::decode::<Request>(bytes) {
             Ok(mut req) => {
-                let response = self.handle(remote, &req);
+                let response = if req.names_ok() {
+                    self.handle(remote, &req)
+                } else {
+                    self.deny_malformed(remote)
+                };
                 // Best-effort scrub of the plaintext copy decode made.
                 if let Request::Put { value, .. } = &mut req {
                     value.zeroize();
                 }
                 response
             }
-            Err(_) => {
-                let store = self.lock_store();
-                if let Err(err) = store.audit(remote, "malformed", "", "denied") {
-                    tracing::error!(%err, "audit append failed");
-                }
-                Response::Denied
-            }
+            Err(_) => self.deny_malformed(remote),
         }
+    }
+
+    fn deny_malformed(&self, remote: &str) -> Response {
+        let store = self.lock_store();
+        if let Err(err) = store.audit(remote, "malformed", "", "denied") {
+            tracing::error!(%err, "audit append failed");
+        }
+        Response::Denied
     }
 
     /// Handle one decoded request from an authenticated peer. Synchronous:
@@ -1044,6 +1050,7 @@ impl ProtocolHandler for Bunker {
 /// How long a sync session keeps draining further events after the first
 /// one of a batch, before emitting the deduplicated result.
 const SYNC_DEBOUNCE: Duration = Duration::from_millis(200);
+const SYNC_DEBOUNCE_MAX: Duration = Duration::from_secs(1);
 
 /// Maximum `SecretEntry` rows per `GroupSecrets` message.
 const SYNC_SECRETS_CHUNK: usize = 1000;
@@ -1090,9 +1097,12 @@ impl ProtocolHandler for SyncServer {
         // held across one, so an abort cannot strand the lock.
         let mut streams = tokio::task::JoinSet::new();
         loop {
-            let (mut send, mut recv) = match connection.accept_bi().await {
-                Ok(pair) => pair,
-                Err(_) => break, // peer closed (or connection error): done
+            let (mut send, mut recv) = tokio::select! {
+                pair = connection.accept_bi() => match pair {
+                    Ok(pair) => pair,
+                    Err(_) => break, // peer closed (or connection error): done
+                },
+                Some(_) = streams.join_next(), if !streams.is_empty() => continue,
             };
             let inner = self.0.clone();
             let remote = remote.clone();
@@ -1116,10 +1126,15 @@ async fn handle_sync_stream(
     send: &mut SendStream,
     recv: &mut iroh::endpoint::RecvStream,
 ) -> Result<()> {
-    let Some(req) = sync::read_msg::<SyncRequest>(recv).await? else {
+    let Some(req) = sync::read_req::<SyncRequest>(recv).await? else {
         return Ok(());
     };
     match req {
+        SyncRequest::FetchGroup { group } | SyncRequest::FetchSecrets { group, .. }
+            if group.len() > proto::MAX_NAME =>
+        {
+            sync::write_msg(send, &SyncMessage::SyncDenied).await
+        }
         SyncRequest::Hello => sync_hello(inner, remote, send).await,
         SyncRequest::FetchGroup { group } => sync_fetch_group(inner, remote, &group, send).await,
         SyncRequest::FetchSecrets { group, names } => {
@@ -1288,9 +1303,13 @@ async fn sync_hello(inner: &Inner, remote: &str, send: &mut SendStream) -> Resul
             Err(broadcast::error::RecvError::Closed) => return Ok(()),
         }
         // Debounce: keep draining until the channel stays quiet for the
-        // whole window, then emit one deduplicated batch.
+        // window (but at most SYNC_DEBOUNCE_MAX, so steady writes cannot
+        // starve pushes), then emit one deduplicated batch.
+        let deadline = tokio::time::Instant::now() + SYNC_DEBOUNCE_MAX;
         loop {
-            match tokio::time::timeout(SYNC_DEBOUNCE, events.recv()).await {
+            let window =
+                SYNC_DEBOUNCE.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            match tokio::time::timeout(window, events.recv()).await {
                 Ok(Ok(group)) => {
                     batch.insert(group);
                 }
@@ -2000,10 +2019,24 @@ mod tests {
             bunker.handle_raw(&remote, b"\xffnot-cbor"),
             Response::Denied
         );
+        // Over-long names are rejected even from a service admin, and the
+        // audit row does not carry the name.
+        let long = proto::encode(&Request::CreateGroup {
+            name: "x".repeat(proto::MAX_NAME + 1),
+        })
+        .unwrap();
+        assert_eq!(bunker.handle_raw(&remote, &long), Response::Denied);
         drop(bunker);
+        let max_target: i64 = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT max(length(target)) FROM audit_log", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(max_target, 0);
         let verified = Store::open(&db).unwrap().verify_audit_chain().unwrap();
         assert!(
-            matches!(verified, AuditVerification::Valid { entries: 1, .. }),
+            matches!(verified, AuditVerification::Valid { entries: 2, .. }),
             "expected one audit entry for the malformed frame, got {verified:?}"
         );
     }
