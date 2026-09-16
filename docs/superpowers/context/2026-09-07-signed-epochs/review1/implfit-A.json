@@ -1,0 +1,110 @@
+{
+  "verdict": "Not implementable as written. Two blockers are mechanical: the v3 DDL in section 8 fails on every existing database (SQLite refuses ALTER TABLE ... ADD COLUMN ... UNIQUE; verified with sqlite3 3.51.0), and the migration in section 12 mints genesis records with dek_gen = MAX(group_dek.version)+1 while C1/R2 require genesis dek_gen = 1, so every migrated chain is rejected by every verifier. Beyond those, the server side has real gaps: recovery that replaces the authority is refused by S2 and has no key-handover path; S4's straggler rule only covers current versions so a busy writer defeats D11; the reencrypted digest is defined over two different sets; the wire read-bound change relies on a Put cap that does not exist and forgets the client's own bound; S8's out-of-lock rule collides with Bunker::handle's single Mutex<Store> and server-authored rotates now do O(ciphertext) work under it; and there is no v3 init for a fresh install. The remaining items are under-specifications an implementer would have to guess at (stage semantics, audit plumbing, legacy Grant no-op behaviour). Findings JSON: /private/tmp/claude-502/-Users-dragan-fables-for-robots-secret-bunker-iroh/0c07f4bd-a1ff-4066-aa31-2b8de0a5ded7/scratchpad/review/implfit-A.json",
+  "findings": [
+    {
+      "severity": "critical",
+      "section": "8 (schema v3 DDL)",
+      "title": "ALTER TABLE secret_group ADD COLUMN group_uid BLOB UNIQUE is invalid SQLite",
+      "detail": "SQLite forbids a UNIQUE (or PRIMARY KEY) constraint on a column added with ALTER TABLE ADD COLUMN. Verified with the system sqlite3 3.51.0: `ALTER TABLE secret_group ADD COLUMN group_uid BLOB UNIQUE;` -> `Error: Cannot add a UNIQUE column`. Store::open runs migrate()+SCHEMA unconditionally on every open (src/store.rs:236-241), for authoritative databases and replica mirrors alike, so as written the v2->v3 upgrade fails on every existing database and the process cannot start. Section 4.2 relies on this UNIQUE for the group identity, so it cannot simply be dropped.",
+      "fix": "Write `ALTER TABLE secret_group ADD COLUMN group_uid BLOB;` followed by `CREATE UNIQUE INDEX IF NOT EXISTS secret_group_group_uid ON secret_group(group_uid);` (NULLs are distinct in a SQLite unique index, so unmigrated rows do not collide). Guard all four ALTERs with pragma_table_info checks the way migrate() guards v1->v2, run the whole v2->v3 DDL in one BEGIN/COMMIT, and add the v2->v3 store test section 13 promises against a hand-built v2 database (the existing v1 fixture pattern at src/store.rs:1841)."
+    },
+    {
+      "severity": "critical",
+      "section": "12 step 2 vs 5 C1 / R2 / 10 P6",
+      "title": "Migrated genesis has dek_gen = MAX(version)+1 but C1/R2 require genesis dek_gen = 1",
+      "detail": "Section 12 step 2: `dek_gen = MAX(group_dek.version) + 1` (>= 2 for any pre-existing group; groups that have ever rotated are higher), and section 8 says group_dek.version 'continues the same counter'. Section 5 C1: 'Genesis: epoch = 1, prev = 0^32, kind = genesis, dek_gen = 1'; R2: 'genesis: dek_gen = 1'. Every migrated genesis therefore fails C1/R2 at the server's own startup derivation (R5 sets from stored records), at every replica's P2, and in `client epoch log`; post-migration nothing syncs. If instead genesis is forced to 1, the re-encrypted rows carry dek_version = N+1 in the AAD (crypto::secret_aad binds dek_version; secret_version.dek_version is what Put and P6 compare against), so P6 (`secret.dek_version == head.dek_gen`) filters every fetched version and Get on the authoritative node opens the wrong generation.",
+      "fix": "Relax C1 and R2 for genesis to `dek_gen >= 1` (verifiers pin whatever genesis states; R2's +0/+1 rule provides continuity from there), and state in 4.1 that dek_gen is 'the group_dek.version of the generation' rather than '1 for genesis'. Alternatively have migration renumber to 1 (safe only because retired group_dek rows are deleted and the AAD binds a fresh key), but then drop the 'version continues the same counter' claim; the first option matches CreateGroup (create_group inserts version 1) and the existing counter."
+    },
+    {
+      "severity": "major",
+      "section": "5 S2 vs 6.4 / G4 / D8 and Bunker::new",
+      "title": "A recovery that replaces `authority` is refused by S2 and has no key-handover path on the server",
+      "detail": "S2: 'The configured authority/backup ids equal the record's (also for genesis)'. 6.4 and G4 allow a recovery to carry `--authority <id>` / `--backup <id>` and say operational-key replacement is 'one recovery per group replacing authority, with --rotate', 'the service is never stopped'. A recovery whose authority differs from meta.operational_ed25519 fails S2 before anything else, so the operational-key-compromise flow is unreachable. Even with S2 fixed, Bunker::new (src/server.rs:65-88) loads exactly one operational key and checks it against meta at startup; the spec never says who updates meta.operational_ed25519, how the running process obtains the new secret key without a restart, or how it serves Get/Put for groups whose head names the new authority while other groups still name the old one (per-group recovery guarantees a mixed window). In mode A the server is a recipient, so a recovery with --rotate that drops the old authority makes that group unreadable by the running process the moment it is installed.",
+      "fix": "Specify the handover: S2 checks `authority in {current, next}`; `serve` takes an optional `--operational-key-next`; the server holds both keys during the window and opens a group's wrap with whichever key its head names; when no head names the old key any more, meta.operational_ed25519 is advanced (audited `authority-rotated`) and the old key can be dropped at the next restart. Backup replacement is simpler (public key only) but S2 needs the same two-value rule for backup. Alternatively drop 'never stopped' and make authority replacement an explicit `db` maintenance step; either way section 6.4 and S2 must agree."
+    },
+    {
+      "severity": "major",
+      "section": "5 S4 / D11 / 6.1",
+      "title": "Straggler rule covers only current versions, so a busy writer makes SubmitEpoch fail forever",
+      "detail": "S4 requires the staged set to cover 'every retained (name, version) row of the group at commit time' and re-encrypts only 'current versions written after the client's export (stragglers)'. put_secret (src/store.rs:1268-1307) retains every prior version; only delete_secret removes rows. Sequence: admin exports at time t; writer Puts name X twice after t, creating versions N+1 and N+2; at commit N+1 is retained, non-current and unstaged. Coverage fails, the straggler clause does not apply, SubmitEpoch answers Failed, the client restarts at step 2 and loses the same race again. This contradicts D11's stated reason for server-side straggler handling ('converge even against a writer that keeps writing'). The same hole applies to a name created and then overwritten after the export.",
+      "fix": "Define stragglers as every retained (name, version) row absent from the staged set, current or not; the server re-encrypts all of them at commit under the lock and counts them in the audit row. Keep 'staged rows for deleted versions are ignored'. Also state that a staged row whose (name, version) now holds a different old ciphertext than at export (impossible today since versions are immutable, but worth pinning) is an S5 failure."
+    },
+    {
+      "severity": "major",
+      "section": "4.3 vs 5 S4 / 6.1 / 6.5",
+      "title": "`reencrypted` is defined over two different sets, so the signed digest attests neither",
+      "detail": "4.3: the digest is 'Over the ciphertext set installed with a rotating record'. S4: it 'equals reencrypted (computed by the server over the staged set as submitted)', then 'rows staged for a version deleted meanwhile are ignored' (in the digest, not installed) and stragglers are 're-encrypted by the server itself at commit' (installed, not in the digest, with server-drawn nonces the client never saw). After any straggler or concurrent delete, the installed set's digest differs from record.reencrypted, so an offline auditor or `client epoch log` recomputing 4.3 from the database gets a mismatch on a perfectly valid chain, and the only verifier rule left is R2's `reencrypted != 0`. 6.5's 're-encrypted 143 versions' cannot be derived from the record either.",
+      "fix": "Pick one meaning and state it in 4.1, 4.3, S4 and 6.5: `reencrypted` = digest of the author-staged set as submitted (what the signer produced), with the installed-set digest and straggler count recorded in the `epoch-submit` audit row and in GroupStatus. Or keep the 'installed set' meaning and, in mode A, refuse when the installed set would differ (answer StaleVersions as in mode E), accepting the loss of D11. Add a golden test for the digest over an empty set and over a set with stragglers to lock the choice."
+    },
+    {
+      "severity": "major",
+      "section": "9 (read bound) and 6.1 step 5",
+      "title": "Read-bound change relies on a Put cap that does not exist, ignores the client's bound, and the 3.5 MiB chunk rule cannot carry a cap-sized secret",
+      "detail": "(a) Section 9: 'Put.value stays capped at the handler'. There is no such cap: src/server.rs put() never checks value.len(); the only limit is `recv.read_to_end(proto::MAX_MSG)` at src/server.rs:1019. Raising that to MAX_MSG + 64 KiB silently raises the maximum secret size by 64 KiB and the spec gives no number to put in protocol.md or the Go client; tests/e2e.rs::a_maximum_size_secret_syncs_to_the_replica sizes a Put to the exact byte of MAX_MSG. (b) The client reads every reply with `recv.read_to_end(proto::MAX_MSG)` (src/client.rs:54) and the replica's handler reads requests with MAX_MSG (src/replica.rs:391); the spec raises only 'the server's per-stream read bound'. An Export reply carrying one cap-sized SealedVersion (value ~4,194,255 B + 16 B tag + ~150 B of fields) exceeds MAX_MSG, so `client epoch export`/kick fails at 'reading response'; a StageVersions > 4 MiB sent to a replica drops the connection instead of answering ReadOnlyReplica. ExportGroup.limit is a row count with no byte budget, so a page of several MB rows overruns any bound. (c) 6.1 step 5 says StageVersions chunks are <= 3.5 MiB, but one cap-sized SealedVersion is ~4.0 MiB and a row cannot be split (upsert by (name, version)).",
+      "fix": "Add an explicit `value.len() <= PUT_VALUE_MAX` check in put() with PUT_VALUE_MAX = MAX_MSG - 4 KiB (or the current effective maximum, MAX_MSG minus envelope), document it in protocol.md and the Go README; raise the client and replica read bounds to the same MAX_MSG + 64 KiB (or define a REPLY_MAX); make Export replies byte-budgeted (limit is a hint, always >= 1 row, `next` cursor); restate step 5 as 'one or more rows per message, message <= MAX_MSG + 64 KiB minus envelope'."
+    },
+    {
+      "severity": "major",
+      "section": "5 S8 vs Bunker::handle; 6.3",
+      "title": "S8's out-of-lock verification does not fit Bunker::handle, and server-authored rotates now re-encrypt whole groups under the global lock on the async worker",
+      "detail": "Bunker::handle (src/server.rs:197-227) takes the single std::sync::Mutex<Store> at line 199 and holds it across dispatch(); ProtocolHandler::accept calls handle_raw inline on the tokio worker thread (line 1019-1024). S8 (MUST) requires E/C/R/A/G verification and the S5 trial decryption of every staged row (2x retained ciphertext of ChaCha20-Poly1305 plus ~3n scalar multiplications) to run outside the lock, so SubmitEpoch cannot go through handle/dispatch as they stand; the spec does not say how the head snapshot, verification, and the later S3 CAS are sequenced. Separately, 6.3's server-authored records (RemoveIdentity in mode A: 'server-side re-encryption of every retained version' of every readable group; legacy Grant shrink of read) run inside dispatch under the lock. Today remove_identity generates one DEK and n age wraps per group (milliseconds); after this change a RemoveIdentity on a group with tens of MB of history holds the lock for seconds and blocks every Get/Put and every sync_fetch on the node, and it is the one operation the design says must 'always win'.",
+      "fix": "Specify one two-phase path for every rotating operation: (1) under the lock snapshot head record, head_epoch, and the rows to re-encrypt; (2) release, do all crypto in tokio::task::spawn_blocking; (3) re-take the lock, CAS on head_epoch, re-encrypt stragglers (rows added since the snapshot), install in one transaction. For RemoveIdentity keep the identity-row delete inside the install transaction so denial and rotation stay atomic; on CAS failure redo only the delta. State that handle_raw grows an async entry for these variants (or that handle returns a deferred job) so the lock is never held across the crypto."
+    },
+    {
+      "severity": "major",
+      "section": "11 / 12 / 16 phase 1 (missing v3 `init`)",
+      "title": "No bootstrap for a fresh v3 database: `init` is never specified and writes age keys `serve` will refuse",
+      "detail": "The spec mentions `init` nowhere (grep: no match). Today Store::init (src/store.rs:257-292) records operational_pubkey/backup_pubkey (age recipients), is_initialized() keys on operational_pubkey, Bunker::new checks the age operational key against it, and main.rs resolve_operational_key auto-generates an age identity in the XDG dir. Section 12 step 3 makes a v3 `serve` refuse any authoritative database without epochs_migrated, and the only path that writes operational_ed25519/backup_ed25519/epoch_mode/epochs_migrated is db migrate-epochs, which needs an existing age operational key and existing groups. A brand-new deployment therefore cannot be brought up: `init` writes the wrong keys, `serve` refuses. KeyRole::Operational/Backup still resolve to operational.age/backup.age with is_age() = true, which drives `key show|generate|export|import`; section 11 mentions only `key generate operational|backup`.",
+      "fix": "Add a v3 `init` to sections 11/12: `init --db --operational-key operational.key --backup-id <hex> [--mode A] [--admin-id]` writes operational_ed25519, backup_ed25519, epoch_mode, schema_version=3, epochs_migrated=1, role=authoritative, and the first service admin (no age material); is_initialized() keys on operational_ed25519; KeyRole::Operational/Backup become Ed25519 files named per 3.2 with is_age() removed; decide whether init may still auto-generate the backup key locally (tests/cli.rs::cli_init_autogenerates_backup_and_admin_keys) given 3.2 says 'generated offline'."
+    },
+    {
+      "severity": "major",
+      "section": "6.1 (stage cap) vs D6",
+      "title": "Per-group stage cap '2 x current ciphertext + 16 MiB' is below what a legitimate rotation needs if 'current' means current versions",
+      "detail": "D6 requires a rotation to re-encrypt every retained version, so the stage must hold the ciphertext of all retained rows. In this codebase 'current' consistently means the current version (secret_current, current_version, current_dek_version, secret_entries), so the natural reading of the cap is 2 x (sum of current-version ciphertext) + 16 MiB. A group whose history is more than about twice its current set (any group with a few hundred rewrites of a large secret) then cannot stage its own rotation: StageVersions is refused before the record is ever built, and the headline feature is unavailable for exactly the groups that most need rotation.",
+      "fix": "Define the cap as 2 x (sum of ciphertext over every retained version of the group) + 16 MiB, computed at StageVersions time, and say whether the check is per message or cumulative per stage."
+    },
+    {
+      "severity": "minor",
+      "section": "6.3 vs 13 (RemoveIdentity records)",
+      "title": "6.3 and 13 disagree on what RemoveIdentity authors for write-only rows",
+      "detail": "6.3: 'authors one record per group the identity had a row on: mode A -> rotate'. 13: 'RemoveIdentity -> one rotate per readable group and a carry for w-only rows in one transaction'. A rotate for a w-only row is legal (rotate is always permitted for the authority in mode A) but re-encrypts the whole group for a non-recipient. handle()'s removal_scope already computes groups_for_identity (every row), and dispatch uses groups_with_read for rotations, so the split in 13 maps directly onto the existing code.",
+      "fix": "Make 6.3 say: rotate for every group where the identity holds read (a recipient), carry (row dropped, wraps verbatim) for groups where it holds only w/a-without-r (which after G1 means w only); both authored by the authority in the identity-delete transaction."
+    },
+    {
+      "severity": "minor",
+      "section": "6.1 server commit (audit rows) vs Store::audit / Bunker::handle",
+      "title": "Audit rows inside the install transaction and the epoch-submit target are not implementable with the current audit plumbing",
+      "detail": "6.1 puts `epoch-submit` (target group@epoch#hash[..16]) and `rotate-dek` inside 'one SQLite transaction'. Store::audit(&self, ...) (src/store.rs:1351) executes on self.conn; rusqlite 0.37 Connection::transaction(&mut self) borrows the connection mutably, so audit cannot be called while the install Transaction is alive; every existing multi-step store op commits first and audits after (e.g. remove_identity_with_rotations then per-group rotate-dek in server.rs). Bunker::handle also appends an unconditional row from Request::op()/target() after dispatch, so SubmitEpoch would get a second generic row without the hash. op()/target() strings for GroupStatus, GroupEpochs, ResolveIdentity, ExportGroup and StageVersions are not given.",
+      "fix": "Add Store::audit_in(tx: &Transaction, ...) sharing the hash-chain code, and define the op names (`group-status`, `group-epochs`, `resolve-identity`, `export-group`, `stage-versions`, `submit-epoch`) and targets; state that for SubmitEpoch handle's generic row is the epoch-submit row (target filled in from the dispatch result) rather than a duplicate."
+    },
+    {
+      "severity": "minor",
+      "section": "6.1 / 8 (epoch_stage semantics)",
+      "title": "Stage ownership, replacement and TTL are under-specified relative to the table as written",
+      "detail": "epoch_stage's PRIMARY KEY is (group_id, stage_id, name, version) with submitter as a plain column, yet 6.1 says 'one open stage per (group, submitter)' and 13 says 'replacement'. Not stated: whether a second stage_id from the same submitter deletes the first or is refused; whether SubmitEpoch checks stage.submitter == remote; and whether the 15-minute TTL is per row (staged_at) or per stage. With per-row expiry and 'swept on the next stage/submit for the group', a multi-chunk upload over a slow link can lose its first chunks before the last arrives, and the submitter then sees an S4 coverage Failed with no indication why.",
+      "fix": "State: a new stage_id from the same submitter replaces (deletes) that submitter's previous stage for the group; SubmitEpoch requires stage.submitter == remote (else Failed); TTL is idle time since the stage's most recent StageVersions (track a per-stage last_touched, or take MAX(staged_at) over the stage); and the sweep's audit row."
+    },
+    {
+      "severity": "minor",
+      "section": "5 S6 / 6.3 (legacy Grant)",
+      "title": "A no-change legacy Grant changes from Ok to Failed with no statement of intent",
+      "detail": "Today Grant with unchanged bits reaches store.set_perms (upsert) and answers Ok (src/server.rs grant, '_ => set_perms'). Under 6.3 the shrink path authors a record, and S6 refuses any record that changes nothing with Failed{'no-op epoch'}; a same-bits Grant is neither a shrink nor an addition and its outcome is unspecified. Existing users of Grant: tui.rs:566,638 and tests/cli.rs::cli_user_permission_lifecycle; protocol.md section 8 asks for behaviour changes to secret-bunker/1 to be documented.",
+      "fix": "State that a legacy Grant whose bits equal the current row answers Ok and authors nothing (idempotent, as today), that a Grant adding bits answers Failed with the exact reason string, and list both in protocol.md's Grant paragraph."
+    },
+    {
+      "severity": "minor",
+      "section": "4.1 / E1 vs 8 (group_epoch.at INTEGER)",
+      "title": "A record with at >= 2^63 verifies but cannot be installed",
+      "detail": "4.1 makes `at` a u64be and E4 forbids using it for accept/reject; section 8 stores it in `at INTEGER NOT NULL` (i64). rusqlite's ToSql for u64 fails with ToSqlConversionFailure for values above i64::MAX, so a record with at >= 2^63 passes every E/C/R/A/G rule, passes S5, and then fails inside the install transaction with 'internal error' after the client has staged the whole group.",
+      "fix": "Add to E1: `at < 2^63`; or store `at` as the raw 8 bytes / cast to i64 with the record bytes remaining the source of truth."
+    },
+    {
+      "severity": "minor",
+      "section": "12 step 1",
+      "title": "Migration says 'the operator removes it first' but no offline removal path exists",
+      "detail": "Step 1 refuses to migrate while any registered EndpointId fails decode_point and tells the operator to remove it first, with the service stopped. The only removal path is RemoveIdentity over the wire (src/server.rs remove_identity); DbCmd has only Grant and AuditVerify, and db grant is being removed. The operator must restart the v2 server to remove the identity, then stop it again.",
+      "fix": "Add `db remove-identity --db --name` (deleting the row and, on v2, rotating its readable groups like remove_identity_with_rotations) or a `--drop-invalid-identities` flag on migrate-epochs that deletes such rows (their read grants are moot: their wraps cannot be reproduced) and audits `migrate-drop-identity`."
+    }
+  ]
+}

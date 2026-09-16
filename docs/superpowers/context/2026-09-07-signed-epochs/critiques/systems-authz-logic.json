@@ -1,0 +1,117 @@
+{
+  "findings": [
+    {
+      "severity": "critical",
+      "title": "A removal-shaped `carry` can roll the head generation back to any older keys epoch",
+      "detail": "V7 sets a carry's dek_version to epoch[from].dek_version and V6 only requires from <= prev.epoch with effective = wraps(from) - removed == readers(acl) u pinned. Nothing says dek_version is non-decreasing. Sequence on a mode-B group migrated from mode A (6.2 mints M_1 server-side with operational pinned at epoch 1): epoch 1 keys gen1 recipients {op, bk, X, Y}; epoch 2 admin mint gen2 kicks X -> {bk, Y}; epoch 3 server-authored carry{from: 1, removed: [op, X]}, acl = prev.acl. V9(b) OK (no bits added), V8 OK (pinned unchanged), effective {bk, Y} == readers u pinned OK, V7 dek_version = 1 OK, V5 OK. The head generation is now gen1, which the server and the kicked X hold; PutSealed/Put must use the head generation, so every new write is readable by the server. Human variant: an admin without read re-adds a kicked reader by choosing from = the last epoch that reader was wrapped in, rolling the group onto a burned key without ever holding M. Replicas verify and accept. This alone defeats both headline guarantees.",
+      "fix": "Add a verifier rule that dek_version is non-decreasing (carry => dek_version == prev.dek_version). Constrain carry.from to the nearest keys epoch at or before prev (walking back through carries) and define effective(this) = effective(prev) - removed, so a carry can only shrink the current generation's recipient set. Reject a carry whose `removed` touches a pinned role unless the epoch also drops that role from `pinned` (human-only)."
+    },
+    {
+      "severity": "critical",
+      "title": "Server-authored re-pin (V9(c)) lets the authoritative node add itself to, or replace the backup of, an end-to-end group",
+      "detail": "V8 allows server-authored epochs to change `pinned`; V9(c) only requires acl == prev.acl and explicitly permits mint == true, which needs no prior M. Sequence on a mode-B group: epoch n+1 server keys, mint=true, fresh M, pinned = prev.pinned u {operational: P_server}, acl unchanged, wraps to readers u pinned, any `reencrypted` (replicas cannot check coverage; ciphertexts can be left under the old generation, which old records still open). Every V-rule passes. prev.pinned now contains operational, so V9(d) applies and epoch n+2 may be 'anything': add a reader, raise a bit, add an admin. Variant: epoch n+1 replaces the `backup` point with P_attacker; V8 then forces every later human mint to wrap to it forever. The design also contradicts itself: 5.2 says B->A 'needs an admin to include the operational point in a mint', but V8 forbids humans from touching pinned while V9(c) lets the server do it, so the group's mode is entirely at the server's discretion.",
+      "fix": "Server-authored epochs may only REPLACE the operational point when prev.pinned already contains one (recover), never add a role, and never change `backup`. A backup change requires a co-signature by the previous backup point (Schnorr with a_bk over the record hash, verifiable from prev.pinned via the 1.4 sign rule). Adding or removing `operational` is a human decision: relax V8 so an admin epoch may change only the operational entry, and make A->B and B->A admin-authored."
+    },
+    {
+      "severity": "critical",
+      "title": "Orphan-then-recover: an undefined server shape that installs any admin on an E2E group",
+      "detail": "V5 lets server-authored epochs leave zero admins (so RemoveIdentity is never blocked). 3.1 and 11.5 then say recovery is a server-signed `db grant` epoch under 'the orphan-recovery exception', which V9 never defines. Any definition that lets a server epoch add a row when admins(prev.acl) is empty yields: epoch n+1 server carry clearing every admin bit (V9(b), removal-only); epoch n+2 server 'recovery' adding (attacker, 7), with mint=true to hand it a wrap. Two epochs, both verify on every replica, on a mode-B group. The claim 'a hostile node cannot add a reader or raise a permission on a mode-B group' is false as specified.",
+      "fix": "Define V9(e): a server-authored epoch may add rows only when admins(prev.acl) is empty AND the record carries a second signature by the pinned backup point (mode-B recovery already needs the offline backup key to recover M). Without the backup key the server can only orphan, which is the intended liveness-only bound. In mode A, V9(d) already covers recovery."
+    },
+    {
+      "severity": "major",
+      "title": "Revoking read no longer forces a key roll; a kicked reader keeps M for every later write",
+      "detail": "V6/V7 accept a `keys` epoch with mint=false whose wraps drop a reader (same M, commit == prev.commit), and accept a human `carry` that removes a reader. Nothing ties a removal to a mint; today's revoke_read_and_rotate and remove_identity_with_rotations always rotate in the same transaction. Sequence: epoch n admin A: keys mint=false, acl minus X's read bit (server step 6 only checks KCV in mode A -> accepted). X still holds M_k. All PutSealed/Put continue under gen k. Epoch n+1 admin adds Y via keys mint=false (11.4) - still M_k. needs_rotation is a server-only column replicas never see, and the mode-B RemoveIdentity tombstone relies on 'any admin mints next', which nothing enforces. X, with a stolen database copy or its own stale mirror, reads every write until someone happens to mint.",
+      "fix": "Verifier rule: keys and not mint => set(wraps.pk) is a superset of set(wraps.pk of the epoch that minted dek_version). You may add recipients without rotating only if nobody has been dropped since the last mint; any epoch that removes a recipient (keys or carry) forces the next keys epoch to be a mint. The server should also refuse PutSealed/Put while needs_rotation is set, or the design must state plainly that a tombstoned reader reads all writes until the next mint."
+    },
+    {
+      "severity": "major",
+      "title": "A non-reader admin can mint and irreversibly destroy every current secret in E2E mode",
+      "detail": "3.1 claims 'Rotate (mint) requires holding read ... by construction'. It does not: a fresh M needs no old M, wraps go to public keys, and only honest re-encryption needs plaintext. In mode B the server does no KCV check or trial decryption; coverage and digest are satisfiable with random bytes. Sequence: B (perms = a) stages random ciphertext for every current (name, version), submits a mint; V4/V5/V6/V7/V10 pass; step 7 UPDATEs secret_version in place; the old ciphertext is gone. The backup key can recover the old M from the old record but not the overwritten bytes. An identity that today could not delete a single secret (no write bit) wipes the group.",
+      "fix": "Verifier rule: a human mint requires author in readers(prev.acl). Do not overwrite in place: keep the pre-mint (dek_version, nonce, ciphertext) of each current version (a retired-row table or a per-epoch row) until the generation is retired, so a bad mint is recoverable with the backup key."
+    },
+    {
+      "severity": "major",
+      "title": "A mint lets an r|a admin without `write` silently rewrite plaintext, keeping version and created_by unchanged",
+      "detail": "Step 6e only requires each staged ciphertext to decrypt; it never compares with the old plaintext. 4.1 deliberately keeps version/created_at/created_by. Sequence: Alice (r|a, no w) runs `client rotate`, substitutes the value of db-password during re-encryption; mode-A trial decrypt succeeds; consumers see the same version and author; CAS-based writers never conflict; the operator's reconcile pushes the new content hash into the k8s Secret. In mode B nobody can check at all. This is a privilege escalation (admin+read -> effective write) that also defeats attribution: the write is credited to the original `created_by`.",
+      "fix": "Mode A: decrypt old and new and require plaintext equality per staged version. Mode B: a human mint requires the write bit too (author in writers(prev.acl)), and the docs state that a mint is a potential write by its author. Record the last re-encrypting epoch per secret_version so `epoch log`/GroupStatus can attribute the bytes."
+    },
+    {
+      "severity": "major",
+      "title": "The server's endpoint id can sit in the ACL; server-authored vs admin-authored is ambiguous and the server can be a listed reader of an 'E2E' group",
+      "detail": "1.1 says the server is 'author only, never a recipient', but no verifier rule enforces ctx.authoritative not in acl, and V4's 'or' leaves an epoch by the server key that is also in admins(prev.acl) unclassified (human path = no V9 restriction?). Sequence: mode A (V9(d) = anything): server epoch adds (server_id, 7) under roster name 'ci-runner'. The group is later moved to E2E (server re-pin + admin mint). The admin's tool wraps to readers(acl), which includes server_id; the group is 'E2E' but the server opens every generation, and if the verifier treats it as an admin it authors unrestricted epochs. Admins reviewing the ACL see names from the server-controlled roster, not keys.",
+      "fix": "Verifier rules: the authoritative id never appears in `acl` or in `wraps` other than as the pinned operational point; author == ctx.authoritative always takes the V9 path regardless of ACL membership. Make the A->B transition a human epoch and have the CLI/TUI show endpoint ids (not only roster names) in every epoch diff."
+    },
+    {
+      "severity": "major",
+      "title": "Replica re-TOFUs genesis after dropping a group: a 'rebirth' substitutes a whole group's contents",
+      "detail": "R0 pins genesis on 'first sight'; drop_group_local deletes the secret_group row, which is where genesis_hash lives. Sequence: hostile server omits G from a manifest (or answers SyncDenied) -> replica drops G and its pin; the server then serves G with a fresh server-authored genesis (V9(a)) whose ACL lists the replica as reader and an attacker admin, with attacker-chosen secrets encrypted under an M the server minted. The replica verifies from epoch 1, mirrors it, and the operator renders attacker values into k8s Secrets. This is content substitution, not liveness, and 5.5 claims the opposite.",
+      "fix": "Persist genesis pins per group name in a table that survives drop; a reappearing name with a different genesis is a fork (reject, emit EpochRejected/GenesisMismatch) until an operator resets. Let ReplicaBuilder accept operator-supplied pins, and emit an event on every first pin so TOFU is visible."
+    },
+    {
+      "severity": "major",
+      "title": "Rotating the authoritative endpoint key makes every chain unverifiable",
+      "detail": "V4 compares `author` with ctx.authoritative taken from the replica's stamp/config, and every genesis (migration, CreateGroup) plus every server epoch is signed by the current endpoint key. After the documented endpoint-key rotation (crypto-design section 8), a replica pointed at the new id verifies epoch 1: author = old key, not in admins(acl) and != ctx.authoritative -> reject; no group can be mirrored. Existing mirrors refuse the new id at check_role and must be recreated, hitting the same wall. There is no governance for who authorizes the server's key change.",
+      "fix": "Pin the authority in the chain: genesis carries `authority` (32 B); a server-authored 'authority rotation' epoch signed by the OLD authority names the new one (V9(e)); verifiers use the chain's current authority and treat ctx.authoritative only as the TOFU bootstrap for genesis."
+    },
+    {
+      "severity": "major",
+      "title": "Client retries hand the server valid sibling records; a hostile server forks replicas onto a superseded branch",
+      "detail": "11.2 step 5 rebuilds and re-signs on StaleVersions/EpochConflict, but the superseded record (same prev, valid signature) was already delivered to the server. Sequence: Alice submits 12a (grant Carol) -> EpochConflict because Dave's 12 (kick Eve) landed -> Alice submits 13 on top of 12. The server serves R1 the real chain and R2 [.., 11, 12a]. R2 verifies, serves Eve forever, and under R0' rejects every true epoch while keeping its mirror. The server picked the branch without holding any key, and a kicked identity is silently revived on a replica of its choosing.",
+      "fix": "On fork/rewind detection the replica must fail closed for that group (stop serving it, emit the event) rather than keep serving; document that the server can choose among concurrently valid records. Reduce the supply: the CLI should not re-sign a new record for the same prev until the server has answered the previous one, and the server should record and audit every rejected-but-valid record."
+    },
+    {
+      "severity": "major",
+      "title": "The last-admin rule keeps an admin, not a usable one: a group can be left with only a non-reader admin",
+      "detail": "V5 counts admin bits. An admin without read has no wrap and can only author carries, never a mint or a read grant (3.1). Sequence: A (rwa) authors a keys epoch with acl [(B, a)] (or clears its own read bit and drops itself from wraps, which V6 permits). V5 passes. Nobody can add a reader or roll the key; in mode B the only way out is `db grant --backup-key`, i.e. the offline root. Today the server could always rescue such a group; in mode B it cannot.",
+      "fix": "For human-authored epochs V5 must require at least one row holding read|admin (a reader-admin). Server-authored epochs keep the orphaning exception."
+    },
+    {
+      "severity": "minor",
+      "title": "ACL rows may reference unregistered endpoint ids; the resolution decides who can register identities",
+      "detail": "Step 8 never checks acl ids against the identity table, yet step 7 inserts into group_acl, which needs identity_id; R1 explicitly tolerates head-ACL ids with no roster entry. If the server auto-registers, every group admin gains AddIdentity (a service-admin power) and RemoveIdentity has no name to target; if it rejects, the spec must say so.",
+      "fix": "Submission rule: every acl endpoint id must be a registered identity (Failed otherwise). Keep R1's tolerance only as robustness against roster/ACL skew."
+    },
+    {
+      "severity": "minor",
+      "title": "V11 lets any admin freeze the chain's clock forever",
+      "detail": "`at` is author-chosen and V11 requires at >= prev.at. One epoch with at = i64::MAX forces every later epoch to carry the same value; timestamps in `epoch log`/GroupStatus become meaningless permanently. The rule buys no security (no wall-clock comparison anywhere).",
+      "fix": "Drop V11 or make it advisory (log, do not reject); if kept, bound `at` to [prev.at - slack, prev.at + 10 years] and display the server's created_at alongside."
+    },
+    {
+      "severity": "minor",
+      "title": "In mode A attribution collapses to the server key",
+      "detail": "Every Grant/RotateDek/RemoveIdentity/CreateGroup, `db grant`, migration and the TUI fallback produce epochs signed by the server; the human appears only in the mutable audit log. 5.5's 'every ACL/key change is attributable to a specific key' holds only for CLI-authored epochs, and for the Go client never.",
+      "fix": "State it plainly; add an unverified `on_behalf_of` field to server-authored records for forensics; restrict V9(d) to what the Go client and service admins need, and have the TUI/CLI author client-side whenever the caller holds read+admin."
+    },
+    {
+      "severity": "minor",
+      "title": "Replicas never check the `reencrypted` digest against fetched ciphertext",
+      "detail": "R4/R5 are unchanged, so the only chain-verifying party ignores the one field that binds an author to bytes; 'the last re-encryption is attributable and bound to exact bytes' is never verified in practice, and a mint's re-encrypted set can be swapped in transit without detection.",
+      "fix": "In R4, for fetched (name, version) whose dek_version equals the latest mint generation, compute the leaf digest and require membership in that mint epoch's set; reject mismatches like any other verification failure."
+    },
+    {
+      "severity": "minor",
+      "title": "EpochConflict auto-rebase silently co-signs a concurrent admin's ACL change",
+      "detail": "11.2 step 5 'restart from 1' rebuilds the ACL from the new head; Alice's kick of Bob lands on top of Dave's grant of Mallory and carries Mallory forward under Alice's signature without Alice reviewing it.",
+      "fix": "On EpochConflict the CLI/TUI prints the intervening epochs' ACL diff and requires confirmation (`--yes` for automation)."
+    },
+    {
+      "severity": "minor",
+      "title": "Migrating a group straight to E2E leaves the server knowing M_1 with no rotation flag",
+      "detail": "6.2 step 2 mints M on the server regardless of dek_mode; with dek_mode = e2e the operational point is not pinned but the server holds M_1 until an admin mints, and needs_rotation is not set. The same applies to a server-authored A->B re-pin.",
+      "fix": "Migration to e2e and any A->B transition set needs_rotation = 1 and the docs/TUI say the server can read until the first admin mint."
+    }
+  ],
+  "strengths": [
+    "Storing and verifying the author's exact body bytes removes the canonical-CBOR problem entirely and lets the parser be strict.",
+    "V6 (recipients == readers u pinned, canonical + torsion-free points) makes hidden recipients impossible and is checkable without any key.",
+    "Deliverer == author at submission plus the Ed25519 signature gives real non-repudiation for client-authored epochs.",
+    "Server CAS on prev/epoch plus replica fork/rewind rejection is the right shape; authorizing replicas from the verified head rather than the roster is the central improvement over today.",
+    "Mode B refusing server-side read grants and rotations closes the implicit-power hole for those groups, and mixing modes per group is sensible.",
+    "The carry shape lets admins without read do w/a edits without ever seeing M, once `from` is constrained.",
+    "The reencrypted digest bound under the author's signature is the correct primitive for 'who last re-encrypted'.",
+    "Reusing the age X25519 keys as Edwards points with an explicit sign rule avoids a key ceremony at migration."
+  ],
+  "verdict": "Not safe as specified. Verifier rules V5-V9 admit at least three legitimate-looking sequences that fully defeat the two headline guarantees (an E2E group resists a hostile authoritative node; a kick rolls the key): carry generation rollback, server re-pin adding operational or replacing backup, and orphan-then-recover. Several further sequences let non-reader or non-writer admins destroy or rewrite data, leave a replica on a server-chosen branch, or make chains unverifiable after a documented key rotation. Every fix is a local rule change: monotone dek_version with carry.from pinned to the current generation; server may never add a pinned role or touch backup without a backup co-signature; recovery co-signed by backup; removal forces the next keys epoch to mint; mint requires read (and write, or a plaintext-equality check in mode A); the server id is excluded from the ACL; authority pinned in the chain; persistent genesis pins; fail-closed on fork; V5 requires a reader-admin. With those applied the design holds and should proceed. Full critique: /private/tmp/claude-502/-Users-dragan-fables-for-robots-secret-bunker-iroh/0c07f4bd-a1ff-4066-aa31-2b8de0a5ded7/scratchpad/critiques/systems-authz-logic.json"
+}

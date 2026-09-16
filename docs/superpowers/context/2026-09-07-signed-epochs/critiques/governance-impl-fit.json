@@ -1,0 +1,131 @@
+{
+  "findings": [
+    {
+      "severity": "major",
+      "title": "Stage keyed by (group, epoch_hash, submitter) defeats the incremental 'uncovered' retry and the EpochConflict rebuild the design relies on",
+      "detail": "reencrypted is under the signature and part of hash(rec). When SubmitEpoch answers Failed{uncovered: name@version} the admin must add leaves, recompute reencrypted, re-sign -> hash(rec) changes -> every previously staged row sits under a dead stage key; the resubmit finds an empty stage and reports everything uncovered. A CAS loser has the same problem (new prev -> new hash). Section 4 says the admin 're-encrypts just those and resubmits'; as specified this is a full restage every attempt, and with concurrent writers the loop never converges. Old stage rows also linger for an hour per attempt, doubling the group's ciphertext footprint.",
+      "fix": "Key the stage by a client-chosen random stage_id (or by (group, submitter) with one in-flight stage per submitter); StageEpoch{group, stage_id, versions} upserts rows by (name, version); SubmitEpoch{group, stage_id, record}. reencrypted still commits the author to the staged bytes. Delete the stage on success or on an explicit AbortStage."
+    },
+    {
+      "severity": "major",
+      "title": "A near-maximal secret cannot travel in an Export or StageEpoch frame on secret-bunker/1, so rotation is impossible for such groups",
+      "detail": "proto::MAX_MSG is 4 MiB, enforced by recv.read_to_end(proto::MAX_MSG) in Bunker::accept (src/server.rs ~1019) and Client::request (src/client.rs). A legal Put value is just under 4 MiB; ciphertext adds the 16-byte tag, and Export/StageEpoch add name, version, nonce, created_by and CBOR framing. That is exactly why SYNC_MAX_MSG is 8 MiB (docs/sync-protocol.md section 2; tests/e2e.rs a_maximum_size_secret_syncs_to_the_replica). The design specifies 'StageEpoch ... <= 4 MiB frames' and a paginated Export over the client ALPN, so a group holding one such secret can never be exported or restaged, and since every kick is a rotate (G3), that group can never revoke a reader.",
+      "fix": "Either (a) serve ExportGroup/StageEpoch over the sync ALPN (8 MiB length-prefixed frames, admin-authorized), or (b) add per-version byte-range chunking (offset/total) to Export and StageEpoch rows with server-side reassembly in epoch_stage, or (c) raise the cap for these variants on both Rust sides (Client::request reads with MAX_MSG too). Add an e2e test rotating a group that contains a MAX_MSG-sized secret."
+    },
+    {
+      "severity": "major",
+      "title": "The record does not bind the group name and A1 lets the server mint genesis records: a hostile server can shadow or relabel groups at replicas",
+      "detail": "The layout carries a random group_id but no name; Group.name is server-supplied; P1/P2 key the replica head by group_id; A1 accepts author == pinned service key for genesis. A hostile server can (a) mint a fresh genesis (new group_id, any acl, an M it knows) and serve it under the existing name 'prod': the replica has no head for that group_id, accepts it under C1, and apply_group_sync (keyed by name) replaces prod's ACL with the attacker's; or (b) serve chain X as 'staging' to replica A and 'prod' to replica B. secret_aad binds the name so old ciphertext will not decrypt across names, but membership and authorization at replicas are forged, which is precisely what section 6.3 claims the server can no longer do. Section 6.3 calls server-minted genesis 'harmless beyond what it can do already'; it is not once names are the client-facing key.",
+      "fix": "Add name (u32 length || bytes) to the genesis layout and make replicas verify Group.name == chain name. Replicas pin name -> group_id on first sight and refuse a genesis for a name they already hold (audit 'sync-genesis-conflict') and a different name for a known group_id. Server-minted genesis stays (CreateGroup/migration) but is then name-bound."
+    },
+    {
+      "severity": "major",
+      "title": "Group admins cannot build an acl record from the specified API: they need the grantee's raw endpoint id, which is service-admin-only",
+      "detail": "Records speak raw 32-byte keys. ListIdentityNames deliberately returns names only (src/proto.rs doc; design/crypto-design.md section 7: 'full identity records (endpoint ids, service-admin flags) remain service-admin-only'); ListIdentities is service-admin gated; Epochs.identities only covers keys already in the chain. So the primary flow of the ask, 'admin adds a reader', cannot be executed without out-of-band copy-paste of endpoint ids. S1 says 'keys are registered' but never how an admin learns the key.",
+      "fix": "Add an admin-gated ResolveIdentity{group, name} -> endpoint_id request (or additively extend the ListIdentityNames reply with a new field of (name, endpoint_id) pairs), and state the policy change explicitly in sections 3.6/6.3: group admins now learn endpoint ids of anyone they grant to. This is unavoidable with a raw-key chain and belongs in the threat-model delta."
+    },
+    {
+      "severity": "major",
+      "title": "S4 contradicts itself: 'staged rows for versions deleted meanwhile are ignored' vs 'MUST hash to reencrypted'",
+      "detail": "The author computed reencrypted over the exported leaf set, which included the version deleted between export and submit. If the server ignores that staged row the surviving set hashes differently and the digest check fails; if it includes it, it installs a row for a version that no longer exists. Every rotate that races a Delete is rejected until the admin re-exports and re-signs, and combined with the stage-key finding that means a full restage.",
+      "fix": "Define S4 precisely: verify reencrypted over the staged set exactly as submitted (every staged (name, version) row, sorted); then install only rows whose (name, version) is still retained, discard the rest, and require coverage of every retained version. The signed digest still commits the author to what it produced, and deletions cannot fail the check."
+    },
+    {
+      "severity": "major",
+      "title": "Mode S verifies staged ciphertext decrypts but not that the plaintext is unchanged: any admin can rewrite every secret under cover of a rotate while created_by/author/put_sig stay verbatim",
+      "detail": "S5 decrypts each staged row with the new DEK and refuses garbage; step 3 of section 4 keeps created_at/created_by/author/put_sig verbatim. Nothing compares new plaintext with old. In mode S the server holds DEK_old and can compare cheaply. Without it a rotate lets an admin silently replace the content of every retained version and keep the original writer's stamp; for every version without a put signature (all Go-client puts, all pre-migration versions) this is undetectable, and the ask's 'who last re-encrypted' becomes 'who may have rewritten history'. Section 2 acknowledges the proof does not cover this, but the server can enforce it.",
+      "fix": "In S5 also decrypt the current row under DEK_old (the server's own wrap in mode S) and require byte-for-byte equality per (name, version); refuse the record otherwise. For mode E, state that this check is impossible and make put signatures mandatory there so readers can detect rewrites."
+    },
+    {
+      "severity": "major",
+      "title": "Migration leaves group_dek rows the existing put/snapshot code misreads: current_dek_version() returns the old MAX, not the head's dek_gen",
+      "detail": "Section 8 says 're-encrypt every retained secret_version under dek_gen = 1' and 'group_dek unchanged; version == dek_gen'. A pre-migration group with three retained DEK versions keeps group_dek rows 1..3. Store::current_dek_version() is SELECT MAX(version) -> 3; Bunker::put() uses it for the AAD and DEK lookup; snapshot_group() iterates dek_versions(). After migration the head says dek_gen=1, ciphertext is under gen 1, and the next Put encrypts with dek_version=3 against a (group, dek_gen) cache that has no gen 3, producing Failed or an undecryptable row.",
+      "fix": "Migration must delete group_dek rows other than the generation it writes (one-generation invariant), or genesis dek_gen must be old_max+1 (relax C1 to dek_gen >= 1). Independently, mode-S Put and snapshot must take the generation from the verified head record, never from MAX(group_dek.version); say so in section 8."
+    },
+    {
+      "severity": "major",
+      "title": "Startup backfill and Bunker::new are age-bound and unaddressed: serve would refuse to start after migration, and the key/CLI plumbing is unplanned",
+      "detail": "src/main.rs Serve calls bunker.backfill_reader_wraps() unconditionally. After migration dek_wrap is empty, so missing_reader_wraps() (group_acl read x group_dek LEFT JOIN dek_wrap) lists every reader x every generation; backfill calls unwrap_dek on a nonexistent operational wrap -> Err -> serve exits. Bunker::new(store, op_identity: age::x25519::Identity) requires an age key matching meta.operational_pubkey; read_secret() takes an age identity; keys.rs KeyRole::{Operational,Backup}.is_age() drives keygen/import/export file format; init takes --backup-pubkey age1...; recover re-wraps age rows. The design says the keys 'become Ed25519 (iroh SecretKey format)' and the age keys are retired, but names none of these touch points, and 'automatically at first serve' would need both the old age key and the new keys on one command line.",
+      "fix": "Gate backfill_reader_wraps on schema_version < 3 and drop it in v4. Replace Bunker::new's age identity with the service Ed25519 secret key plus a v3 check. Add KeyRole::Service and an Ed25519 backup role (hex seed files like client.key), define the textual public-key form stored in meta (lowercase hex), update init/serve flags (--service-key, --backup-pubkey <hex>), retire or repurpose recover/keygen-age. Make migration an explicit db migrate-epochs that takes the old operational age key and the new keys; do not run it implicitly on first serve."
+    },
+    {
+      "severity": "major",
+      "title": "RemoveIdentity vs the group_acl FK cascade: the server's ACL projection diverges from the head record, and replicas keep authorizing the removed identity",
+      "detail": "group_acl.identity_id REFERENCES identity(id) ON DELETE CASCADE. Deleting the registry row removes the key's group_acl rows while it remains in head.acl/wraps. authorize_group/read_scope then deny it (intended), but GroupAcl, ListGroups.stale_recipients and anything reading group_acl now disagree with the chain; the next acl epoch must keep the key (G3) while 'S1 keys are registered' would refuse it, so the only legal next record is a rotate, which the design does not say. On replicas P5 takes the ACL from the record, so a removed identity keeps read/write authorization at every replica (not just the ability to decrypt copies it holds) until some admin rotates; today RemoveIdentity revokes at replicas on the next sync. This is a silent behavior change beyond risk 3, which only mentions removed replicas. Replicas also need an identity row for a chain key absent from identities (identity.name is NOT NULL UNIQUE).",
+      "fix": "Treat group_acl as a pure projection of the head: drop the cascade for this path (or rebuild the projection from the head after RemoveIdentity). Define S1 for non-genesis records as 'every acl key is registered or already in head.acl'. Have replicas synthesize a placeholder name (e.g. first 16 hex chars) for unnamed chain keys. State in 6.3 that a removed identity retains replica-side authorization until an admin rotates, and have RemoveIdentity return the affected groups."
+    },
+    {
+      "severity": "minor",
+      "title": "Sync requests carry no replica head, and Group is not chunked: 'records since the replica's head' cannot be computed and long chains exceed the frame cap",
+      "detail": "SyncRequest::Hello and FetchGroup{group} have no 'since'; the design changes only the Group message, so the server must ship the whole chain on every FetchGroup. Group is one frame (send_group_snapshot); a chain of a few thousand epochs with ~10 recipients (~1.5 KB each) exceeds SYNC_MAX_MSG and the stream dies on every reconnect (the documented failure mode in docs/sync-protocol.md section 6).",
+      "fix": "On secret-bunker-sync/2 add Hello{heads: [(group, epoch, hash)]} and FetchGroup{group, since_epoch}; the server sends records > since (whole chain when absent or on hash mismatch). Chunk epochs across repeated Group messages; run_session and fetch_group_state already merge repeated Group by name."
+    },
+    {
+      "severity": "minor",
+      "title": "Scalar::from_hash needs digest 0.11 (sha2 0.11); the crate pins sha2 0.10",
+      "detail": "curve25519-dalek 5.0.0's from_hash<D: Digest<OutputSize = U64>> is bound to digest 0.11 ([dependencies.digest] version = \"0.11\"); the repo's sha2 = \"0.10\" Sha512 implements digest 0.10 and will not satisfy the bound. curve25519-dalek also needs the digest feature (ed25519-dalek 3 enables it) and alloc for vartime_multiscalar_mul (default). sha2 0.11 is already in Cargo.lock via ed25519-dalek 3.",
+      "fix": "Add sha2 = \"0.11\" as a second dependency for the transcript, or hash with sha2 0.10 into [u8; 64] and call Scalar::from_bytes_mod_order_wide. Pin the choice in the design."
+    },
+    {
+      "severity": "minor",
+      "title": "Replica apply order and DEK derivation are under-specified relative to apply_group_state()",
+      "detail": "Today apply_group_state computes secrets_needing_fetch, fetches, filters fetched rows by state.deks versions (the wrapped_versions retain), then applies in one transaction. With deks dropped the filter must use the verified head's dek_gen, which requires verifying and persisting epochs before the fetch decision (a rejected record means nothing from that state may be applied per P1). Replica::get reads dek_wrap; the design does not say where a replica gets its DEK at read time and must not persist a plaintext DEK (today the mirror holds only wraps).",
+      "fix": "Specify: verify all received records and persist accepted ones plus the head in the group's transaction; compute head.dek_gen; fetch; retain rows with dek_gen == head.dek_gen (one re-fetch on skip, as today); apply. Replica::get derives the DEK from group_epoch.record + own scalar per call or an in-memory (group, dek_gen) cache, never storing it."
+    },
+    {
+      "severity": "minor",
+      "title": "New optional fields on Secret and Put must be skip_serializing_if or the shared golden vectors and strict Go decoding break",
+      "detail": "Response::Secret{value, version} gains created_by/author/verified and Request::Put gains sig. If always serialized, proto::tests::wire_format_is_stable fails (the a2 map becomes a5) and the Go proto_test.go vectors diverge; a Go decoder that rejects unknown fields breaks outright.",
+      "fix": "Declare them Option<...> with #[serde(default, skip_serializing_if = \"Option::is_none\")] so existing encodings are byte-identical; add golden vectors for the with-fields case and update the Go vectors in lockstep per docs/protocol.md section 8."
+    },
+    {
+      "severity": "minor",
+      "title": "S3/S5 under the global store lock stalls every client and sync session for the duration of a rotate",
+      "detail": "Bunker::handle holds Mutex<Store> for the whole request. S3 'evaluated under the store lock' plus S5 decrypting every staged row (the group's entire ciphertext) and 2+2n vartime scalar mults keeps the lock for seconds on a large group; sync_hello, fetch streams and all client requests block.",
+      "fix": "Verify signature, chain rules against a snapshot of the head, DLEQ and S5 outside the lock; then take the lock, re-check the head hash (CAS) and coverage, and install."
+    },
+    {
+      "severity": "minor",
+      "title": "Failed for legacy Grant/RotateDek must follow authorization; the TUI/CLI epoch flows are unnamed",
+      "detail": "docs/protocol.md section 6: Failed is only sent after authorization succeeded, otherwise it is an existence oracle. The design answers Grant/RotateDek with Failed without saying the admin check runs first. The TUI's ACL editor (src/tui.rs: r/w/a toggles via Request::Grant, R via RotateDek, n via ListIdentityNames) and the CLI client grant/rotate-dek become dead on an epoch-mode bunker; the only client-side tool named is db submit-epoch, yet section 4's six-step procedure needs a client implementation with progress for large groups.",
+      "fix": "Authorize (admin on group) before answering Failed. Name the client commands (e.g. client acl set/kick/rotate, client epochs show) and TUI actions, and specify a long-running rotate path in the TUI's spawn_blocking request loop."
+    },
+    {
+      "severity": "minor",
+      "title": "GroupEpochs gated on 'any bit' widens roster-history disclosure to write-only identities",
+      "detail": "Today GroupAcl is admin-gated and sync discloses the roster to readers only. The chain carries full membership history; handing it to write-only identities is a new disclosure not listed in risk 9.",
+      "fix": "Require the read bit (replicas need it) or admin; say so in 6.3."
+    },
+    {
+      "severity": "minor",
+      "title": "Put signatures need group_id, which no request returns; service-rekey wording contradicts R5; no batch tool for a lost service key",
+      "detail": "The put-signature preimage includes the 32-byte group_id chosen at genesis; ListGroups/GroupInfo carries only name and perms, so a writer cannot sign without first calling GroupEpochs. A4 says 'the author's own wrap is the only new one and the rest are re-randomised over the same M' - re-randomising with a fresh r changes every c_i, and R5 forbids verbatim carry-over when the recipient set changes. Rotating a lost service key needs one backup-signed recovery record per group with no tool named.",
+      "fix": "Add optional group_id to GroupInfo (additive). Reword A4: fresh r', all wraps recomputed, same M, proof regenerated. Specify a db recover-service-key that emits N recovery records in one offline run."
+    },
+    {
+      "severity": "minor",
+      "title": "Migration and server-minted genesis are impossible in mode E under A1",
+      "detail": "A1 allows genesis by an acl admin or by the pinned service key. In mode E pinned = {backup} only; the server holds no key that can author, so neither db migrate-epochs nor CreateGroup-without-genesis can produce a record, although section 6.1 says the pinned set 'can be chosen now'.",
+      "fix": "State that epoch_mode = E requires client-supplied genesis (CreateGroup{genesis}) and that migration is mode-S only, or allow a backup-key-signed genesis for offline migration into mode E."
+    },
+    {
+      "severity": "minor",
+      "title": "Testing story is missing: no golden vectors for the layout, and the existing suite that will break is not enumerated",
+      "detail": "The fixed layout exists to make byte-level vectors easy, yet none are listed (record bytes, hash, DLEQ transcript, a fixed-seed valid chain). Tests this design invalidates: server.rs grant_read_wraps_and_revoke_rotates, write_only_grant_creates_no_wraps, remove_identity_rotates_all_readable_groups, rotate_dek_wraps_to_readers, backfill_creates_missing_wraps, create_group_wraps_to_creator; tests/e2e.rs recovery_rewraps_deks, a_revoked_readers_wrap_cannot_open_later_writes, replica_engine_full_flow; tests/cli.rs cli_db_rescue_and_audit_verify (db grant removed); sync::tests::wire_format_is_stable. No tests are named for the CAS race/uncovered path, delete race, replica re-root, torsion-tweaked c_i, non-canonical point, duplicate recipient, or name-shadow refusal.",
+      "fix": "List a negative-test matrix per rule (E1-E4, C1-C4, R1-R5, A1-A4, G1-G8, P1-P5, S1-S5) with one test each, add golden vectors for record/hash/transcript and a fixed-seed chain, and enumerate which existing tests are replaced by what."
+    }
+  ],
+  "strengths": [
+    "Fixed binary layout with a magic prefix for hash and signature, CBOR only as a container: avoids canonical-CBOR pitfalls with ciborium and makes golden vectors trivial.",
+    "One-DEK-generation-per-group maps cleanly onto the existing sync change discriminator: re-encryption changes (dek_version, nonce) on every row, so secrets_needing_fetch() refetches exactly what changed with no new protocol rule.",
+    "dek_gen reuses the dek_version u64 slot in secret_aad(), so crypto.rs's AAD and the secret_version schema are untouched.",
+    "Exact-group verification with canonical-encoding, non-identity and torsion-free checks on every point (E3/E4) addresses the cofactor caveat correctly without Ristretto; the APIs it names (to_scalar, to_edwards, is_torsion_free, vartime_double_scalar_mul_basepoint) exist in the pinned ed25519-dalek 3 / curve25519-dalek 5.",
+    "G3 (read removal is always a rotate) matches today's revoke_read_and_rotate semantics and closes the 'revocation theatre' hole a naive acl epoch would open.",
+    "CAS on the head under the store lock matches Bunker::handle()'s existing lock discipline and the Put CAS model; no new concurrency primitive.",
+    "Keeping the identity registry outside the chain matches how replicas already treat names as server-attested display data (apply_group_sync rule 1).",
+    "Refusing legacy Grant/RotateDek with Failed rather than silently server-authoring epochs is honest; server-minted genesis keeps CreateGroup working for the Go client.",
+    "P2 turns today's silent follow of a rewound authoritative node (apply rule 3 'wrap blob differs -> replace') into a detected event; the recovery-epoch jump is a pragmatic answer to a restore behind replicas.",
+    "Mode S as the v1 default preserves Get/Put/List, write-only identities and the Go client unchanged."
+  ],
+  "verdict": "The governance rules (E/C/R/A/G, admin-kicks-admin default, backup-key-only recovery) are internally coherent and the ElGamal+DLEQ scheme is implementable on the pinned dalek crates. The storage/protocol layer, however, has several defects that would not work as written: the staging table is keyed by the record hash, which changes on every 'uncovered'/EpochConflict retry the design relies on; the client protocol's 4 MiB frame cap (read_to_end(MAX_MSG) on both sides) cannot carry a near-maximal secret's ciphertext, so rotation is impossible for such groups; the record does not bind the group name and A1 lets the server mint genesis records, so a hostile server can shadow or relabel groups at replicas, undermining the headline 'cannot forge membership' claim; group admins cannot obtain the raw endpoint ids they must put into acl records (ListIdentityNames deliberately returns names only); S4's 'ignore deleted rows' contradicts 'must hash to reencrypted'; and migration leaves group_dek rows that current_dek_version()/put()/snapshot_group() misread. Mode S also lets any admin rewrite plaintexts under cover of a rotate while keeping created_by/put_sig verbatim, which the server can cheaply prevent. The remainder (age-bound backfill and Bunker::new, RemoveIdentity vs the group_acl FK cascade, missing 'since' on sync requests, sha2/digest version, serde skip_serializing_if, lock scope, CLI/TUI flows, tests) is under-specification a planner must fill. Fix the major items before planning; the crypto and governance sections can stand. Full critique: /private/tmp/claude-502/-Users-dragan-fables-for-robots-secret-bunker-iroh/0c07f4bd-a1ff-4066-aa31-2b8de0a5ded7/scratchpad/critiques/governance-impl-fit.json"
+}

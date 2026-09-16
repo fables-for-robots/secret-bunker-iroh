@@ -1,0 +1,117 @@
+{
+  "findings": [
+    {
+      "severity": "critical",
+      "title": "V9 makes mode-B orphan recovery impossible, and any fix reopens the hostile-server hole the design claims to close",
+      "detail": "V5 lets a server-authored epoch leave zero admins ('recovery is a later server-authored epoch, 11.5') and 11.5 says `db grant` applies 'V9(c)/(d) or the orphan-recovery exception'. V9 as written has no such exception: server-authored shapes are (a) genesis, (b) removal-only carry, (c) pinned-only re-pin, (d) anything only when `operational` is pinned. In mode B (no operational point) a `db grant` that re-adds an admin row is an additive server-signed epoch that every replica rejects under V9, so an orphaned mode-B group (e.g. after `RemoveIdentity` of its last admin, which the design keeps unblockable) is unrecoverable through the chain. If you add an orphan exception, a hostile authoritative node gets a two-step escalation: orphan the group with a V9(b) carry (always allowed), then add its own key under the exception, defeating KD7 / section 5.5 ('cannot add a reader or raise a permission on a mode-B group').",
+      "fix": "Decide explicitly. Option A: mode-B orphan recovery is authored by the backup key, not the server: derive the backup scalar as in 1.4 and sign with `ed25519_dalek::hazmat::raw_sign` over the pinned backup point (add a V4 clause 'author == pinned.backup'); the server never holds that key, so the guarantee survives. Option B: forbid orphan recovery in mode B and require a fresh genesis plus replica mirror reset, and say so in the runbook. Either way remove the V5/11.5 text that promises a server-authored recovery in mode B."
+    },
+    {
+      "severity": "critical",
+      "title": "Rotating the server endpoint key bricks chain verification for every replica",
+      "detail": "V4 accepts server-authored records only when `author == ctx.authoritative`, and the replica sets `ctx.authoritative` to the id it dials (stamped in `meta.authoritative`, enforced by `check_role` in src/replica.rs). Every migrated group's genesis and every mode-A `Grant`/`RotateDek`/`RemoveIdentity` epoch is signed by the endpoint key in use at that time. crypto-design.md section 8 documents endpoint-key rotation as a supported lifecycle step ('changes the bunker's EndpointId ... the database is unaffected'); today replicas recover with a mirror reset. Under the design a reset mirror walks the chain from genesis and fails V4 on the first old-key record of every group; existing mirrors fail on the first new-key record. KD6 claims 'operational/endpoint keys still rotate independently' but the chain now binds at-rest authority to the transport key. The e2e harness already exercises this shape: `spawn_authoritative` in tests/e2e.rs re-spawns the same store under `SecretKey::generate()` each time.",
+      "fix": "Make the accepted server key part of the chain rather than of the verifier context: add a server-authored 'authority rotation' epoch (`pinned` gains `[\"authority\", A_new]`, verified under the previous authority) and have V4 check server-authored records against `prev.pinned.authority` (genesis: the id stamped at first sight), so `ctx.authoritative` is only the TOFU seed. Alternatively pin the authority key in genesis and treat endpoint-key rotation as re-genesis of every group, but then say so in crypto-design.md section 8 and the operator runbook."
+    },
+    {
+      "severity": "major",
+      "title": "Staging keyed by the record hash forces the client to hold or re-encrypt the whole group before staging",
+      "detail": "`StageReencrypted` rows are keyed by `epoch_hash`, and the hash covers `reencrypted`, a digest over every leaf's `(name, version, dek_version, nonce, SHA-256(ciphertext))`. `crypto::encrypt_secret` draws a random nonce per call, so the client cannot know the record hash until it has re-encrypted every current version. 11.2 says 'the CLI streams page by page so peak memory is one page' - impossible as specified: the client must buffer all re-encrypted ciphertext (the 4.2 'pathological' 1000 x 4 MiB case needs 8 GiB of RAM) or run two full passes with cached nonces. `StaleVersions` retries make it worse: restaging one name changes the digest, hence the hash, hence the staging key, so 'restage' is really 'restage everything'.",
+      "fix": "Key staging by a client-chosen 32-byte `staging_id` carried in every `StageReencrypted` and in `SubmitEpoch`; the server computes the digest over the staged rows (plus inline ones) at submit time and compares it to `record.reencrypted`. The client then streams: fetch page, re-encrypt, stage, keep only the leaf hashes, sign at the end. A `StaleVersions` retry restages only the listed names under the same `staging_id`."
+    },
+    {
+      "severity": "major",
+      "title": "Maximum-size secrets do not fit the sealed requests/responses under `MAX_MSG`",
+      "detail": "`proto::MAX_MSG` is 4 MiB and the server reads every request with `recv.read_to_end(MAX_MSG)` (src/server.rs accept loop) before it knows the variant. A `Put` sized to the cap yields ciphertext of value+16 bytes; `Sealed`/`SealedList` responses add `dek_version`, `version` and a 12-byte nonce, and `PutSealed`/`StageReencrypted` requests add the 32-byte `epoch_hash` and version fields, so for short group/secret names they exceed the cap by tens of bytes. docs/sync-protocol.md section 2 chose 8 MiB for sync precisely because 'a maximal Put ... its ciphertext adds a 16-byte AEAD tag'. Test (5) in section 14, '4 MiB secret through kick, staging and sync', fails as designed at `ListSealed` and again at staging.",
+      "fix": "Introduce `MAX_SEALED_MSG = MAX_MSG + 64 KiB` and have the server's accept loop read up to that (backwards compatible: v1 clients never send more), with clients using the same bound for sealed responses; document it in protocol.md next to `MAX_MSG`. Bounding `Put` values instead would break the Go client."
+    },
+    {
+      "severity": "major",
+      "title": "Mode-A server-authored mints silently turn O(1) handlers into full-group re-encryption under the global store lock",
+      "detail": "Section 4.1 makes every minting epoch re-encrypt every current version and section 8 routes `RotateDek`, `Grant` losing read, `RemoveIdentity`, migration and `db grant` through the same step 7. Today `rotate_dek`/`revoke_read_and_rotate`/`remove_identity_with_rotations` mint a key and write a few wrap rows; `Bunker::handle` runs synchronously under `lock_store()` and every client and sync stream waits on that mutex. After the change one `RotateDek` on a group with 50 x 200 KB values is 20 MB of AEAD work under the lock, and `RemoveIdentity` for an identity reading N groups does N groups in one transaction. Every nonce changes, so every replica refetches the whole group on each server-side rotate (today: nothing). `db grant` revoking read today needs public keys only ('Rotation needs no private key'); it now needs `--operational-key` or the backup key. Section 4.2's 'mode A keeps the fast path' contradicts 4.1 and 8.",
+      "fix": "Pick one and state it. Recommended: server-authored mints keep today's forward-only semantics - `reencrypted` = 32 zero bytes, no `secret_version` rows touched, new writes land under the new generation - and only client-submitted mints (step 6c) must cover every current version. That preserves the documented 'revocation is forward protection' behaviour, keeps `db grant` key-free for revokes, and avoids the replica refetch storm. If server-side re-encryption is wanted, run it in bounded chunks outside the lock and commit with a CAS on `head_epoch`."
+    },
+    {
+      "severity": "major",
+      "title": "`SubmitEpoch` trial-decrypts the whole staged set while holding the store mutex",
+      "detail": "Step 6d/6e digest and, in mode A, `decrypt_secret` every staged row inside the request handler, i.e. under the same synchronous `lock_store()` that gates every other request and every sync session. For the sizes the design quotes (20 MB typical, 8 GiB pathological) that is seconds to minutes of total server unavailability per kick. The server cannot verify earlier because it needs `c_op` from the record to derive the DEK, and the record only arrives with `SubmitEpoch`.",
+      "fix": "Send the record first: `StageReencrypted` (or a new `BeginEpoch`) carries the record on its first call; the server verifies V1-V11 and the mode-A KCV once, derives and caches the DEK for that staging id, and trial-decrypts each 3.5 MiB chunk as it is staged (bounded work per lock hold, or outside the lock with rows marked verified). `SubmitEpoch` then only re-checks CAS, coverage and digest."
+    },
+    {
+      "severity": "major",
+      "title": "A non-service-admin group admin cannot obtain the endpoint id it needs to grant a new reader client-side",
+      "detail": "The record ACL and wraps are keyed by raw endpoint ids, so `client grant --identity carol` must resolve `carol` to her EndpointId. The protocol deliberately withholds that from group admins: `ListIdentityNames` returns names only and endpoint ids are service-admin-only via `ListIdentities` (docs/protocol.md section 5, crypto-design.md section 7). `GroupAcl` returns `(name, perms)` for existing members only. So the flow the brief centres on - a reader-admin adding a reader without the operational key - only works for service admins, who could use server-side `Grant` anyway. Separately, step 8 never checks that every ACL entry in a submitted record is a registered identity; `group_acl` needs `identity.id`, so an unregistered id makes step 7 fail with an opaque rollback.",
+      "fix": "Add `ResolveIdentity {group, name}` -> `Identity {endpoint_id}` gated on `admin` of `group` (the same disclosure step `ListIdentityNames` + `Grant` already take, now returning the public key) and note the widened disclosure in crypto-design.md section 7. In step 8 add 'every `acl` endpoint id is a registered identity, else `Failed{reason}`'."
+    },
+    {
+      "severity": "major",
+      "title": "The existing startup backfill will abort `serve` after migration",
+      "detail": "`Bunker::backfill_reader_wraps` runs on every authoritative start (src/main.rs serve path) and iterates `Store::missing_reader_wraps`, which lists every `(group, group_dek.version, reader)` with no `dek_wrap` row. After migration the epoch generation has `group_dek` rows and no `dek_wrap` rows at all, so the backfill calls `unwrap_dek` -> `dek_wrap(gid, v, 'operational')` -> `None` -> error, and `serve` exits before mounting anything. It would also re-mint the legacy reader age wraps the migration just deleted. The design says the migration takes the backfill's slot but never says the backfill goes away.",
+      "fix": "Delete `backfill_reader_wraps` and `missing_reader_wraps` in phase 1 (their premise - reader age wraps - no longer exists), and add a store test that a migrated database boots twice."
+    },
+    {
+      "severity": "major",
+      "title": "Mode-B revocation is fail-open until a human mints",
+      "detail": "crypto-design.md section 2 promises that revoking `read` 'additionally rotates the group DEK in the same transaction, so nothing written after the revocation is protected by a key the revoked identity ever held', and section 7 repeats it. In mode B the server cannot mint, so `RemoveIdentity` authors a `carry` tombstone, sets `needs_rotation`, and keeps accepting `PutSealed` under the generation the kicked key still holds. Anyone holding a stolen replica or DB copy plus the kicked key reads every new write until an admin notices the `!` marker.",
+      "fix": "Fail closed: while `needs_rotation = 1`, answer `PutSealed` (and `Put`) with `Failed{reason: \"group needs rotation after a revocation\"}` and surface it in `GroupStatus`; or document in section 2 that mode B downgrades this guarantee to 'until the next admin mint'."
+    },
+    {
+      "severity": "major",
+      "title": "`--with-history` cannot be implemented with the specified protocol",
+      "detail": "Sections 4.1 and 11.2 offer re-encrypting retained versions, but no request returns a non-current version's ciphertext: `ListSealed` is 'current versions with ciphertext', `GetSealed` returns the current `Sealed`, and `Get` has no version parameter (which 4.1 itself points out). The server accepts a superset of current rows in 6c, but the client has nothing to feed it. It is also beyond the ask.",
+      "fix": "Drop `--with-history` and the superset clause in 6c; if history re-encryption is ever wanted, add a `ListSealed {..., history: true}` variant then."
+    },
+    {
+      "severity": "minor",
+      "title": "V4 as written rejects every server-authored genesis",
+      "detail": "V4: 'Genesis: `author` in admins(acl). Later: ... or `author == ctx.authoritative`'. The authoritative alternative only applies to later epochs, yet V9(a) permits server-authored genesis and the migration, mode-A `CreateGroup` and the `dek_mode` story depend on it. The server is never in any ACL.",
+      "fix": "V4 genesis: `author` in admins(acl) or `author == ctx.authoritative` (subject to V9(a))."
+    },
+    {
+      "severity": "minor",
+      "title": "R0 rejects every reconnect because the `Hello` manifest ships the full chain",
+      "detail": "Section 9 says the manifest 'ships the full chain per group' while R0 says 'received records must start at `local_head + 1` (or at 1 on first sight)'. On any reconnect after the first, a replica with local head N receives records 1..M and, as written, rejects the group. It also re-verifies N DLEQs per group per resync if it simply re-walks from genesis.",
+      "fix": "R0: records with `epoch <= local_head` must byte-match the stored record's hash (this is the fork check of R0') and are skipped; verification starts at `local_head + 1`. Better, make `Hello` honour a per-group `have` list so the manifest ships only the tail."
+    },
+    {
+      "severity": "minor",
+      "title": "V11 lets an admin's fast clock block server-authored epochs, including the unblockable `RemoveIdentity`",
+      "detail": "V11 requires `at >= prev.at`. A client-authored epoch stamped from a laptop an hour ahead makes every server-authored epoch fail V11 for an hour - including the `RemoveIdentity` tombstone that crypto-design.md says must always win, and the migration/`db grant` paths.",
+      "fix": "Either drop V11 (ordering is already given by `epoch`/`prev`) or have every author stamp `at = max(now, prev.at)` and state that `at` is informational."
+    },
+    {
+      "severity": "minor",
+      "title": "Replica read paths and request dispatch are under-specified",
+      "detail": "R4 is labelled 'unchanged', but `apply_group_state` in src/replica.rs filters fetched secrets by `state.deks` versions (`wrapped_versions`), which is always empty in sync/2; the filter must be rewritten to 'dek_version opened by a stored or just-received record'. `server::read_secret` takes an `age::x25519::Identity` and a `dek_wrap` recipient; both callers need a dispatch on `group_dek.epoch` and the replica needs its Edwards scalar instead. `ReplicaServer::dispatch` matches `Request` exhaustively, and the design only says new mutations answer `ReadOnlyReplica`: it does not say whether `GroupStatus`, `GroupEpochs`, `GetSealed`, `ListSealed` are served from the mirror (natural for `client epoch log` against a replica).",
+      "fix": "State the replica behaviour per new variant (serve the four reads from the mirror, redirect the rest), rewrite the undecryptable filter in terms of epoch records, and give `read_secret` a `DekOpener` enum (`LegacyAge{identity, recipient}` | `Epoch{scalar, point}`)."
+    },
+    {
+      "severity": "minor",
+      "title": "A `Delete` racing a kick cannot converge under the `StaleVersions` contract",
+      "detail": "Step 7 rolls back when a staged `(secret, version)` row no longer exists and reports `StaleVersions{names: current - staged}`, but a deleted secret is not in `current`, so its name is never reported; the client refetches nothing and resubmits the same set, or if it guesses the name `GetSealed` answers the uniform `Denied` for a nonexistent secret and the CLI reads that as an authorization failure.",
+      "fix": "The server cannot drop those leaves itself (the digest is signed), so report them: `StaleVersions{names, gone}` where `gone` lists staged secrets that no longer exist; the client drops those leaves, recomputes `reencrypted`, re-signs and resubmits. Treat a staged row whose secret is gone as non-fatal for the coverage check (it cannot be current)."
+    },
+    {
+      "severity": "minor",
+      "title": "Mirror reset and `EpochRejected` handling are left optional but are the only recovery path",
+      "detail": "R0/R0' reject a rewound or forked chain and keep the mirror; the fix is `db drop-group --db mirror.sqlite --group g`, which does not exist (`DbCmd` has Grant/AuditVerify/Generate/Export; `Store::drop_group_local` is internal), and the k8s operator embeds `Replica` with no API to reset a group or the mirror. Section 10 makes the `Degraded/ChainRejected` condition optional, but a group stuck on a rejected chain keeps serving stale `BunkerSecret`s with `Ready=Synced` indefinitely - exactly what the existing staleness reporting exists to prevent.",
+      "fix": "Add `db drop-group` and a `Replica::reset_group(name)` API; make the operator emit a `ChainRejected` condition (and metric) whenever `EpochRejected` fires; document the authoritative-restore runbook step for k8s (delete the mirror PVC or call the reset)."
+    },
+    {
+      "severity": "minor",
+      "title": "Scope is larger than the ask; several pieces are dead or optional",
+      "detail": "The ask is admin-driven kick + key roll, verifiable and attributable. Mode B brings `GetSealed`/`ListSealed`/`PutSealed`, tombstones, `needs_rotation`, loss of write-only writes and service-admin read, a `recover` rewrite, and the `carry` shape (needed mainly for mode B, since V9(d) lets the server author w/a edits in mode A). `--with-history` is unimplementable (above). The 11.2 clause 'the server rejects if legacy versions make it higher, returning the expected value' is dead after migration because every generation since epoch 1 is registered through an epoch, so `MAX(group_dek.version) == head.dek_version` always.",
+      "fix": "Ship phases 0-3 (mode A, client-side kick/rotate/grant, epoch log, sync/2 replica verification) as the deliverable for the ask; keep mode B as a documented follow-up with its own design pass, and remove the dead clause and `--with-history`."
+    }
+  ],
+  "strengths": [
+    "Keeps `group_dek.version` as the single generation counter so `secret_version.dek_version` and `crypto::secret_aad` are untouched; in-place re-encryption recomputes the AAD with the new `dek_version` correctly.",
+    "Storing and hashing the author's exact `body` bytes sidesteps canonical CBOR entirely and matches how `ciborium` is used here.",
+    "Wire changes are additive on both ALPNs; new response variants only answer new requests, so the Go client and v1 CLIs are unaffected in mode A, and the design correctly bumps the sync ALPN rather than mutating sync/1.",
+    "Correctly identifies the exhaustive matches that must grow (`Bunker::touched_groups`, `ReplicaServer::dispatch`, operator `events.rs`) and that `reconcile.rs` already compares content hashes so a re-encryption storm is a no-op.",
+    "Reuses the `(current_version, dek_version, nonce)` discriminator so replicas detect in-place re-encryption without protocol surgery.",
+    "The DLEQ algebra checks out and every dalek API named (`VerifyingKey::to_edwards`, `SigningKey::to_scalar`, `MontgomeryPoint::to_edwards(sign)`, `is_torsion_free`, `vartime_double_scalar_mul_basepoint`, `Scalar::from_hash`) exists in the pinned ed25519-dalek 3.0 / curve25519-dalek 5.0; `hkdf` 0.12 is in the lock file.",
+    "Backup-key sign resolution (`M = c_bk -/+ a_bk*c0`) is right for an X25519 key re-read on Edwards, and clamped scalars land in the prime-order subgroup so pinned points are torsion-free by construction.",
+    "Phase 1 and 2 coupling (empty `deks` breaks sync/1 replicas) is spotted and the upgrade order matches how the operator already tolerates an ALPN gap."
+  ],
+  "verdict": "Not plannable as written. Two contradictions sit at the core of the verifiability claim: V9 makes mode-B orphan recovery impossible (and any exception hands a hostile server a two-step escalation), and V4 binds every server-authored record - including every migrated genesis - to the current endpoint id, so a documented endpoint-key rotation bricks chain verification for all replicas. Below that, the client re-encryption path does not work at the sizes the design quotes (staging keyed by a hash that depends on all the ciphertext; 4 MiB secrets exceed `MAX_MSG` in the sealed variants), existing handlers silently change from O(1) rotations to full re-encryption under the global store lock, the startup backfill aborts `serve` after migration, and a non-service-admin admin cannot even learn the endpoint id needed to grant a reader. Fix those, cut mode B and `--with-history` to a follow-up, and the remaining structure (epoch table, verbatim records, unchanged AAD and generation counter, additive wire changes, replica verification from the head record) is a sound fit for this codebase. Full critique: /private/tmp/claude-502/-Users-dragan-fables-for-robots-secret-bunker-iroh/0c07f4bd-a1ff-4066-aa31-2b8de0a5ded7/scratchpad/critiques/systems-impl-fit.json"
+}

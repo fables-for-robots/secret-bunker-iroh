@@ -1,0 +1,192 @@
+{
+  "placeholders": [
+    "Header: 'Status: draft, awaiting user review'; section 18 lists 13 open questions whose answers 'change the spec'. Q2 (does the Go client call Grant/RotateDek), Q5 (history on rotation: (a)/(b)/(c)), Q7 (recovery requires the backup key) and Q13 (keep the legacy Grant shrink path) each change task lists; a plan cannot be finalised until they are answered.",
+    "Section 6.3: '(Whether the Go client needs either is Q2.)' - whether legacy Grant/RotateDek must keep working for the Go client is left open.",
+    "Section 7.2 (mode E): `PutSealed{...}` has a field list but `Sealed{...}`, `StaleEpoch`, 'a short write fence while a rotation stage is open', 'per-version plaintext commitments (signed puts)' and 'client-submitted genesis' are one-line hand-waves, yet section 1 claims mode E is 'fully specified by the same record format and its extra rules'.",
+    "Section 9 `Epochs` and section 10 `epochs` are 'byte-budgeted' with no number; `ExportGroup.limit` has no stated unit (rows vs bytes).",
+    "Section 5 S8: 'Verified records and the DEK per (group_id, dek_commit) are cached in memory (zeroized on evict)' - no cache bound or eviction policy.",
+    "Section 10 P1: 'back off until the next Changed/resync' - no backoff parameters, no metric, no cap.",
+    "Section 6.5: the log line prints `alice(1a98...)` and `-bob(r)` but nothing says where a non-admin reader running `client epoch log` obtains id-to-name mappings (`GroupAcl` returns names without ids; `ResolveIdentity` is admin-only).",
+    "Section 11: 'exit 2 on a persistent EpochConflict' - 'persistent' (retry count / rebase policy) is undefined.",
+    "Section 13: golden vectors 'via a test hook' for fixed m/r_i/hedge bytes - the hook is unnamed and unlocated, though it is the shared fixture for the Go implementation.",
+    "Section 5 S1-S8 and E/C/R/A/G: `Failed{reason}` strings are given only for S6 ('no-op epoch') and the legacy Grant path; every other rejection reason is unspecified.",
+    "Section 8: `ReplicaEvent::EpochRejected{group, epoch, reason}` and `Status{mode, last_rotate_epoch, last_rotate_author, last_rotate_at}` have no field types (string vs u8, nullable when never rotated)."
+  ],
+  "contradictions": [
+    {
+      "where": "Section 5 C1 and R2 ('genesis: dek_gen = 1') vs section 12 step 2 ('dek_gen = MAX(group_dek.version) + 1') and section 8 ('`version` continues the same counter').",
+      "detail": "Any migrated group whose DEK was ever rotated (every group that ever had a read revoked, or RemoveIdentity, or RotateDek) gets a genesis with dek_gen >= 2. C1 and R2 both require genesis dek_gen = 1 and are run by every replica (P2: 'Verify every received record with E/C/R/A/G') and every offline auditor, so the migrated genesis is rejected everywhere except by the authoritative node that must skip its own rule to store it. Section 12 step 4 ('replicas resync from genesis and pin it') therefore fails for exactly those groups.",
+      "resolution": "Relax C1/R2 to 'genesis: dek_gen >= 1' (non-genesis records step by at most one, as R2 already says) and have section 12 state the starting value; or restart the counter at 1 at migration, in which case section 12 must delete the old group_dek rows before inserting the new one (PK (group_id, version) collision) and section 3.4 must note that the AAD's dek_version restarts under a fresh DEK."
+    },
+    {
+      "where": "Section 16 ('Phases 1 and 2 are one release'; SubmitEpoch/epochflow/CLI/TUI are phase 3) vs section 6.3 (legacy additive `Grant` and `RotateDek` answer `Failed{reason: \"signed epochs: use a signing client\"}`) and D4/A3 (the authority may not author additive records; phase-2 replicas reject them).",
+      "detail": "After the phase 1+2 release, no identity can be granted read on any group and no DEK can be rotated: the server refuses to author it, and the only party allowed to author it (an admin with a signing client) does not exist until phase 3 ships. Section 17's first success criterion is unreachable on that release, and any incident requiring a rotation between the two releases has no path.",
+      "resolution": "Either move `ExportGroup`/`StageVersions`/`SubmitEpoch` plus the `rewrap` and `rotate` client flows into the phase 1+2 release (phase 3 then only adds `kick`/TUI polish), or state that phase 1 keeps today's server-authored additive Grant/RotateDek behind a flag and that phase-2 replicas accept authority-authored additive records until phase 3 - and say which, because the second option re-opens the D4 threat for one release."
+    },
+    {
+      "where": "Section 6.4 ('operational-key replacement' is a recovery trigger; 'the service is never stopped'; 'one recovery per group replacing `authority`') vs section 5 S2 ('The configured `authority`/`backup` ids equal the record's'), S5 ('the server opens its own wrap, checks dek_commit') and section 8 meta (`operational_ed25519` is one server-wide value).",
+      "detail": "Attack/failure sequence: the operator suspects operational-key compromise, authors a recovery for group g with `--authority <new>` `--rotate`, and submits it over the wire. S2 rejects it (the record's authority differs from the configured id). If S2 is skipped, S5 rejects it (the running server holds only the old operational secret and cannot open the wrap addressed to the new authority). If both are skipped, the server can no longer serve `Get`/`Put` on g until restarted with the new key, contradicting 'never stopped'. Because `authority` is per group and `operational_ed25519` is per server, a group-by-group replacement leaves the server unable to satisfy S2 for old and new groups at once.",
+      "resolution": "Specify the authority-replacement procedure: S2's configured-id equality applies to genesis only; `serve` accepts one or more operational keys (`--operational-key` repeatable, or `--next-operational-key`), S5 and `read_secret` open the wrap with whichever configured key matches the head's `authority`, and `meta.operational_ed25519` becomes a list. Or drop 'the service is never stopped' for this trigger and describe the stop/restart."
+    },
+    {
+      "where": "Section 4.3 (`reencrypted` = 'digest of the installed ciphertext set') vs section 5 S4 ('its digest equals `reencrypted` (computed by the server over the staged set as submitted)'; 'Rows staged for a version deleted meanwhile are ignored'; stragglers 're-encrypted by the server itself at commit') and D11.",
+      "detail": "With one straggler Put or one Delete inside the client's window the installed set differs from the staged set, so the signed `reencrypted` can equal at most one of them. Section 4.3's definition makes the field an auditor-recomputable commitment; S4 makes it a commitment to bytes the auditor never sees. It is also unspecified whether rows staged for a version deleted meanwhile are part of the server's digest ('as submitted' says yes, 'ignored' says no).",
+      "resolution": "Define `reencrypted` as the digest over the staged rows exactly as received (including rows for versions deleted meanwhile) and store the digest of what was actually installed (stragglers included, deleted rows excluded) in a separate `group_epoch.installed_digest` column and in the `epoch-submit` audit row; rewrite section 4.3 accordingly. Alternatively forbid stragglers in mode A too (the write fence section 7.2 already prescribes for mode E) so the two sets are identical."
+    },
+    {
+      "where": "Section 8 schema: `ALTER TABLE secret_group ADD COLUMN group_uid BLOB UNIQUE;`.",
+      "detail": "SQLite rejects ADD COLUMN with a UNIQUE constraint ('Cannot add a UNIQUE column'). The v2->v3 migration as written fails on every existing database, authoritative and replica alike; store.rs's v1->v2 migration shows the pattern actually needed (rebuild or index).",
+      "resolution": "`ALTER TABLE secret_group ADD COLUMN group_uid BLOB;` followed by `CREATE UNIQUE INDEX IF NOT EXISTS secret_group_uid ON secret_group(group_uid) WHERE group_uid IS NOT NULL;`, with the ALTERs guarded by `pragma_table_info` as in `migrate()`."
+    },
+    {
+      "where": "Section 10 ('Message names are kept'; only `Group` and `FetchGroup` change shape; 'The `Hello` manifest ships records since each group's pinned head') vs sync.rs (`SyncRequest::Hello` is a unit variant) and section 5 C1 ('a verifier with either [a head or a pin] MUST NOT accept a genesis') vs P1/P3 (the pin survives `drop_group_local`).",
+      "detail": "Two failures. (1) The authoritative node cannot know a replica's pinned head from a unit `Hello`, so 'since the pinned head' is unimplementable; it can only ship whole chains, which conflicts with 'byte-budgeted'. (2) A replica revoked from g drops g under P3 but keeps its pin under P1; when re-granted it receives the chain from genesis (first sight from the server's point of view), and C1 as worded forbids it from accepting that genesis, so the group can never be re-mirrored without an operator pin reset.",
+      "resolution": "Give `Hello` a body: `Hello{have: [{group, have_epoch}]}` (old replicas are not served anyway - v1 fails at ALPN), or make the manifest chain-less and let the replica drive `FetchGroup{group, have_epoch}` per group. Reword C1: a verifier holding a pin for `name` accepts a genesis only if its hash equals `group_pin.genesis_hash`, and the chain that follows must pass through `(head_epoch, head_hash)`."
+    },
+    {
+      "where": "Section 6.4 step 3 ('any registered identity: client epoch submit --bundle g.recovery (S1 exception; staged like 6.1)') vs section 9 table (`StageVersions{...}` requires `admin`).",
+      "detail": "A recovery that removes a recipient MUST be a rotate (G4/R6) and therefore needs its re-encrypted set staged before `SubmitEpoch`. In the two main recovery triggers (orphaned group: no admins; hijacked group: the admins are the adversary) nobody who may call `StageVersions` can be trusted or exists, so the flow cannot complete. The S1 exception was extended to `SubmitEpoch` but not to `StageVersions`.",
+      "resolution": "Gate `StageVersions` on 'admin on `group`, or any registered identity' with the byte cap and TTL as the abuse bound, and enforce admin only at `SubmitEpoch` for non-recovery kinds; or require the recovery bundle to be submitted by a service admin (mode A) and say so in section 6.4 and section 9."
+    },
+    {
+      "where": "Section 6.1 step 5 ('StageVersions ... in <= 3.5 MiB chunks') vs section 9 (read bound `MAX_MSG + 64 KiB`, 'so that a cap-sized secret's ciphertext fits inside an Export/StageVersions envelope') and section 13 e2e (4) ('A cap-sized secret ... through kick, staging and sync').",
+      "detail": "`proto::MAX_MSG` is 4 MiB; the existing test `a_maximum_size_secret_syncs_to_the_replica` (tests/e2e.rs:2046) writes a value of exactly MAX_MSG minus the Put envelope. Its ciphertext (value + 16 bytes) is ~4 MiB and cannot be placed in any chunk bounded by 3.5 MiB, so 6.1 step 5 and e2e (4) cannot both hold.",
+      "resolution": "State the chunking rule as 'chunks of <= 3.5 MiB, or a single `SealedVersion` when that one alone is larger; a single version always fits `MAX_MSG + 64 KiB` because `Put.value` is capped' - and add the `Put.value` cap that section 9 assumes exists (see the next entry)."
+    },
+    {
+      "where": "Section 9 ('`Put.value` stays capped at the handler') vs server.rs `put()` (no length check on `value`; the only cap is `recv.read_to_end(proto::MAX_MSG)` at server.rs:1019), and section 9 raising only 'the server's per-stream read bound' vs client.rs:54 and replica.rs:391 (`read_to_end(proto::MAX_MSG)`).",
+      "detail": "There is no handler-level cap today. Raising the server's read bound to `MAX_MSG + 64 KiB` without adding one silently raises the maximum secret size by 64 KiB and invalidates the 'cap minus envelope' sizing that the sync-frame headroom test relies on. Separately, an `Export` reply carrying one cap-sized version (ciphertext + SealedVersion metadata + envelope) exceeds `MAX_MSG`, and the client reads replies with `read_to_end(MAX_MSG)`, so the flow in 6.1 step 3 fails on exactly the secret e2e (4) tests.",
+      "resolution": "Add a named handler cap (`MAX_VALUE = MAX_MSG - 64` or similar) to `Bunker::put` and document it in docs/protocol.md; raise the client's response read bound (and the replica handler's request bound, if it serves any new read) to the same `MAX_MSG + 64 KiB`; state both in section 9."
+    },
+    {
+      "where": "Section 6.3 (`RemoveIdentity`, mode A: 'authors one record per group the identity had a row on: mode A -> `rotate`') vs section 13 Server tests ('`RemoveIdentity` -> one rotate per readable group and a carry for w-only rows in one transaction') and section 4.1 kinds table (`carry` by authority = shrink).",
+      "detail": "The same operation is specified to produce two different record sets. Under 6.3 a group where the removed identity held only `w` is rotated (fresh M, every retained version re-encrypted) for no key-material reason; under 13 it gets an authority `carry`. Store/server tests written from 13 fail against an implementation of 6.3 and vice versa.",
+      "resolution": "Adopt section 13's version in 6.3: `rotate` for every group where the identity was a recipient (held `r`), authority `carry` for groups where it held only `w`; both in the `RemoveIdentity` transaction."
+    },
+    {
+      "where": "Section 10 ('`Replica`/`ReplicaBuilder` API unchanged apart from `expect_keys` and the additive `ReplicaEvent::EpochRejected`') vs P4 ('the operator resets with `db drop-group ...` or `Replica::reset_group`').",
+      "detail": "`Replica::reset_group` does not exist (replica.rs public API: builder, subscribe, get, list, groups, status, protocol_handler, handle_raw, handle; ReplicaBuilder: store_path, secret_key, authoritative, authoritative_addrs, endpoint). It is a second API addition that the same section says is not there, and the operator would need a way to call it (no flag or HTTP endpoint is named).",
+      "resolution": "Either list `Replica::reset_group(&self, group) -> Result<()>` in the API delta and say how the operator exposes it, or delete the mention and make `db drop-group` (with a pin reset, see ambiguities) the only reset path."
+    },
+    {
+      "where": "Section 4.1 kinds table (`genesis`: 'who authors: `authority`') and section 5 A1 (`genesis`: `author == authority`) vs section 7.2 and 6.3 ('Client-submitted genesis is the mode-E creation path').",
+      "detail": "Section 1 claims mode E 'is fully specified by the same record format (one field) and its extra rules'. With A1 as written a client-authored genesis is unverifiable in either mode, so the mode-E creation path is not specified at all.",
+      "resolution": "Add to section 7.2's extra rules: 'mode E genesis: `author` is any registered identity that appears in `acl` with the admin bit; S1 applies; A1's authority requirement is mode A only'."
+    },
+    {
+      "where": "Section 5 S6 ('A record that changes nothing (same ACL, same recipients, not a rotate) is refused') vs section 6.4 (recovery triggers include `authority` replacement) in mode E (pinned = {backup}).",
+      "detail": "In mode E `authority` is not a recipient, so a recovery that only replaces `authority` (the operational-key-compromise response) changes neither the ACL nor the recipient set and is refused by S6.",
+      "resolution": "Exempt `kind = recovery` from S6, or define 'changes nothing' as 'same ACL, same recipients, same `authority`/`backup`/`mode`, not a rotate'."
+    },
+    {
+      "where": "Section 3.1 'Version traps': 'curve25519-dalek 5 binds `Scalar::random`, `Scalar::from_hash` and `hash_to_curve` to rand_core 0.9/digest 0.11'.",
+      "detail": "Cargo.lock: curve25519-dalek 5.0.0 depends on `rand_core 0.10.1` (optional feature) and `digest 0.11.3`; there is no rand_core 0.9 anywhere in the tree (only 0.6.4 via rand 0.8 and 0.10.1). Also `digest` is not among dalek 5's default features, so `from_hash` would need `features = [\"digest\"]`. The workaround the spec prescribes (`from_bytes_mod_order_wide` with rand 0.8 bytes) is unaffected, but a planner adding the dependency from this paragraph will pick wrong versions/features.",
+      "resolution": "Say rand_core 0.10; note that only default features + `zeroize` are needed because SHA-512 output is fed through `from_bytes_mod_order_wide` (no `digest` feature)."
+    },
+    {
+      "where": "Section 9 ('Disclosure widening, to be recorded in `crypto-design.md` section 7') vs section 14 ('`design/crypto-design.md` sections 2 (threat model, disclosure) ...').",
+      "detail": "Two different target sections for the same text. In the current document the disclosure refinements live in section 7 (lines 429-446) and the replication-disclosure sentence in section 12 (line 697); section 2 has none.",
+      "resolution": "Pick section 7 in both places (it already holds the per-role disclosure refinements) and cross-reference from section 2 if desired."
+    },
+    {
+      "where": "Section 13 Store tests ('v2->v3 on the existing fixture databases').",
+      "detail": "No fixture database files exist (tests/ holds cli.rs and e2e.rs only); the store's schema-migration tests build v1 schemas inline (store.rs:1857 and 1931).",
+      "resolution": "Say 'on inline-built v1/v2 schemas, as store.rs's existing migration tests do', or add 'create fixture .sqlite files' as a task."
+    },
+    {
+      "where": "Section 11 TUI ('ACL pane `x`/`r`/`n` and groups pane `R` run the client-side flows') vs tui.rs:628 (`KeyCode::Char(c @ ('r' | 'w' | 'a' | 'x'))` all send `Request::Grant`).",
+      "detail": "The `w` and `a` toggles also go through the legacy `Grant`; an `a` toggle that raises the admin bit is additive and will answer `Failed` after migration unless rerouted, and `w`/`a` lowering needs a client-signed `carry`.",
+      "resolution": "List all four ACL-pane keys as rerouted: `x` and `r`-off -> 6.1 (rotate), `r`-on and `a`-on -> `rewrap`, `w` either way and `a`-off -> `carry`."
+    }
+  ],
+  "ambiguities": [
+    {
+      "where": "Section 6.1 server commit: 'update `secret_group.head_epoch`, clear `needs_rotation`' - listed for every accepted record.",
+      "detail": "Reading 1: any accepted record clears the flag. Reading 2: only a record with a new generation clears it. Under reading 1 a `rewrap`/`carry` (same M) submitted after a mode-E `RemoveIdentity` declares the group safe while the removed key still opens M, defeating the flag's purpose.",
+      "resolution": "Clear `needs_rotation` only when the accepted record has `dek_gen = head.dek_gen + 1`; say so in 6.1 and in the `epoch_stage`/`SubmitEpoch` handler description."
+    },
+    {
+      "where": "Section 4.1/4.2 (`group_id`: 32 random bytes, 'is `UNIQUE` in `secret_group`') vs section 8 (`group_epoch.group_id INTEGER ... REFERENCES secret_group(id)`, `secret_group.group_uid BLOB`) vs section 9 (`Status{group_uid, ...}`).",
+      "detail": "`group_id` denotes both the layout's 32-byte permanent identity and the SQLite integer foreign key; the column that is UNIQUE is `group_uid`. A planner mapping 'store the record's `group_id`' will pick the wrong column.",
+      "resolution": "Rename the layout field to `group_uid` and reserve `group_id` for the integer FK throughout the spec, stating the mapping once in section 8."
+    },
+    {
+      "where": "Section 6.1: 'per-group byte cap `2 x current ciphertext + 16 MiB`'.",
+      "detail": "'current ciphertext' can mean the current versions only; D6 and S4 require every retained version to be staged, so for a group with deep history the cap would sit below the mandatory stage size and every rotation would fail.",
+      "resolution": "Define the cap over the sum of all retained `secret_version.ciphertext` bytes of the group (the same quantity 6.1 calls 'total retained ciphertext' two lines earlier)."
+    },
+    {
+      "where": "Section 6.1: stage rows 'expire (15 minutes, swept on the next stage/submit for the group)'; `epoch_stage.staged_at` is per row.",
+      "detail": "Reading 1: 15 minutes from the first `StageVersions` of the stage (a large group over a slow link expires mid-upload and the submit fails S4). Reading 2: 15 minutes idle since the last `StageVersions`. Reading 3: per row, so early rows expire while late rows are still arriving and coverage silently fails.",
+      "resolution": "Idle TTL per stage: a stage expires 15 minutes after `MAX(staged_at)` over its rows; sweep whole stages, never individual rows."
+    },
+    {
+      "where": "Section 9 'Requires' column vs today's `authorize_group(store, ident, group, needed, ident.service_admin)` bypass on the authoritative node; section 7.3 ('Service admin ... nothing unless granted'); section 6.3 (legacy Grant shrink 'with the audit row naming the requesting admin').",
+      "detail": "Only `ExportGroup` says '(mode A: also service admin)'. It is unclear whether the implicit service-admin bypass applies to `GroupStatus`, `GroupEpochs`, `ResolveIdentity`, `StageVersions` and the legacy `Grant` shrink path. The spec also never states the behaviour change it implies: a service admin without an explicit admin row can no longer add a reader to, or rotate, a group it did not create (crypto-design.md section 7 currently says 'a service admin is root').",
+      "resolution": "Add a 'service-admin implicit?' column to the section 9 table (yes for GroupStatus/GroupEpochs/ExportGroup/ResolveIdentity in mode A, no for StageVersions/SubmitEpoch which are keyed to `author`), and state in section 7.3 and section 18 that service admins keep shrink-only power (legacy Grant, RemoveIdentity) and need an explicit admin row (via a group admin's rewrap or a recovery) for additive changes."
+    },
+    {
+      "where": "Section 9 `SealedVersion = {name, version, dek_gen, nonce, ciphertext, created_at, created_by}` used by `StageVersions`, vs section 8 `epoch_stage` (no `created_at`/`created_by` columns) and the 6.1 commit (`UPDATE secret_version SET dek_version, nonce, ciphertext`).",
+      "detail": "Reading 1: the server ignores the two fields on staging. Reading 2: it validates them against the existing row and refuses on mismatch. Reading 3: they must be absent. Each yields a different handler and a different golden vector.",
+      "resolution": "Reading 1: the server ignores them; document `SealedVersion` as 'created_at/created_by are informational on input; a rotation never changes a row's provenance'."
+    },
+    {
+      "where": "Section 6.4: `recovery author ... [--acl id:rwa ...]`.",
+      "detail": "Reading 1: the listed entries replace the ACL wholesale (needed to evict a rogue admin). Reading 2: they merge into `head.acl` (needed to add an admin to an orphaned group without retyping the roster). The two readings give different records for the same command line.",
+      "resolution": "No `--acl` => `head.acl` unchanged; any `--acl` => the listed entries are the entire ACL. Add `--keep-acl` if merging is wanted."
+    },
+    {
+      "where": "Section 10 P1 ('`group_pin` ... survives `drop_group_local`') vs P4 ('the operator resets with `db drop-group --db mirror.sqlite --group g`').",
+      "detail": "If `db drop-group` only drops the mirror, the pin survives and the rewound chain is rejected again (reset does nothing). If it also clears the pin, the survival guarantee P1 relies on is bypassed by a routine command with no audit trail.",
+      "resolution": "`db drop-group` drops the mirror only; add `db reset-pin --group g` (or `--reset-pin`) that clears `group_pin` and audits `pin-reset`; P4 names the latter."
+    },
+    {
+      "where": "Section 10: 'a `ChainRejected` condition on affected `BunkerSecret`s'.",
+      "detail": "The operator publishes a single condition type `Ready` with reasons (`StaleReplica`, `AccessRevoked`, `MissingGroup`, ...; reconcile.rs:138, operator/README.md:60). `ChainRejected` could be a new condition type or a new reason.",
+      "resolution": "`Ready=False/ChainRejected`, published on transition like the existing reasons; add it to the README table."
+    },
+    {
+      "where": "Section 5 S3 (`EpochConflict` when C2 fails under the lock) and S8 (E/C/R/A/G run outside the lock first).",
+      "detail": "A `prev`/`epoch` mismatch detected in the pre-lock pass is a C rule failure ('The first failing rule rejects the record') and could answer `Failed`, while the same mismatch under the lock answers `EpochConflict`. Clients retry differently on the two.",
+      "resolution": "Any C2 mismatch answers `EpochConflict{head_epoch, head_hash}` wherever it is detected; `Failed` is reserved for rules other than C2."
+    },
+    {
+      "where": "Section 5 S4/S5 identify staged rows by `(name, version)`; store.rs `delete_secret` deletes the `secret` row (cascading its versions) and `put_secret` restarts a re-created name at version 1.",
+      "detail": "Failure sequence: admin exports g; a writer deletes `db-password` (version 3) and re-creates it (new version 1); the admin's staged `(db-password, 1)` now refers to a different row; S5 decrypts the replaced row under the old DEK, finds a different plaintext, and refuses the record. A writer that keeps deleting and re-creating stalls every rotation, and 'rows staged for a version deleted meanwhile are ignored' does not cover a re-created version.",
+      "resolution": "Key staged rows additionally by the exported `created_at` (or the `secret.id`), and treat a staged row whose key no longer matches as absent (the re-created row is then a straggler the server re-encrypts under S4)."
+    },
+    {
+      "where": "Section 3.5 hedged nonce: `k_i = H(... || r_i || SHA-512(T without commitments) || OsRng 32 bytes)`.",
+      "detail": "Whether the 32 random bytes are drawn once per proof or once per `i` is unstated; it changes the golden-vector test hook and the constant-time budget.",
+      "resolution": "Draw once per `i`; the test hook supplies an array of n 32-byte hedges."
+    },
+    {
+      "where": "Section 9 (`Epochs` 'byte-budgeted; page by the last returned epoch'; `ExportGroup{..., limit}`) and section 10 (`epochs` 'byte-budgeted').",
+      "detail": "No budget is given; `limit` read as a row count can overflow the frame when rows are cap-sized, read as bytes it conflicts with 'pages'.",
+      "resolution": "`Epochs` budget = `MAX_MSG`; sync `epochs` budget = `SYNC_MAX_MSG`; `ExportGroup.limit` is a row count that the server clamps so the encoded reply fits `MAX_MSG + 64 KiB` while always returning at least one row."
+    },
+    {
+      "where": "Section 6.1 step 8 ('otherwise restart at 2') after `EpochConflict`.",
+      "detail": "If the intervening record was a `rewrap`/`carry`, `dek_gen` and M are unchanged and the staged rows are still valid (same AAD, same DEK); restarting at step 2 re-uploads 2x the group for nothing. If it was a `rotate`, the stage is invalid and must be rebuilt.",
+      "resolution": "Restart at step 6 (re-sign against the new head, reuse `stage_id`) when `head.dek_gen` is unchanged; restart at step 2 otherwise."
+    }
+  ],
+  "missing_for_planning": [
+    "`Request::op()` / `Request::target()` audit names for `GroupStatus`, `GroupEpochs`, `ResolveIdentity`, `ExportGroup`, `StageVersions`, `SubmitEpoch`, plus arms for all six in `Bunker::touched_groups` (server.rs:231, exhaustive by design - the spec mentions only `SubmitEpoch`) and in the replica's exhaustive `dispatch` (replica.rs:336): which of the new reads a replica answers from its mirror (GroupStatus/GroupEpochs plausible; ExportGroup and ResolveIdentity unclear).",
+    "Rule-to-reply mapping: which verifier rules answer `Denied` (S1 per section 13), `Failed{reason}` (A2 per section 13, S4-S7) or `EpochConflict` (C2/S3), and the exact `reason` strings, so tests and the Go client can match them.",
+    "Client-side pin storage for `epochflow` (6.1 step 1 'verify the tail against the local pin'): file location under the XDG data dir, format, keyed by server EndpointId + group_uid, TOFU on first sight, and what `client kick` does when the pin disagrees with the server (fork on the client side).",
+    "`init` for a fresh v3 database: new flags (`--operational-key` Ed25519 file, `--backup-id <hex>`), whether it writes `epochs_migrated = 1`; `KeyRole::filename()` changes (`operational.age`/`backup.age` -> `operational.key`/`backup.key`), removal of `KeyRole::is_age`, and what `key show/export/import` do for the archived age keys; whether `db migrate-epochs --mode E` is refused while mode E is unbuilt.",
+    "Field types for `ReplicaEvent::EpochRejected{group, epoch, reason}`, `Status{mode, last_rotate_epoch, last_rotate_author, last_rotate_at, needs_rotation}` (nullable when never rotated?), `stage_id` (bstr of 16) and `Epochs.head_epoch`.",
+    "Operator CLI flag and env-var names behind `ReplicaBuilder::expect_keys` (e.g. `--expect-authority-id`/`BUNKER_EXPECT_AUTHORITY_ID`), how the chart maps `bunker.expectAuthorityId`/`bunker.expectBackupId` to them, and the label set of `bunker_epoch_rejected_total`.",
+    "E1's `name` limit (<= 255 bytes): no group-name length check exists today (`create_group` in server.rs/store.rs validates nothing); `CreateGroup` must gain one and `db migrate-epochs` must say what it does with a longer existing name (refuse, like an invalid EndpointId?).",
+    "`revoked_identity` lifecycle: when a row is deleted (at the apply that drops the id from its last head?), whether the sync `revoked` list is persisted on the replica (the ACL projection is rebuilt from the head record on restart, so an unpersisted filter silently re-admits the id), and where the replica stores it.",
+    "Replica mirror v2->v3: what happens to a mirror's pre-migration `dek_wrap`/`group_dek` rows and `secret_group.group_uid` (P1-P6 replace apply rules 1-3 that managed them); whether the v3 store migration drops them on a `role = replica` database.",
+    "A name source for `client epoch log`/`epoch status` on the client side (ids -> names) for non-admin readers: extend `Epochs`/`Status` with a `names` map like sync's, or make `GroupAcl` return endpoint ids to admins.",
+    "The exact record size: the layout sums to about 356 bytes + name length (+ 64 sig), not the '~250' of section 4.1; needed for the `Epochs`/sync byte budgets and the 50-recipient estimate.",
+    "New `Bunker::new` signature (Ed25519 operational key instead of `age::x25519::Identity`; server.rs:64, called from main.rs:762 and tests/e2e.rs `spawn_authoritative`) and the replacement of `ReplicaInner::age_identity` (replica.rs:83) by an Ed25519 scalar for wrap opening.",
+    "The golden-vector test hook API (name, module, how fixed `m`/`r_i`/hedge bytes are injected without leaking into release builds) since it is the shared fixture for the Go implementation.",
+    "Handling of a recovery bundle whose chain the submitting server does not have in full (bundle exported from a replica or from an older snapshot): does `SubmitEpoch` for a recovery require `prev == hash(head)` like every other record (C2) - if so, section 6.4's 'restore from an old snapshot' cases need a step.",
+    "Stage semantics when a second `stage_id` arrives from the same submitter for the same group ('one open stage per (group, submitter)'): replace the old stage, refuse, or keep both until TTL - section 13 mentions 'replacement' without defining it."
+  ],
+  "verdict": "Not implementable as written. The cryptographic core (sections 3-4) and the verifier rule set (section 5) are precise enough to plan phase 0 today, but six contradictions block phases 1-4: every migrated genesis violates C1/R2 (dek_gen = 1 vs MAX+1); the phase 1+2 release freezes all additive grants and rotations until phase 3; recovery-with-authority-replacement cannot pass S2/S5 on a running server; `reencrypted` has two incompatible definitions (installed set vs staged set); the v3 `ALTER TABLE ... ADD COLUMN ... UNIQUE` is invalid SQLite; and sync v2's unit `Hello` cannot deliver 'records since the pinned head' while C1 blocks re-mirroring a dropped group. Below those: StageVersions gating breaks the recovery flow, the 3.5 MiB chunk rule cannot carry the cap-sized secret the spec itself tests, and the `Put.value`/client read-bound claims do not match the code. Symbol audit against the repository: present as claimed - `crypto::encrypt_secret`, `crypto::secret_aad`, `remove_identity_with_rotations`, `backfill_reader_wraps`, `Bunker::new`, `read_secret`, `authorize_group`, `apply_group_sync` (rules 1-3), `drop_group_local`, `touched_groups`, `ReplicaEvent` (exhaustive match in operator/src/events.rs:82), `state.deks` guard (replica.rs:863), `SyncDenied`, `proto::tests::wire_format_is_stable`, `a_maximum_size_secret_syncs_to_the_replica`, `operator/tests/reconcile_apply.rs`, `apply_bunker_secret` content-hash skip, `iroh::SecretKey::sign`, `MAX_MSG` = 4 MiB, exit code 2 = CAS conflict, `db grant`, `recover`, `key generate <role>`, `client.key`/`server.key`/`operational.age`/`backup.age`, all sync message names, `Failed{reason}`/`ReadOnlyReplica`/`Denied`, `AddIdentity{name,endpoint_id,service_admin}`, `ed25519-dalek 3` (`to_scalar`, `verify_strict`), `curve25519-dalek 5` (`from_bytes_mod_order_wide`, `from_canonical_bytes` -> CtOption, `is_torsion_free`, `is_small_order`, `vartime_double_scalar_mul_basepoint`), `hkdf 0.12`, `rand 0.8`, `sha2 0.10`, crypto-design.md sections 2/3/4/7/8/9/11/12. Absent or wrong: `Replica::reset_group` (presented alongside 'API unchanged'); `rand_core 0.9` (lock has 0.10.1 under dalek 5); a handler-level `Put.value` cap (none exists); 'existing fixture databases' (none; tests build schemas inline); TUI ACL keys `w`/`a` also route through `Grant`. Full JSON at /private/tmp/claude-502/-Users-dragan-fables-for-robots-secret-bunker-iroh/0c07f4bd-a1ff-4066-aa31-2b8de0a5ded7/scratchpad/review/consistency.json."
+}

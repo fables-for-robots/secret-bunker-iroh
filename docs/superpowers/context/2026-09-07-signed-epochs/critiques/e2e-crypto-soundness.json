@@ -1,0 +1,72 @@
+{
+  "findings": [
+    {
+      "severity": "critical",
+      "title": "Related/rogue recipient keys make M publicly computable; registration has no proof of possession",
+      "detail": "Plain ElGamal wraps are linear in the recipient key: c_i = M + r*A_i. Any recipient whose discrete log is publicly related to another recipient's leaks M to the WHOLE WORLD, not just to the attacker. Concrete: attacker hands a service admin the hex of -A_victim (flip the sign bit of the victim's EndpointId) as 'my endpoint id'. AddIdentity (src/server.rs add_identity) only checks iroh::EndpointId parsing; nothing proves possession. A group admin grants it read; the epoch is torsion-free, canonical, distinct ids, DLEQ passes. Then c_X + c_v = 2M and anyone holding the epoch record (stolen DB, replica DB, any client) computes M = 2^{-1}*(c_X + c_v) mod L, hence the DEK of that generation and of every acl epoch that keeps M. Same for A_X = A_u + A_v (M = c_u + c_v - c_X), A_X = 2A_v, A_X = B (M = c_X - c0), any A_X = d*B with public d. With today's age wraps this class is harmless (X25519 uses the u-coordinate, so -A_v IS the victim's recipient; A_u+A_v is a wrap nobody can open). The DLEQ verifier cannot catch the general linear-relation family, so 'the reader list is a proof' holds only for ids whose discrete log is unknown to the world, which nothing in the design establishes. The rogue id never completes an iroh handshake (verify_strict), so it looks like a dormant CI key.",
+      "fix": "Require proof of possession before an id can appear in any epoch: AddIdentity carries sig = Ed25519(sk_id, \"secret-bunker-iroh/pop/1\" || endpoint_id || bunker_endpoint_id || name), checked with verify_strict and stored on the identity row; or register only ids that have completed an authenticated connection. Defence in depth (cheap): verifier rejects small-order A_i (incl. identity) and any pair A_i == -A_j. If registration cannot change, use MuSig-style coefficients h_i = H(\"…/coef/1\" || group_id || A_1..A_n || i), c_i = M + r*(h_i*A_i), DLEQ over E_i = h_i*A_i - h_1*A_1, reader computes M = c_i - (h_i*a_i)*c0; PoP is simpler and also closes the torsion/non-canonical registration problems."
+    },
+    {
+      "severity": "major",
+      "title": "Verifier accepts a kick without a rekey (acl epoch may drop a reader), regressing today's rotate-on-revoke",
+      "detail": "Step 8 ties kind only to dek_gen/dek_commit/body_root; no rule says 'if readers(prev) is not a subset of readers(E) then kind must be rekey'. A buggy client, a TUI revoke form implemented as an ACL edit, or a lazy admin can author an acl epoch that removes reader K from acl and wraps while keeping M (dek_gen unchanged). The chain then publicly says 'K removed in epoch n by X' while K still holds M and decrypts every later record until someone happens to rekey. Today's server refuses exactly this: grant() in src/server.rs takes the (true,false) branch and calls revoke_read_and_rotate in one transaction. The design moves the crypto to clients and drops the guarantee from the verifier.",
+      "fix": "Verifier rule (server at submit, replicas, bundle verify): if any id in readers(prev) ∪ pinned(prev) is absent from wraps(E), require E.kind == rekey (dek_gen+1, fresh M, body_root != 0). Same for removal of a role-0 pinned key. Negative test: 'acl epoch drops a reader -> rejected'."
+    },
+    {
+      "severity": "major",
+      "title": "dek_commit binds dek_gen, so a 'rekey' with reused M passes every check and the kick is silently void",
+      "detail": "dek_commit = HKDF(kcv, Mc, info = group_id || dek_gen). Step 8's rekey rule 'dek_commit != prev.dek_commit' is satisfied automatically by the dek_gen bump even when M is byte-identical to the previous generation. A buggy rekey client (or a malicious admin wanting deniable leakage) that reuses M produces an epoch that verifies everywhere; readers compute HKDF(kcv, M_old, gen+1) == dek_commit and accept; kicked reader K computes DEK_new = HKDF(dek, M_old, group_id || gen+1) from its stashed M_old and reads everything. Neither the verifier nor any honest reader detects it because no reader is asked to compare M across epochs, so 'one honest recipient's check speaks for all' does not cover M freshness at all. Also, deriving two keys via two different HKDF salts over one IKM is nonstandard (the salt is the HMAC key); the textbook shape is one Extract, two Expands.",
+      "fix": "PRK = HKDF-Extract(salt = \"secret-bunker-iroh/m/1\", ikm = Mc); DEK = Expand(PRK, \"dek\" || group_id || dek_gen_be64, 32); dek_commit = Expand(PRK, \"kcv\" || group_id, 32) with no dek_gen in the commitment. Then 'rekey => dek_commit != prev' asserts M changed and 'acl => dek_commit == prev' asserts it did not, and an honest reader's opening check makes both binding. Additionally require readers that held M_prev to refuse a rekey whose decrypted M equals M_prev."
+    },
+    {
+      "severity": "major",
+      "title": "c0 (r) reuse across epochs with different M publishes M_new - M_old; the verifier does not forbid it",
+      "detail": "4.3 legitimises carrying c0/wraps verbatim, but nothing forbids reusing c0 with new wraps. If an admin client reuses r (deterministic r, VM-snapshot RNG, or a 'reuse the ephemeral' optimisation) for a rekey with fresh M', then for any recipient i present in both epochs c_i - c'_i = M - M' is computable by anyone. A kicked reader K (holds M) gets M' immediately; anyone who later learns one generation's M gets the other. Same hazard across groups sharing recipients. The transcript deliberately excludes epoch/prev so a proof is portable, which is fine, but r-freshness is then a property the verifier must check, not assume.",
+      "fix": "Verifier rule: c0 == prev.c0 allowed only if wraps are byte-identical to prev.wraps and kind == acl; otherwise c0 must differ from every earlier c0 in the chain (replicas and bundle verify hold the chain). Server keeps a global UNIQUE index on c0 across groups. Prover: r = H(\"…/r/1\" || m || group_id || dek_gen || 32 random bytes) mod L (hedged) so a weak RNG cannot silently repeat it."
+    },
+    {
+      "severity": "major",
+      "title": "Identity/small-order recipient passes step 6 and puts M in the clear",
+      "detail": "is_torsion_free() is true for the identity point (L*O = O), and O has the canonical encoding 01 00..00. Step 6 checks c0 != identity but not A_i. If id 0100…00 is registered (add_identity accepts it; iroh PublicKey::from_bytes decompresses it) and granted read, then c_O = M + r*O = M: the epoch publishes M verbatim and D_O = -r*A_1 = r*E_O so the DLEQ passes. This is the same failure the design treats as a hard check for r = 0, on the recipient side. Such an id can never handshake (iroh verify_strict rejects weak keys), so it is a dormant trap id like the rogue-key case.",
+      "fix": "Step 6: reject any A_i with is_small_order() (covers identity); reject at AddIdentity as well; keep c0 != identity. Negative tests for A_i = O and a small-order canonical A_i."
+    },
+    {
+      "severity": "major",
+      "title": "DLEQ nonce k is unhedged; one k reuse reveals r and thus M to everyone",
+      "detail": "Two proofs with the same k and different challenges give r = (s - s')/(e' - e) to any observer, and r turns every wrap into M = c_i - r*A_i. Unlike Ed25519 nonce reuse (which leaks one signer's key), this leaks the group generation to the public. The design draws k from the RNG with no derivation rule and the Go port must reimplement it; Ed25519 is deterministic precisely to remove this failure mode.",
+      "fix": "Specify k = SHA-512(\"secret-bunker-iroh/dleq-nonce/1\" || r || transcript-without-T || 32 fresh random bytes) mod L (hedged, RFC 6979 / XEdDSA style), zeroized after use; pin with a golden vector shared with the Go port."
+    },
+    {
+      "severity": "minor",
+      "title": "Signature verification and id registration must be strict; the '7/8 handshake failure' claim for torsioned keys is wrong",
+      "detail": "Step 9 says 'Ed25519 verify'. Plain dalek verify accepts small-order A and non-canonical R; iroh's own PublicKey::verify uses verify_strict. dalek VerifyingKey::from_bytes (used by iroh EndpointId parsing and add_identity) accepts non-canonical y encodings and torsioned points, so such ids can be registered today and, once in an ACL, wedge the group at step 1/6 for every verifier. A torsioned key can complete handshakes reliably: the holder grinds the signature nonce until the challenge is 0 mod 8 (about 8 tries), so 'could not complete an iroh handshake' is not a defence.",
+      "fix": "Specify verify_strict for epoch and record signatures. AddIdentity rejects ids that are non-canonical (decompress->recompress mismatch), not torsion-free, or small-order; the migration tool reports existing ones. Go: filippo.io/edwards25519 SetBytes also accepts non-canonical encodings, so port the recompress check."
+    },
+    {
+      "severity": "minor",
+      "title": "Zeroization and constant-time requirements are unspecified for the new secrets",
+      "detail": "New secret material with no stated hygiene: m, r, k, M, Mc, PRK, the reader's scalar from to_scalar() (curve25519 Scalar is Copy, so temporaries proliferate), the point a_i*c0, DEK, and every plaintext the rekey client holds while re-encrypting the group. The reader's a_i*c0 is a static-key multiplication and must be constant-time; 'only the prover needs constant time' omits the decryptor.",
+      "fix": "List the secrets and require Zeroize on each (ZeroizeOnDrop newtypes; avoid Copy temporaries of a_i); constant-time for prover and decryptor; vartime only in verify_epoch; mirror in the Go port (edwards25519 ScalarMult is constant-time)."
+    },
+    {
+      "severity": "minor",
+      "title": "AEAD tuple is not unique per DEK, and sig_kind 0 records leave epoch/author unauthenticated",
+      "detail": "Delete then recreate resets versions to 1 (put_secret/delete_secret in src/store.rs), so (group_id, name, 1, dek_gen) is encrypted twice under one DEK; the random 96-bit nonce is the only thing preventing keystream reuse. Fine today, but the design must state nonces are never derived from the AAD, or a 'deterministic nonce' optimisation in any client is catastrophic. Separately, Mode A kind-0 records carry epoch/author/origin_author with sig_kind 0, so bundle verify's 'author held write in that epoch' is unverifiable for them; the offline-verifiable story overclaims for the default mode.",
+      "fix": "State: nonce is always 96 random bits from the OS RNG (or use XChaCha20-Poly1305); never derive nonces from name/version. Document that sig_kind 0 attribution is transport-attested only, or have the server sign kind-0 records with the operational Ed25519 key so Mode A bundles verify."
+    },
+    {
+      "severity": "minor",
+      "title": "4.6 break-glass contradicts the 4.1 server rule caller == epoch.author",
+      "detail": "4.1/6.2 require the submitting caller to equal the epoch author; 4.6 has an arbitrary registered carrier submit an epoch signed by the offline backup key, which never connects. As written the break-glass import is refused, and that is the recovery path for the whole design.",
+      "fix": "BeginEpoch/CommitEpoch: accept an epoch whose author is a role-1 pinned key of the current head from any registered caller (the signature is the authority); require caller == author only for acl-admin authors."
+    }
+  ],
+  "strengths": [
+    "Torsion-freeness on c0, every c_i and every A_i plus c0 != identity makes the extracted r satisfy all n relations in a prime-order group, so 'same M for every listed recipient' holds; the c_i check also blocks the targeted-exclusion DoS a prover could reach by grinding the challenge to 0 mod 8.",
+    "Decompress->recompress->compare correctly rejects both non-canonical y (>= p) and the x = 0 with sign bit set encoding; scalars parsed with < L; from_hash over SHA-512 gives a uniform challenge.",
+    "Fiat-Shamir transcript covers everything the proof check depends on (domain string, group_id, c0, n, all A_i, all c_i, all T) in fixed-width fields; the (e, s) form and the AND-composition with one witness are a sound sigma protocol.",
+    "Verify-before-decrypt plus the proof of knowledge of r means the only ciphertexts a reader opens have c0 = r*B for an r the author already knows, so there is no static-DH or chosen-ciphertext oracle against reader keys; the c0 torsion check also protects a future unclamped reader.",
+    "Signature domain strings cannot collide with the endpoint key's other uses: TLS 1.3 CertificateVerify starts with 64 x 0x20, the relay handshake signs a blake3-derived 32-byte key, pkarr signs BEP44 bytes starting with '3:seqi'."
+  ],
+  "verdict": "The DLEQ core is sound, but the headline claim -- the reader list is a proof, verifiable by anyone with no key -- is only true for recipient ids whose discrete logs are unknown to the world, and nothing establishes that: with plain ElGamal a registered related key (-A_victim, A_u+A_v, d*B, or the identity point) publishes M to everyone, a failure class today's age wraps do not have. Add proof of possession at registration and small-order rejection before shipping. Three verifier rules are also missing without which the kick/rekey story is vacuous: kick implies rekey, c0 must be fresh unless wraps are carried verbatim, and dek_commit must commit to M alone so 'M changed' is checkable. Fix the DLEQ nonce derivation, specify verify_strict, and add the zeroization list. All fixes are verifier/registration/derivation changes; the SBE1/SBR1 layouts survive. Full critique: /private/tmp/claude-502/-Users-dragan-fables-for-robots-secret-bunker-iroh/0c07f4bd-a1ff-4066-aa31-2b8de0a5ded7/scratchpad/critiques/e2e-crypto-soundness.json"
+}

@@ -1,0 +1,117 @@
+{
+  "verdict": "Not implementable as written. The recovery flow (6.4) cannot stage a rotating recovery because StageVersions/ExportGroup are admin-gated and an orphaned group has no admin; the sync/2 manifest rule depends on a Hello payload that does not exist; the read-bound change relies on a Put.value cap the server does not have; the cap-sized-secret flow fails at the client's own read bound and at the 3.5 MiB chunk rule; the upgrade order and the pin guarantees do not hold for the k8s operator's emptyDir mirror; the ChainRejected condition has no data path; and a service admin silently loses every additive group operation. Each is fixable without touching the crypto or the record layout. Findings file: /private/tmp/claude-502/-Users-dragan-fables-for-robots-secret-bunker-iroh/0c07f4bd-a1ff-4066-aa31-2b8de0a5ded7/scratchpad/review/implfit-B.json",
+  "findings": [
+    {
+      "severity": "critical",
+      "section": "6.4 step 3 vs 9 (gating table) vs R6/G4",
+      "title": "A rotating recovery cannot be staged: StageVersions/ExportGroup are admin-gated, an orphaned group has no admin",
+      "detail": "6.4 says a recovery is submitted by 'any registered identity ... (S1 exception; staged like 6.1)'. Section 9 gates StageVersions on `admin` and ExportGroup on `admin` (mode A: also service admin); only SubmitEpoch has the S1 exception. R6/G4 force `kind = recovery` to be a rotate whenever a recipient is removed, which is exactly the two headline triggers: a rogue admin locked everyone out (the rogue is a recipient and must be dropped) and operational-key replacement (authority is a recipient in mode A). Sequence: rogue admin R strips every other admin -> group has one admin (R) -> operator authors a recovery removing R with --rotate offline -> the carrier identity C (not an admin, R is) sends StageVersions -> Denied -> SubmitEpoch has no staged set -> S4 fails. Same for `--authority <id>`. Only recoveries that touch no recipient are submittable, and even that requires an ExportGroup by 'any admin' that does not exist in the all-admin-keys-lost case (a mode-A service admin can export, but the carrier still cannot stage).",
+      "fix": "Make the stage follow the record, not the caller: let StageVersions accept when the submitter presents the (already verified) recovery record hash as the stage key, or add `SubmitEpoch{..., versions: [SealedVersion]}` pages for `kind = recovery` that the server stages under the recovery's hash before the CAS. Gate ExportGroup for the bundle on service admin in mode A and say so in 6.4 step 1. Add tests: recovery that removes the rogue admin, and recovery that replaces `authority`, both carried by a non-admin."
+    },
+    {
+      "severity": "major",
+      "section": "10 (Hello manifest) vs src/sync.rs SyncRequest::Hello",
+      "title": "'The Hello manifest ships records since each group's pinned head' is impossible: Hello carries no fields",
+      "detail": "`SyncRequest::Hello` is a unit variant (`\"Hello\"` on the wire) and section 10 says 'Message names are kept; the Group shape changes' and only adds `have_epoch` to FetchGroup. The server has no way to learn the replica's per-group pins at Hello time, so it must ship the whole chain for every group in scope on every session (every ScopeChanged cycles the session): N groups x full chain x ~8 KB per record on each resync, split across repeated `Group` messages under the 8 MiB frame cap. The alternative reading (ship only head metadata) is not what the text says and leaves P2's 'against its predecessor' unspecified for the manifest.",
+      "fix": "Either (a) give Hello a payload on the new ALPN: `{\"Hello\": {\"have\": [{\"group\", \"have_epoch\", \"have_hash\"}]}}` (a unit->struct change is fine because sync/2 is a new ALPN, but it must be stated and pinned in `sync::tests::wire_format_is_stable`), or (b) make the manifest `Group` carry only `group_uid/head_epoch/head_hash/names/revoked` and have the replica issue `FetchGroup{group, have_epoch}` for every group whose pin is behind before applying. In both cases state which of `group_uid/head_epoch/head_hash/names/revoked` wins when repeated `Group` messages for one name are merged (today only `epochs` is said to append)."
+    },
+    {
+      "severity": "major",
+      "section": "9 (read bound) vs src/server.rs Bunker::put and accept loop",
+      "title": "'Put.value stays capped at the handler' describes a cap that does not exist; raising the read bound breaks the Go client's Get",
+      "detail": "The only size limit on a Put today is `recv.read_to_end(proto::MAX_MSG)` in `Bunker::accept`; `Bunker::put` has no `value.len()` check. Once the per-stream bound becomes MAX_MSG + 64 KiB, a Put whose value is ~4 MiB + 64 KiB - envelope is accepted and stored. The `Secret` response for that row is > MAX_MSG, so every existing client fails to read it: `Client::request` uses `read_to_end(proto::MAX_MSG)` (src/client.rs) and protocol.md section 2 pins 4 MiB for the Go client. The same row syncs fine (SecretData ~4.06 MiB < 8 MiB) and then the replica's Get is equally unreadable. The invariant 'no legal write can produce a secret that cannot be read/replicated' is broken by a write the server itself accepted.",
+      "fix": "Add an explicit handler cap: `Put` answers `Failed{reason: \"value too large\"}` (after authorization) when `value.len() > MAX_PUT_VALUE`, with MAX_PUT_VALUE chosen so that both the Put frame and the Secret frame stay <= MAX_MSG (e.g. MAX_MSG - 64 KiB); state the number in protocol.md section 2 and the Go golden-vector notes. Apply the same cap to `ciphertext` in StageVersions before trial decryption."
+    },
+    {
+      "severity": "major",
+      "section": "9 / 6.1 step 5 / 13 e2e (4) vs src/client.rs",
+      "title": "The cap-sized secret does not fit the client's own read bound nor the 3.5 MiB stage chunk",
+      "detail": "Section 9 raises only 'the server's per-stream read bound'. The kick flow's ExportGroup reply is read by the client: `Client::request` reads `read_to_end(proto::MAX_MSG)`. A page holding the existing test's cap-sized secret (value = MAX_MSG - envelope - 4, ciphertext = +16) plus the `Export{versions:[SealedVersion], next}` envelope is ~100 bytes over MAX_MSG, so the first Export page of test 13(4) fails on the client with 'reading response'. Independently, 6.1 step 5 stages 'in <= 3.5 MiB chunks', which cannot hold one ~4 MiB SealedVersion, so the same secret cannot be staged at all as written.",
+      "fix": "Raise `Client::request`'s bound to the same MAX_MSG + 64 KiB (the TUI and epochflow share it), and restate the chunk rule as 'at most 3.5 MiB, or exactly one version when a single version exceeds that'. Make the server's ExportGroup pager byte-budgeted with the same one-version minimum. Keep test 13(4) and add the Export-page size assertion next to the existing sync-frame one."
+    },
+    {
+      "severity": "major",
+      "section": "12 step 4 / 16 phase 2 / 13 e2e (5) vs charts deployment.yaml and replica read path",
+      "title": "Upgrade order assumes replicas 'serve their last mirror' during the ALPN-fail window; false for the operator (emptyDir) and unspecified for v2 mirrors",
+      "detail": "The operator's mirror is `emptyDir: {}` ('full resync each start, by design', charts/secret-bunker-operator/templates/deployment.yaml); an image upgrade is a pod restart, so the upgraded operator starts with no mirror, dials `secret-bunker-sync/2`, fails ALPN against the unmigrated server, and sits at `last_synced = None`: `/readyz` is false and `apply_bunker_secret` returns AwaitingSync (Ready=False) for every CR until the server is migrated. Existing k8s Secrets survive, but nothing is reconciled for the whole window. For a standalone `serve --replica-of` node the last mirror is a v2 mirror (age `dek_wrap` rows, no `group_epoch`); P4 and Replica::get derive the DEK 'from the own wrap' of the head record, which does not exist yet, so unless the v3 replica explicitly keeps the age read path for unpinned groups it cannot serve that mirror either. Test 13(5) 'no serving gap' has no specification that makes it pass.",
+      "fix": "State the transitional read path explicitly: a v3 replica keeps `agebridge` + `dek_wrap` reads for groups with no pin and no `group_epoch` rows, and drops them at the first accepted genesis (C1 already allows that genesis). For the operator, either document the outage window as part of D12 (operator upgrade and server migration inside one maintenance window) or move the mirror to a PVC (which then needs the pin/rewind semantics of the next finding). Make the e2e test cover both node kinds."
+    },
+    {
+      "severity": "major",
+      "section": "D9 / 10 P1, P4 / 7.4 vs charts deployment.yaml emptyDir",
+      "title": "Pin protection against rewinds and forks is void for the k8s operator: every restart is 'first sight'",
+      "detail": "P1 makes `group_pin` survive `drop_group_local`, D9 says replicas 'refuse forks and rewinds', and 7.4 claims a replica 'detects rewinds and forks and holds its last verified state'. The operator's mirror is an emptyDir, so after any pod restart there is no pin and C1 accepts whatever genesis the authoritative node serves (TOFU). `expect_keys` only pins `authority`/`backup`, not the genesis hash or head: an authoritative node restored from an old snapshot (same keys, same genesis, lower head) is accepted silently after the next operator restart, and the operator then serves a state older than the one it served before the restart, reviving kicked readers' ACL rows in the mirror. The rejection path exists only within one pod lifetime.",
+      "fix": "Persist the pins outside the emptyDir: a small operator-owned Secret/ConfigMap (`group -> {group_uid, genesis_hash, head_epoch, head_hash}`) written on every accepted head and loaded into `ReplicaBuilder` at boot (e.g. `ReplicaBuilder::pins(...)`), or a PVC for the mirror. If neither, downgrade the 7.4 row and section 10 to 'within one process lifetime' and say that `bunker.expect*Id` covers keys only."
+    },
+    {
+      "severity": "major",
+      "section": "7.3 / 6.3 (legacy Grant) / A2 / 11 (TUI) / 18",
+      "title": "A service admin loses every additive group operation over the wire unless it holds an explicit admin row; the TUI still advertises perms 7",
+      "detail": "Today `grant` runs under `authorize_group(..., ident.service_admin)` so any service admin can add a reader to any group (this is how the k8s operator identity is granted read). After migration: additive legacy `Grant` answers `Failed{\"signed epochs: use a signing client\"}`; the client-side rewrap needs A2 (`author` holds admin in `head.acl`), and 7.3 lists the service admin as 'nothing unless granted'. Concrete failure: service admin S2 (not the group's creator) runs `client grant --group prod --identity operator --perms r` -> A2 fails; the TUI shows `prod [rwa]` to S2 (`list_groups` reports effective 7), opens the ACL pane (GroupAcl passes via the bypass), and `n` fails 'not an admin-reader'. The only recourse is the offline backup key (6.4). Section 11 also says the TUI has 'no server-side fallback, by D4' while 6.3/Q13 keep a server-authored shrink path for legacy Grant, so `x`/read-off would fail in the TUI for S2 even though the wire still allows the shrink. None of this is in section 18.",
+      "fix": "Add an explicit section-18 question: 'Service admins administer chains only through explicit admin rows; groups they did not create need an existing admin or a backup-key recovery'. Make `ListGroups` on the authoritative node report the caller's chain-effective bits (or add `chain_admin: bool` to Status) so the TUI can grey out `n`/`r`/`a` up front; route TUI `x` and read-off for a service admin without an explicit row through the legacy shrink Grant that 6.3 keeps. Consider a `db migrate-epochs --service-admins-as-group-admins` option that adds explicit `rwa` rows for existing service admins (audited), so the current operational model survives the migration."
+    },
+    {
+      "severity": "major",
+      "section": "10 (operator paragraph) vs operator/src/events.rs, reconcile.rs, replica.rs SyncStatus",
+      "title": "The ChainRejected condition has no data path: reconcile cannot learn that a chain was rejected, and would overwrite it",
+      "detail": "The event bridge (`operator/src/events.rs`) forwards only `ObjectRef`s; `apply_bunker_secret` computes the Ready condition solely from `render()` and `Staleness` (`ready_condition(cr, true, \"Synced\", \"\")` otherwise); `Replica::status()` returns `SyncStatus{connected, last_synced, groups, authoritative}` with no per-group rejection state, and section 10 says the Replica API is 'unchanged apart from expect_keys'. So on `EpochRejected` the bridge can count a metric and trigger reconcile, but that reconcile renders the still-valid mirror and patches Ready=True/Synced. Even if the bridge stashed a flag, the rejection clears only when a later head is accepted, which emits no event if no secret changed, so the condition would either never appear or never clear.",
+      "fix": "Add `rejected: BTreeMap<String, EpochRejection{epoch, reason, at}>` to `SyncStatus` (or `Replica::rejected_groups()`), set on P1/P2/P4 rejection and cleared when a head for that group is accepted; have `apply_bunker_secret` read it and emit `ChainRejected` (Ready=False, keep serving) while present. Emit a wake-up event (e.g. `ChainAccepted{group}`) on the clearing head so the condition converges without waiting for the 1h resync."
+    },
+    {
+      "severity": "minor",
+      "section": "6.3 (RemoveIdentity) vs 13 (Server tests) vs R6",
+      "title": "RemoveIdentity in mode A: 'one rotate per group the identity had a row on' contradicts 'a carry for w-only rows'",
+      "detail": "6.3 says the server authors 'one record per group the identity had a row on: mode A -> rotate'. Section 13 tests 'one rotate per readable group and a carry for w-only rows'. R6 only requires a rotate when a recipient is removed; a write-only row is not a recipient, and A3 allows a shrink `carry`. A rotate for a w-only removal re-encrypts the whole group for nothing.",
+      "fix": "Align 6.3 with 13: rotate for rows with the read bit, `carry` (drop the row) otherwise; both authority-authored, both in the RemoveIdentity transaction."
+    },
+    {
+      "severity": "minor",
+      "section": "6.3 / S8 vs src/server.rs Bunker::handle lock scope",
+      "title": "Server-authored rotates run the full re-encryption under the global store lock",
+      "detail": "`Bunker::handle` takes `lock_store()` and holds it across `dispatch`, so `remove_identity` runs entirely under the lock. Today that is cheap (it only re-wraps DEKs). With D6 a mode-A RemoveIdentity must decrypt and re-encrypt every retained version of every group the identity could read, inside that lock. Removing a replica or operator identity that reads every group re-encrypts the whole database while every Get/Put/sync snapshot blocks. S8 moves only SubmitEpoch's verification and trial decryption outside the lock; nothing is said about server-authored rotates.",
+      "fix": "Implement server-authored rotates as an internal SubmitEpoch: snapshot the head and ciphertext under the lock, re-encrypt and build the record outside it, then take the lock for S3 CAS + S4 straggler handling + install. State this in 6.3 and S8, and make the identity-row delete part of the same final transaction."
+    },
+    {
+      "severity": "minor",
+      "section": "9 / 10 / 7.4 / 15 vs src/replica.rs dispatch",
+      "title": "Replicas' handling of the new read variants is unspecified, yet equivocation detection needs replica heads over the wire",
+      "detail": "Section 9 says 'Every new mutation answers ReadOnlyReplica on a replica'; `ReplicaServer::dispatch` is deliberately exhaustive, so GroupStatus/GroupEpochs/ResolveIdentity/ExportGroup must each pick an answer, and the spec does not say. 7.4 and 15 say equivocation between replicas is 'detectable only by comparing heads', but with no chain read served by replicas there is no wire way to obtain a replica's head; `client epoch log --server <replica>` would fail.",
+      "fix": "Replicas answer GroupStatus and GroupEpochs from their verified mirror (read-gated by the mirrored ACL); ResolveIdentity, ExportGroup, StageVersions, SubmitEpoch answer ReadOnlyReplica to registered callers. Add the four arms to `ReplicaServer::dispatch` and to protocol.md section 7."
+    },
+    {
+      "severity": "minor",
+      "section": "6.5 (`epoch log` rendering) vs 9 (gating table)",
+      "title": "`epoch log` prints `alice(1a98...)` but no read-gated request maps EndpointId to a name",
+      "detail": "The chain carries keys only. `GroupAcl` returns `(name, perms)` without ids; `ListIdentities` is service-admin-only; `ResolveIdentity` is admin-gated and name->id, one name per round trip; `ListIdentityNames` returns names only. A reader running `client epoch log` (GroupEpochs is read-gated) cannot label any author; an admin needs one ResolveIdentity per registered name to build the reverse map.",
+      "fix": "Have `Epochs` carry a server-attested `names: [{endpoint_id, identity_name}]` list for the ids appearing in the returned records (the same display-only shape sync/2's `Group.names` uses), or add a `GroupMembers{group}` read gated like GroupEpochs. Note the disclosure in crypto-design section 7 alongside the existing widening."
+    },
+    {
+      "severity": "minor",
+      "section": "10 P1/P4 / 11 vs store.rs drop_group_local",
+      "title": "Two different 'drop group' operations are conflated: the pin must survive one and be deleted by the other",
+      "detail": "P1: `group_pin` 'survives drop_group_local' (needed so a re-granted replica can verify from its pin). P4: an operator resets a rewound mirror with `db drop-group --db mirror.sqlite --group g` or `Replica::reset_group`; for the re-rooted genesis to be accepted, C1 requires no pin for the name, so that reset must delete the pin. Section 10 also says the Replica API is 'unchanged apart from expect_keys', contradicting the new `Replica::reset_group`. `db drop-group` against a live replica's SQLite file is not addressed (today's `db` commands require the service stopped).",
+      "fix": "Name the two operations: `drop_group_local` (keeps the pin; used by P3 and manifest-absence drops) and `reset_group` (deletes the pin; operator-only, audited `pin-reset`), list `Replica::reset_group` in the API delta, and require the service stopped for `db drop-group` as for the other `db` commands."
+    },
+    {
+      "severity": "minor",
+      "section": "4.3 vs S4 (straggler re-encryption)",
+      "title": "`reencrypted` is defined over the installed set but computed over the client-staged set; stragglers make the signed digest unverifiable offline",
+      "detail": "4.3: 'Over the ciphertext set installed with a rotating record'. S4: 'its digest equals reencrypted (computed by the server over the staged set as submitted)', and in mode A the server then installs stragglers it re-encrypted itself with fresh nonces. After any rotation with `stragglers=n > 0`, an offline auditor recomputing 4.3 from `secret_version` gets a different digest and the record looks tampered; nothing in the record says which rows were server-installed.",
+      "fix": "Define `reencrypted` as the digest of the client-staged set (what the author actually signed) and say that the installed set may exceed it by server-re-encrypted stragglers, recorded in the `epoch-submit` audit row; or, if offline verifiability of the installed set matters, answer `StaleVersions` in mode A too and let the client loop."
+    },
+    {
+      "severity": "minor",
+      "section": "6.1 step 1 / 8 (group_pin is replica-only)",
+      "title": "The kick flow references the client's 'pinned head' but no client-side pin store is specified",
+      "detail": "6.1 step 1: 'GroupEpochs{group, since: pinned head} -> verify the tail against the local pin'. `group_pin` exists only in the replica schema; the CLI/TUI have no persistent state for pins. Without one, every `client kick/grant/rotate` is TOFU from genesis, so a hostile authoritative node (which in mode A holds the authority key and every DEK) can present a freshly re-rooted chain for a known name with any ACL it likes, and the admin's tooling will extend it. Replicas would reject it via C1, but the admin has already re-encrypted and signed on top of it.",
+      "fix": "Specify a per-client pin file (XDG data dir, keyed by server EndpointId + group name, same fields as `group_pin`) with the C1/P1 rules and an explicit `client epoch reset-pin` for the restore case; or state the limitation in 7.4 and 3.8's liveness paragraph."
+    },
+    {
+      "severity": "minor",
+      "section": "6.1 (stage limits)",
+      "title": "The stage byte cap is based on current ciphertext while a rotation must stage every retained version",
+      "detail": "D6 makes a rotation re-encrypt 'every retained version of the group (current and history)'; 6.1's per-group stage cap is '2 x current ciphertext + 16 MiB'. A group with several retained versions per secret and a few MiB of current data exceeds the cap before the export is fully staged, and the kick cannot complete. If 'current ciphertext' was meant to be the total retained ciphertext, the text does not say so.",
+      "fix": "Base the cap on the total retained ciphertext of the group (`SUM(length(ciphertext))` over `secret_version`) plus headroom, and have `GroupStatus` (or the first `Export` page) report that total so the client can show progress against it."
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[package]
+name = "dleq-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# THROWAWAY numeric probe used while writing the signed-epochs spec. Not part of
+# the workspace; build it on its own (`cargo run --release` in this directory) and
+# remove `target/` afterwards.
+
+[dependencies]
+ed25519-dalek = "3"
+curve25519-dalek = { version = "5", features = ["digest"] }
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+
+[workspace]

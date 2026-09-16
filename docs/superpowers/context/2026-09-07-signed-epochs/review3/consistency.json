@@ -1,0 +1,143 @@
+{
+  "verdict": "Revision 3 resolves every prior consistency contradiction that was checked (phase split; two-key naming across S2/6.4/8; G6 now has one reading; Epochs.meta side table; revoked_identity/revive removed; 4.1 mode comment; ReplicaInner keeps age_identity; group_pin replica-only; 4.3 auditor precondition; S9/S10 scoped to non-authority authors; legacy Grant strict-subset; one rewrap/carry rule; Hello have_epoch: 0; R2 pin-only scope; HeadAccepted vs ChainAccepted; S8 entry points and LRU bounds), and the symbol audit against the tree holds: every Rust symbol, file, request/response variant, field, table, column, key role, exit code, chart value, RBAC verb, doc section number and crate version the spec claims exists today does. What the fixes introduced, all rule-text: (1) G6 now applies to recovery, so the hijack recovery 6.4 and e2e (7) are built for cannot be one record when the rogue removed the other admins, and the two-record path is raced because an accepted recovery clears the freeze; (2) the recovery record is carried by OpenStage in section 9 but by 'the first StageVersions' in S1 and 6.4, and S1 never names OpenStage; (3) S1 admits a stage from any bit on the group while 6.1 justifies the fence with 'an admin who abuses it can already do worse' - a write-only key can fence Put/Delete indefinitely; (4) 6.1 step 6/8 reuse 'the same wraps, proof' across an EpochConflict rebase although the proof transcript binds prev/epoch and R1 may need new wraps; (5) the section 13 unit test 'two groups, same RandomSource bytes -> R5 refuses' contradicts 3.3's own m hedge. Two prior items are half fixed: S2 still says an install adopts backup/mode into bunker-wide meta, and 6.3 still defers Q2 inline. The rest are missing field layouts, reason strings, a per-record staged count with no column, and Hello have_hash semantics. None changes the architecture; a plan can be finalised once the five majors are decided. Full JSON with line citations and the symbol audit: /private/tmp/claude-502/-Users-dragan-fables-for-robots-secret-bunker-iroh/0c07f4bd-a1ff-4066-aa31-2b8de0a5ded7/scratchpad/review3/consistency.json",
+  "unfixed_prior": [
+    {
+      "prior_title": "authz minor: Two-key window - S2 says install adopts the record's authority/backup into meta, 6.4 says meta advances only when no head names the old key",
+      "why_not_fixed": "Authority half fixed (6.4 lines 823-834). Backup/mode half not: S2 (line 570-571) still reads 'the install adopts the record's backup/mode into meta for that group's checks'. meta is bunker-wide (section 8 line 987; secret_group gains no per-group backup/mode column), so a recovery switching one group to mode E flips meta.epoch_mode and every later CreateGroup mints a mode-E genesis while 12 says '--mode E is refused'; a backup replacement on the first of N groups changes the genesis backup for all groups before the other recoveries land. Per-group values already live in the head record (C4/G4); 'for that group's checks' has no storage to refer to.",
+      "fix": "Delete the clause from S2; for recovery, S2 checks only that rec.authority is one of the two meta keys, backup/mode come from the record. Genesis defaults in meta change only by an explicit operator step (serve --backup-id / db set-backup, audited), never by an install."
+    },
+    {
+      "prior_title": "consistency placeholder: Section 6.3 defers a plan-affecting decision inline - '(Whether the Go client needs either is Q2.)'",
+      "why_not_fixed": "Still present verbatim at line 780-781. Section 19 Q2 carries the assumption 'data only', so the spec is consistent, but 6.3's legacy Grant/RotateDek behaviour remains conditional on an answer the body does not commit to.",
+      "fix": "Replace with 'Q2 assumes data only; if the Go client needs additive Grant or RotateDek, that is a spec change' or drop the parenthetical and rely on section 19."
+    }
+  ],
+  "findings": [
+    {
+      "severity": "major",
+      "section": "5 G6 (543-549) vs 6.4 triggers/step 2 (789-808), S10 'An accepted recovery clears the freeze' (629), 13 e2e (7), 7.4",
+      "title": "G6 applies to recovery, so the hijack recovery cannot be one record, and the two-record path is raced by the freeze clearing",
+      "detail": "G6: 'A revived id is one that appears in the ACL of an earlier record but not in head.acl. A record of any kind whose ACL adds a revived id MUST make no other ACL change.' 6.4's first trigger is 'a rogue admin locked everyone out'. When the rogue removed the other admins (a rotate), every locked-out admin is a revived id. The natural recovery (--acl alice:rwa --rotate: remove the rogue per R6/G4, re-add alice) makes two ACL changes and is refused by every verifier with 'G6'; re-adding two admins is likewise two changes. The only one-record shape is 'add a never-seen admin id and kick the rogue', which needs an identity registered for the purpose that 6.4 never mentions. The two-record alternative (recovery #1 re-adds alice as sole change; #2 kicks) is raced: S10/6.4 say an accepted recovery clears the freeze, and after #1 the rogue is still an admin, unfrozen, and can kick alice again (A2/A5 allow it) before #2 or a re-freeze lands. e2e (7) 'against a rogue admin held off by FreezeGroup' is therefore writable only for the orphaned case. 6.4 step 2's '--acl: the listed entries are the entire ACL' gives no hint of the constraint.",
+      "fix": "Exempt `recovery` from G6 (A4 already makes it deliberate), stating it in G6 and 6.4. Make the freeze clear only when the recovery says so (an --unfreeze bit on the last recovery of a ceremony) or keep it until an explicit FreezeGroup{frozen:false}. Add to 6.2/11 that a client delta touching a revived id is split into two records and that the CLI handles the G6 refusal reply."
+    },
+    {
+      "severity": "major",
+      "section": "5 S1 (562-566) and 6.4 step 3 (806-807) vs 9 request table (1046-1047), 6.1 'Write fence' (679-681), 13 'existence oracle on ... OpenStage'",
+      "title": "The recovery record is carried by OpenStage in section 9 but by 'the first StageVersions' in S1 and 6.4; S1 never names OpenStage",
+      "detail": "Section 9: OpenStage{group, stage_id, wraps, recovery: bstr or null}; StageVersions{group, stage_id, versions} has no recovery field. S1: 'a stage is accepted from a caller ... whose first StageVersions carries a recovery record'. 6.4 step 3: 'the first StageVersions carries the recovery record, which admits the stage'. A planner writing the wire (and the golden vectors section 9 mandates) from section 9 puts the field on OpenStage; one writing the handler from S1/6.4 looks for it on StageVersions. S1 gates only SubmitEpoch and StageVersions, while 6.1, section 9 and 13 treat OpenStage as S1-gated; the stage cannot exist before OpenStage, so the admission decision has to be made there.",
+      "fix": "S1: 'The same gating applies to OpenStage and StageVersions: a stage is admitted at OpenStage when the caller holds the admin bit in head.acl or OpenStage.recovery verifies under head.backup (C3 first); StageVersions/SubmitEpoch on an unadmitted stage answer Denied; unknown group answers Denied.' 6.4 step 3: 'OpenStage carries the recovery record'. Say whether wraps may be empty when recovery is present."
+    },
+    {
+      "severity": "major",
+      "section": "5 S1 (562-563) vs 6.1 'Write fence' (677-681) and 'Stages' (705-712), 7.3 party table",
+      "title": "S1 admits a stage from any bit on the group, but 6.1 justifies the write fence with 'an admin who abuses it can already do worse'",
+      "detail": "S1: 'a stage is accepted from a caller holding any bit on the group'. 6.1: Put/Delete answer Failed{\"rotation-pending\"} from OpenStage until submit/expiry; 'A stage can be opened only by a caller S1 admits ... an admin who abuses it can already do worse.' Under S1 as written a write-only CI key or a plain reader opens a stage with an empty wrap set and fences Put/Delete for 15 min idle (renewable), 6 h hard, then again under a new stage_id with no cooldown. 7.3 says readers author nothing and writers only Put; neither has a legitimate reason to open a stage (rotations are admin-authored per A2; recovery carriers present a record). The rule and its rationale name different populations, and the rule's population can deny writes to a group it cannot administer.",
+      "fix": "S1/9: OpenStage is admitted only from a caller holding admin in head.acl (service admin implicit in mode A) or presenting a recovery record verifying under head.backup; readers and write-only identities answer Denied. Update 6.1's sentence; add 'write-only identity OpenStage -> Denied' to 13."
+    },
+    {
+      "severity": "major",
+      "section": "6.1 step 6 (655-657) and step 8 (660-663) vs 3.5 transcript (185-196), 3.3 zeroize/never stored (151-155), R1/R3",
+      "title": "Step 8's EpochConflict rebase 're-sign against the new head, same wraps, proof' is unachievable: the proof binds prev/epoch and the recipient set may have grown",
+      "detail": "Step 6 builds the record with 'the same wraps, proof, dek_commit'; step 8: 'If every intervening record left dek_gen unchanged, restart at step 6 (re-sign against the new head, same stage)'. The transcript T of 3.5 contains prev and epoch ('a proof cannot be transplanted to another ... epoch or fork'), so a re-signed record with the old proof fails R3 on every verifier. Re-proving needs every r_i, which 3.3 says are 'never stored' and 'zeroize ... when done'; the flow never says the client keeps r_i or M across the rebase. The branch condition 'dek_gen unchanged' admits an intervening rewrap that added a reader; R1 then requires a wrap for that reader, so 'the same wraps' fails too and a new wrap set needs M. The StaleVersions branch is fine (reencrypted is outside T) but unstated. A planner implementing step 8 literally ships a rebase every verifier rejects.",
+      "fix": "Step 8: 'restart at step 6 with the new head: recompute the wrap set for recipients(new head.acl minus target) from the retained M (fresh r_i) and a new proof over the new prev/epoch, then sign; OpenStage wraps need not match the record's (S5 checks the record's own wrap against dek_commit)'. 3.3: 'M and the r_i are held in Zeroizing memory until the submit lands or the flow aborts, never persisted'. Note a StaleVersions resubmit changes only reencrypted and the signature."
+    },
+    {
+      "severity": "major",
+      "section": "13 Unit (1272-1274) vs 3.3 hedges (138-143, 155-160) and R5 (505-509)",
+      "title": "The 'two groups, same RandomSource bytes -> R5 refuses' test contradicts 3.3's m hedge, which makes M differ per group",
+      "detail": "3.3: m = H(prefix || group_uid || prev || rng), r_i = H(prefix || M || A_i || rng), and 'm differs per group and per chain position, so M cannot repeat across groups or rotations'. Section 13: 'Two groups rotated with the same fixed RandomSource bytes: the second is refused by R5.' With identical RNG bytes and different group_uid, m differs, M differs, every r_i differs (M is in the hedge), every c0_i is new bunker-wide and dek_commit is group-salted: nothing R5 checks repeats, the second rotate is accepted, the test cannot pass. R5's justification for the bunker-wide c0 set ('a recipient present in two groups ... catches a stuck RNG across groups') describes a case the m hedge makes impossible for a compliant prover; the bunker-wide scope is a backstop only against a prover that skips the m hedge. Either the test is wrong or the m hedge must not include group_uid; the text cannot be planned from.",
+      "fix": "Rewrite the test to the case the hedges leave for R5: 'the same group rewrapped (add-reader) with the same fixed bytes: existing recipients' c0 repeat, R5 refuses'; add 'two groups rotated by a prover with the m hedge disabled (test-only): R5 refuses via the backup key's repeated c0'. Reword R5's parenthetical to 'a backstop for a prover that does not hedge m'."
+    },
+    {
+      "severity": "minor",
+      "section": "13 Server (1291) vs 5 S1 (559-563) and reply-mapping example (455-456)",
+      "title": "'non-admin author -> Failed{A2}' is unreachable from the wire: S1 answers Denied first",
+      "detail": "S1 requires caller == author and answers uniform Denied for a caller that is not an admin of the group; a non-admin author is a non-admin caller, so A2 can only fire on a replica or auditor fed a forged record. Section 13 expects Failed{\"A2: ...\"} from the server and the reply mapping names A2 as its wire-visible example. Two rules, one request, two answers.",
+      "fix": "Move the A2 test to the epoch.rs/replica negative matrix; state on the server S1 subsumes A2 (Denied); use a different reply-mapping example (e.g. \"G2: no admin left\")."
+    },
+    {
+      "severity": "minor",
+      "section": "8 group_epoch (958-961) vs 9 Epochs.meta and Status.last_rotate (1042-1043), 4.3 (428-433), 6.5 (851)",
+      "title": "The per-record `staged` count served in Epochs.meta and Status.last_rotate has no column",
+      "detail": "group_epoch stores installed_digest, stragglers, dropped; 4.3 records 'the installed set's digest, the straggler count and the dropped count'. Section 9 serves meta{staged, by_server, dropped} and last_rotate{staged, ...}, and 6.5 prints 're-encrypted 143 by alice + 2 by the server' from it. `staged` (rows covered by the author) is neither stored nor derivable later: the retained row count changes with every subsequent delete.",
+      "fix": "Add `covered INTEGER NOT NULL DEFAULT 0` to group_epoch (written in 6.1 step 3 with stragglers/dropped) and to the audit text; map meta.staged to it."
+    },
+    {
+      "severity": "minor",
+      "section": "6.4 step 1 (799-800) vs S10 'rotating half deferred while frozen' (628-629) and 6.1 step 3 'clear needs_rotation iff dek_gen == head.dek_gen + 1' (697-698)",
+      "title": "The export precondition 'frozen and needs_rotation = false' deadlocks against the deferred rotating half",
+      "detail": "While frozen, S10 defers the authority rotate, so needs_rotation set by any RemoveIdentity or legacy shrink touching the group (carries still land on a frozen group) stays set until the freeze clears; 6.4 step 1 then refuses the export indefinitely, and the only exit (unfreeze, wait for the worker, re-freeze) is never stated. The precondition is also unnecessary: the freeze already keeps the rotating half from moving the head, and a --rotate recovery clears the flag on install.",
+      "fix": "'export only when GroupStatus shows frozen; if needs_rotation is set the recovery must be authored with --rotate'."
+    },
+    {
+      "severity": "minor",
+      "section": "5 S5 (594-600) vs 6.1 step 5 (649-651), 9 OpenStage, D11",
+      "title": "S5's stage-time DEK derivation describes two mechanisms the design no longer has",
+      "detail": "S5: 'the new DEK is derived from the record when the stage was opened with SubmitEpoch's record hash, or from M handed over the fence'. 6.1/9 open a stage with OpenStage{wraps} (wrap set + dek_commit); no record hash exists then (D11 rejected hash-keyed stages) and M is never handed over - the server opens its own wrap. 'The DEK cache is keyed by record hash and populated only from a wrap the server opened for that record' leaves the stage-time DEK with no stated home or lifetime.",
+      "fix": "S5: 'the new DEK is obtained by opening the server's own wrap in OpenStage.wraps and checking KDF(M') against the supplied dek_commit (refuse the OpenStage otherwise); it lives with the epoch_stage_open row and is zeroized when the stage is deleted, separate from the record-hash cache'."
+    },
+    {
+      "severity": "minor",
+      "section": "6.1 step 5 (649-651), 8 epoch_stage_open.wraps (982), 9 OpenStage (1046)",
+      "title": "OpenStage.wraps has no byte layout and no stated validation",
+      "detail": "The field is 'the new record's wrap set + dek_commit' as one bstr. No encoding is given (u32be(n) then n x (id||c0||c) then dek_commit? a partial record?), nor whether E2/E3 (sorted, distinct, decode_point on every point) run before the server opens its wrap, nor whether the commit check is applied at OpenStage. Golden vectors and the epoch_stage_open column both need the layout.",
+      "fix": "Define wraps = u32be(n_wraps) || n_wraps x (id 32 || c0 32 || c 32) || dek_commit 32; require E2/E3 and the own-wrap commit check at OpenStage (Failed{\"S5: wrap does not open to dek_commit\"}); store verbatim."
+    },
+    {
+      "severity": "minor",
+      "section": "6.1 'Stages' (705-716), 9 request table (1046-1048), 5 reply mapping (452-456), 6.3 audit ops, S8 (611-620)",
+      "title": "Reason strings and audit op names are missing for stage limits, S5 message refusals and server-authored carries",
+      "detail": "Section 9 lists only Ok for OpenStage/StageVersions. 6.1 specifies 'at most two open stages bunker-wide', a per-(group, submitter) byte cap, the S5 per-message refusal and the fence, but only Failed{\"rotation-pending\"} and Failed{\"S4: stage not found\"} have strings; the reply-mapping vocabulary covers record rules only. 6.1 step 3 names submit-epoch/rotate-dek for the install and 6.3 names rotate-quarantine/rotate-resume, but the immediate revocation carry's audit op, and whether handle's generic remove-identity/grant row still lands now that those variants take their own transaction (S8 skips the generic row for SubmitEpoch only), are unstated.",
+      "fix": "Add Failed{\"stage: cap\"}, Failed{\"stage: too many\"}, Failed{\"S5: plaintext mismatch\"}, Failed{\"S5: nonce reuse\"}, Failed{\"S5: undecryptable\"}. 6.3: the carry audits `epoch-carry` with target group@epoch#hash[..16] via audit_in; the generic post-dispatch row is kept for RemoveIdentity and legacy Grant."
+    },
+    {
+      "severity": "minor",
+      "section": "6.1 step 8 (658-659) vs 9 ExportGroup (1045)",
+      "title": "'export ... exactly the listed rows' has no request shape",
+      "detail": "ExportGroup{group, after: [name, version] or null, limit} pages by cursor only. The StaleVersions branch says 'export, re-encrypt and restage exactly the listed rows', which the protocol cannot express; the client either re-pages the whole group (contradicting 'Bandwidth is 2 x total retained ciphertext') or needs a filter.",
+      "fix": "Add `versions: [[name, version]] or null` to ExportGroup (only those rows when present) or state that the client re-pages and filters."
+    },
+    {
+      "severity": "minor",
+      "section": "10 Hello (1082) and the `have` paragraph (1093-1096) vs P1/P4",
+      "title": "have_hash is unspecified for have_epoch: 0 and the server's use of have_hash is never stated",
+      "detail": "Hello carries {group, have_epoch, have_hash}; a pinned-but-dropped group is listed with have_epoch: 0 but no have_hash value is given. Nothing says what the server does with have_hash: compare with its record at have_epoch and on mismatch (fork/restore) ship the whole chain so P1/P4 can judge, or ignore it and ship 'records after have_epoch' that the replica cannot chain (C2 fails with no diagnosis).",
+      "fix": "'have_hash is 0^32 when have_epoch is 0. The server ships records after have_epoch only if its record at have_epoch hashes to have_hash; otherwise it ships the whole chain and the replica applies P1/P4.'"
+    },
+    {
+      "severity": "minor",
+      "section": "6.4 'Operational-key replacement' (823-834) and 12 vs 10 P2 expect_keys (1116-1130)",
+      "title": "Operational-key replacement never updates replica expect_keys, so every new group's genesis is rejected by pinned replicas",
+      "detail": "P2 admits an unlisted genesis only if authority/backup/mode equal the replica's configured expect_keys (one authority id). After serve --operational-key new.key, 6.3 mints every new CreateGroup genesis with the new key; a replica configured with bunker.expectAuthorityId = old rejects each (unpinned-genesis) until the chart/flag changes. 6.4 lists per-group recoveries and GroupStatus checks but no replica step; 12 neither. Existing groups are unaffected (C4 recovery exception), hiding the gap until the first new group.",
+      "fix": "Add to 6.4: 'update --expect-authority-id / bunker.expectAuthorityId on every replica to the new key before creating groups; expect_keys accepts a list so both keys can be listed during the window'. Mirror in operator/README (14)."
+    },
+    {
+      "severity": "minor",
+      "section": "5 E2 (462-464) vs 3.1 AddIdentity (105-108), 12 step 1 (1224-1232), 4.1 'Pinned ids never appear in acl'",
+      "title": "Nothing refuses registering or migrating an identity whose id equals authority or backup, which E2 then makes ungrantable",
+      "detail": "E2 forbids an id in both acl and pinned. AddIdentity applies only decode_point (3.1); migration step 1 validates only decode_point and name length. An identity registered with the operational or backup key's EndpointId passes registration, and every record granting it fails E2 on every verifier with no stated remedy; in step 2 the migration would mint an unverifiable genesis for any group holding such a row.",
+      "fix": "AddIdentity and db migrate-epochs refuse an id equal to any configured authority (current or previous) or backup (Failed{\"E2: pinned id\"}; migration lists them like invalid ids). Add to 13 server tests."
+    },
+    {
+      "severity": "minor",
+      "section": "5 S4 (586-588) vs 6.1 step 5 (651) and D11",
+      "title": "S4 ends the straggler window at 'the first StageVersions'; the fence starts at OpenStage",
+      "detail": "S4: 'The write fence of 6.1 keeps stragglers to the rows written between the export and the first StageVersions.' 6.1 step 5: 'the fence starts here' at OpenStage; D11: 'Put is fenced on a group while a valid stage is open'.",
+      "fix": "S4: 'between the export and OpenStage'."
+    },
+    {
+      "severity": "minor",
+      "section": "6.3 'The rotating half' (754-756), 8 (1022-1023)",
+      "title": "Symbol-location claims: spawn_rotator 'started once by serveloop' and Bunker::new callers omit src/server.rs tests",
+      "detail": "src/serveloop.rs serve_with_rebind is a generic rebind loop over a build closure and never sees a Bunker; the Bunker is constructed in src/main.rs Serve (line 761) before the loop is entered (line 774), which is where a once-per-process start belongs. Section 8 lists Bunker::new's callers as main.rs and tests/e2e.rs spawn_authoritative; src/server.rs tests call it at lines 1419, 1998 and 2030 and need the new signature too.",
+      "fix": "'started once by main.rs's Serve branch before serve_with_rebind (per-generation rebinds do not restart it)'; add src/server.rs tests to the caller list."
+    },
+    {
+      "severity": "minor",
+      "section": "11 (1189, 1205), 16 phase table, 5 S7 (605-608)",
+      "title": "`client epoch status` output, `db drop-group`'s phase and `db revoke-key`'s signing key are unspecified",
+      "detail": "11 sends `client epoch log|status` to 6.5, which specifies the log rendering only. `db drop-group` (11) appears in no phase row of 16. `db revoke-key --db --id <hex>` 'authors the carries offline' (S7) - authority carries must be signed by the operational key and chain on each group's head, but no --operational-key flag is listed and nothing says it refuses a key the head does not name.",
+      "fix": "Specify epoch status as GroupStatus plus the local pin and a fork/ok verdict; add db drop-group to phase 2; give db revoke-key --operational-key and 'refused unless that key is the head's authority for every affected group'."
+    }
+  ]
+}

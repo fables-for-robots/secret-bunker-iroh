@@ -1,0 +1,109 @@
+{
+  "findings": [
+    {
+      "severity": "critical",
+      "title": "sync/2 SecretData carrying both `ciphertext` and `record` overflows SYNC_MAX_MSG for a maximum-size secret",
+      "detail": "6.3 says `SecretData` *gains* `record: bytes` while keeping the existing fields. An SBR1 record embeds the ciphertext again (~226 B header + ciphertext). A Put sized to the cap (tests/e2e.rs `a_maximum_size_secret_syncs_to_the_replica` puts exactly MAX_MSG - envelope - 4 bytes) yields ciphertext of ~4,194,276 B; ciphertext + record + CBOR envelope is ~8,388,900 B > SYNC_MAX_MSG (8,388,608). `sync::frame` (src/sync.rs:130) errors before any byte is written, the fetch stream dies, the replica falls into the reconnect loop and fails identically forever. That existing e2e test would fail, and the 'one frame per secret' invariant in sync-protocol.md section 2 is broken.",
+      "fix": "Since the ALPN is bumped to sync/2 anyway, make `record` the only payload of SecretData (drop or empty `ciphertext`/`nonce`/`dek_version` in the v2 message) and derive the columns from the record on apply; or raise SYNC_MAX_MSG to 3x MAX_MSG. Keep the max-size e2e test and add a rekey variant of it."
+    },
+    {
+      "severity": "critical",
+      "title": "StageRecord / Record cannot carry a secret written at the Put cap, so such a group can never be re-keyed",
+      "detail": "The server reads every client stream with `recv.read_to_end(proto::MAX_MSG)` (src/server.rs:1019) before it knows the variant. A secret whose Put sat on the cap has ciphertext ~MAX_MSG - 30 B; its SBR1 record adds ~226 B + name and the `StageRecord{group, epoch_hash, record}` envelope ~60 B, so the frame exceeds MAX_MSG by ~250 B and is rejected. Same for `Record{record}` on GetRecord. A kick (4.1) of any group holding one cap-sized secret cannot complete: cryptographic revocation is blocked precisely by the largest secrets. The sync protocol solved this with a strictly larger cap; the client protocol here has none.",
+      "fix": "Give the record-carrying variants headroom: the server reads client streams with `MAX_MSG + MAX_RECORD_OVERHEAD` (e.g. +64 KiB) — compatible with old clients — while `Put.value` stays capped; or stage records over a length-prefixed multi-frame stream like sync. State the cap in protocol.md and add a test that re-keys a group containing a cap-sized secret."
+    },
+    {
+      "severity": "critical",
+      "title": "Replica apply filter is keyed on `state.deks`, which the design sends empty — nothing would ever be applied",
+      "detail": "6.3: '`deks` is sent empty' and 'Rule 3 (wraps) becomes: store the epoch, nothing else; then the existing rules 1–5'. But the undecryptable-record guard lives outside the store rules, in src/replica.rs:863-866: `wrapped_versions = state.deks…; fetched.retain(|s| wrapped_versions.contains(&s.dek_version))`. With `deks` empty every fetched secret is dropped, `skipped_undecryptable` is true, the one re-fetch in `sync_one_group` drops everything again, and the group is left permanently empty. The design never mentions this filter and its 'existing rules' phrasing carries it over unchanged.",
+      "fix": "Replace the filter with `record.dek_gen == head.dek_gen` (head parsed from `Group.head`), keep the one-shot re-fetch, and make `secrets_needing_fetch` (src/store.rs:948) compare `record_hash` instead of `(current_version, dek_version, nonce)`. Add a replica.rs unit test for the race (state head dek_gen N, fetched record dek_gen N+1)."
+    },
+    {
+      "severity": "critical",
+      "title": "GetRecord has no `version` and ListRecords is admin-only, so 4.1 step 3 and break-glass `bundle export` are not executable as specified",
+      "detail": "4.1 step 3: 'ListRecords → every (name, version, record_hash); GetRecord each' over every retained version. 6.2 defines `GetRecord{group, name}` with no version, so historical versions cannot be fetched at all (`secret_current`, src/store.rs:1225, is the only version-returning query today). Separately, 4.6/2.3 say `bundle export` is done by 'any reader' and is the recovery for an *orphaned* group (no admin left), yet `ListRecords` requires `admin`. Both the normal kick loop and the orphan-recovery path are blocked on the wire as written.",
+      "fix": "`GetRecord{group, name, version: Option<u64>}` (omitted = current) plus a store query `secret_version_row(group_id, name, version)`. Gate `ListRecords` on `read` (it discloses names, version numbers and hashes; `List` already discloses names to readers). Or make `bundle export` a sync-ALPN fetch with a `FetchHistory` variant — either way, say which."
+    },
+    {
+      "severity": "major",
+      "title": "Bundle import contradicts the BeginEpoch/CommitEpoch authorization rule",
+      "detail": "4.6: the import is 'a staged submit by whoever carries the file; the epoch is signed by the backup key, so the carrier needs no permission beyond being registered'. 4.1's server check and 6.2: 'caller == epoch.author' and 'admin in head (or epoch 1 + service admin)'. The backup key never comes online, so caller can never equal author for a break-glass epoch; every break-glass import is refused and, with `db grant` and `recover` removed, no orphan-recovery path remains.",
+      "fix": "In BeginEpoch/CommitEpoch: if `epoch.author` is a role-1 pinned id in the stored head, accept from any registered caller (the chain authorizes the epoch); otherwise require caller == author. Audit with the carrier as `endpoint_id` and the author id in `target`."
+    },
+    {
+      "severity": "major",
+      "title": "Replica authorization source of truth is unspecified, and the RemoveIdentity FK cascade desynchronizes the materialized ACL from the chain",
+      "detail": "6.1 materializes the head epoch's ACL into `group_acl` 'rewritten inside every epoch-apply transaction'; 6.3 keeps `Group.acl` 'for display'. But `RemoveIdentity` deletes the identity row and `group_acl(identity_id) … ON DELETE CASCADE` (src/store.rs:84) removes that id's ACL rows outside any epoch — the design's risk 10 is built into the schema. `acl_entries_full` (src/store.rs:871, a JOIN on identity) then omits the id from `Group.acl` while the signed head still lists it. Unless stated, one of two bad outcomes follows: (a) if the replica authorizes from `Group.acl` (unsigned, server-supplied), a compromised authoritative node can add a `read` bit for any id and `ReplicaServer::dispatch` (src/replica.rs:341) decrypts with the replica's own key and serves plaintext to it — 'replicas verify the chain' is hollow for the served surface; (b) if it authorizes from the head epoch, a registry-removed identity keeps reading through every replica until an admin finishes 4.1, and `AddIdentity` with the same EndpointId later regains every read the chain still grants (today removal cascades ACL rows, so re-registration starts clean). Also the verifier never checks that ACL ids are registered, so an epoch naming an unregistered id cannot be materialized (`identity_id` NOT NULL FK).",
+      "fix": "State: replica `group_acl` is materialized only from the verified head epoch; `Group.acl` supplies display names and nothing else (ids/perms not in the head are ignored). Document that registry removal is not honored by replicas until the group is re-keyed (that is what `tainted` is for) and that re-registering an EndpointId inherits chain grants. Add a server-side submit policy (not a verifier rule): every acl id in a submitted epoch must be a registered identity. Add a replica test: a hostile `Group.acl` read bit for a non-reader must not be served."
+    },
+    {
+      "severity": "major",
+      "title": "Service-admin implicit `admin` on every group silently disappears (and takes `remove-identity`'s client-side rekey with it)",
+      "detail": "Today `authorize_group(…, ident.service_admin)` (src/server.rs:855) lets any service admin Grant/RotateDek/GroupAcl on any group; `service_admins_implicitly_access_all_groups` (src/server.rs:1683) pins it. Under the design, epoch authorship is verified against the previous epoch's ACL (section 3) and a service admin holds no wrap, so a service admin who did not create the group cannot grant, kick or rotate; `Grant`/`RotateDek` answer `Failed`. 5.1 lists 'service-admin implicit read: works' but is silent on admin. Knock-on: 4.4's `remove-identity` re-keys 'every group where the caller is admin+reader' — the service admin running it (the only caller allowed to) is typically not a reader-admin on those groups, so in practice it re-keys nothing and prints every group as debt; the operator README rotation runbook ('Removing an identity rotates the DEK of every group it could read') becomes false.",
+      "fix": "Call it out as a behavior change tied to open question 3 (role 0 for the operational key). Either (a) accept it and document that service admins need explicit `rwa` from a reader-admin or the backup key, and rewrite the operator runbook so a group admin runs the kick; or (b) let the server, as a role-0 recipient in Mode A, author epochs on behalf of a service admin (relaxing 'epoch 1 and nothing else'), the only way to keep today's UX. Update the unit test either way."
+    },
+    {
+      "severity": "major",
+      "title": "Migration/serve gating and the age-era startup paths are under-specified",
+      "detail": "`Store::open` runs `migrate()` automatically (pure SQL); the epoch migration needs the age operational key and a new Ed25519 key, so it is a CLI step (`migrate-epochs`). 6.1 keeps `group_dek`/`dek_wrap` 'while any group lacks an epoch', implying a dual-mode server, but nothing says whether `serve` refuses an unmigrated database or serves legacy groups alongside epoch groups (two code paths in `put`, `read_secret`, `grant`, `snapshot_group`, replicas). `Bunker::new` (src/server.rs:64) validates `operational_pubkey` (age) and `serve` runs `backfill_reader_wraps` (src/main.rs:766, minting age wraps via `missing_reader_wraps`) before serving — both fail or mint dead rows once the age tables go. Replica side: `Replica::get` reads `dek_wrap` (src/replica.rs:170) and `secret_aad` takes the group *name*, while the new AAD needs `group_uid`, which the replica only learns from inside the head epoch.",
+      "fix": "Simplest: `Bunker::new` refuses a database with `epochs_migrated != 1` ('run migrate-epochs first'); delete `backfill_reader_wraps` and the age meta checks in the same change. Specify the replica mirror migration: on the first sync/2 session `apply_group_sync` writes `group_uid`/`genesis_hash`/`head_epoch` into `secret_group`, and rule 3's stale-wrap delete already clears old `dek_wrap` rows when `deks` is empty. Add a fixture-based migration test like `migration_v1_to_v2_moves_wrap_columns_to_rows`."
+    },
+    {
+      "severity": "major",
+      "title": "Testing story: the design deletes two flows that have integration tests and replaces them with nothing testable",
+      "detail": "`recover` is exercised by tests/e2e.rs `recovery_rewraps_deks` and `db grant` by tests/cli.rs `cli_db_rescue_and_audit_verify` (create group, offline grant with the service stopped, restart, write). The design replaces both with `bundle export → rekey → import`, but 6.4's 'golden vectors' is the only testing content. Missing: an e2e for the staged kick (Begin/Stage/Commit, EpochConflict on a racing Put, StaleEpoch), the offline bundle round trip through a stopped server, replica chain negatives (fork, rollback below pin, own id dropped → GroupRemoved with attribution), CLI `remove-identity` re-key-first, and the cap-sized-secret rekey.",
+      "fix": "List the replacement tests explicitly, one per deleted flow, plus risk 1's negative verifier tests as `crypto::tests`, and a replica test for the `Group.acl`-vs-head divergence."
+    },
+    {
+      "severity": "minor",
+      "title": "dalek API fit: no crate-root re-export, `Scalar::random` needs rand_core 0.10, `from_hash` needs sha2 0.11",
+      "detail": "ed25519-dalek 3.0.0 re-exports only `rand_core` (feature-gated), `ed25519`, `Digest` and `Sha512` (registry src/lib.rs:257-297); `to_edwards()`/`to_scalar()` return curve25519-dalek 5 types, so naming them requires `curve25519-dalek = \"5\"` as a direct dependency — 1.1/7.1's 'via the re-export' is wrong (the brief already anticipates the dep). `Scalar::random` is `#[cfg(feature = \"rand_core\")]` and takes a rand_core 0.10 `CryptoRng`; the crate's `rand = \"0.8\"` `OsRng` does not implement it. `Scalar::from_hash` takes a digest 0.11 hasher (ed25519-dalek's `Sha512` = sha2 0.11), not the crate's `sha2 = \"0.10\"`; `hkdf` 0.12 pairs with sha2 0.10, so two sha2 majors coexist.",
+      "fix": "Add `curve25519-dalek = { version = \"5\", features = [\"rand_core\", \"digest\"] }` and either bump `rand` to 0.10 or derive scalars via `Scalar::from_bytes_mod_order_wide` from 64 bytes of `OsRng.fill_bytes` (no feature needed). Use `ed25519_dalek::Sha512` for the transcript and HKDF-SHA256 over the existing sha2 0.10. Prefer `verify_strict` for epoch/record signatures."
+    },
+    {
+      "severity": "minor",
+      "title": "CommitEpoch does all verification under the global store mutex on the async accept task",
+      "detail": "`Bunker::handle` holds the std `Mutex<Store>` for the whole request and is called directly from `ProtocolHandler::accept` (src/server.rs:1021) without spawn_blocking. 4.1 puts signature verification and, in Mode A, AEAD decryption of every staged record (N × up to 4 MiB) inside the CommitEpoch transaction, stalling every client request and every sync session for the duration; today's heaviest request is a single 4 MiB ChaCha pass.",
+      "fix": "Verify each record at `StageRecord` time (signature, AAD/AEAD under the head's DEK in Mode A, dek_gen/epoch fields) and persist a verified flag; CommitEpoch then checks only set equality, `body_root` and the epoch. Consider `spawn_blocking` for the commit."
+    },
+    {
+      "severity": "minor",
+      "title": "Audit-log growth: one hash-chained row per StageRecord",
+      "detail": "`handle` appends an audit row for every request (src/server.rs:215) and `Request::op()` is exhaustive; a rekey of a group with V retained versions writes V `stage-record` rows plus the `rotate-dek`/`grant` rows 4.1 adds. With history retained on the authoritative node this dominates the log.",
+      "fix": "Audit StageRecord only on denial/failure; have CommitEpoch write one row whose target carries `epoch`, `dek_gen`, record count and author. Keep the design's `rotate-dek`/`grant` attribution rows."
+    },
+    {
+      "severity": "minor",
+      "title": "Pending-epoch storage and the staging GC are unspecified",
+      "detail": "`BeginEpoch{group, epoch: bytes}` must persist the epoch until CommitEpoch, but `epoch_staging`'s PK is `(group_id, epoch_hash, name, version)` (record rows) and `group_epoch` holds committed epochs only. 'Staging rows older than 10 minutes are garbage-collected' names no actor; `Bunker` has no background task.",
+      "fix": "Add `epoch_pending(group_id, epoch_hash, record BLOB, created_at, PRIMARY KEY(group_id, epoch_hash))`; run the GC inline at the start of BeginEpoch and on serve startup."
+    },
+    {
+      "severity": "minor",
+      "title": "Additive `GroupInfo` fields change the shared golden vectors and need the Go client's unknown-field behavior confirmed",
+      "detail": "6.2 adds `epoch`, `dek_gen`, `last_rekey_by`, `tainted` to `Groups` entries. `proto::tests::wire_format_is_stable` (src/proto.rs:293) pins the `Response::Groups` hex, mirrored by `proto_test.go`; both break and must move in lockstep. protocol.md says decoders 'should' (not must) ignore unknown fields, so a strict Go CBOR decoder would reject every `ListGroups` reply after the upgrade.",
+      "fix": "Confirm the Go client's decoder tolerates unknown map keys before shipping, update both golden vectors in the same PR, or return the new data via a new `GroupEpochs` request if it does not."
+    },
+    {
+      "severity": "minor",
+      "title": "Store the raw SBR1 bytes rather than re-serializing from columns",
+      "detail": "6.1 splits the record into `secret_version` columns (`epoch`, `kind`, `author`, `origin_*`, `sig_kind`, `sig`, with `created_at` i64 vs SBR1 `at u64be`). `record_hash`, `body_root` and signature verification need the exact bytes; re-serializing from columns is a second implementation of the layout on every read path (Get, sync, bundle export), and one i64/u64 or name-encoding slip makes stored records unverifiable.",
+      "fix": "Add `record BLOB NOT NULL` to `secret_version` (and the replica mirror); keep the columns as derived, query-only data — as the design already does for `group_epoch.record`."
+    },
+    {
+      "severity": "minor",
+      "title": "Over-engineered relative to the ask: provenance carry-over and the general-purpose bundle toolset",
+      "detail": "`origin_author`/`origin_at` in SBR1 (2.2) and the `bundle verify | decrypt` subcommands plus framing SBG1 as a 'SOPS-file analogue' (2.3) go beyond kick/re-key/attribution. `bundle export | rekey | import` are required because `db grant` and `recover` are removed; the rest is scope. Likewise Mode B's `PutRecord`/`GetRecord`/client-submitted genesis are fully specified but explicitly not shipped.",
+      "fix": "Ship `bundle export | rekey | import` only, keep `author`/`at` on records (the ask's attribution), drop `origin_*` until needed, and move the Mode B wire surface to a follow-up spec referenced from section 8's checklist."
+    }
+  ],
+  "strengths": [
+    "Fixed binary layouts (SBE1/SBR1) carried as CBOR byte strings keep `proto.rs` variant/field names untouched and avoid a canonical-CBOR requirement for the Go client.",
+    "Materializing the head epoch's ACL into `group_acl` is the right lever: `authorize_group`, `read_scope`, `acl_entries_full`, `list_groups_explicit` and the replica's dispatch need no change.",
+    "The staged Begin/Stage/Commit submit correctly recognizes that a group's ciphertext exceeds MAX_MSG, and CAS on the exact `(name, version)` set matches `put_secret`'s CAS style and the single-mutex transaction model.",
+    "Mode A keeps Get/Put/List/Delete byte-identical for existing clients and lets the server, as a role-0 recipient, reject a rekey that would brick readers at submit time.",
+    "Accurate reading of the codebase: only current versions are mirrored, history lives on the authoritative node only, `RemoveIdentity` is never blocked, ALPN bump is the sync versioning mechanism, and `dek_version` can be reused for `dek_gen`.",
+    "The `--drop-history` migration default and the 'exactly one live dek_gen' invariant simplify the schema (no `group_dek`/`dek_wrap` versioning) and close today's stolen-DB-plus-kicked-key gap."
+  ],
+  "verdict": "Solid at the schema/handler level but not implementable as written: four items would fail against the current code (SecretData over SYNC_MAX_MSG for cap-sized secrets; StageRecord/Record over MAX_MSG blocking any rekey of a group holding one; the replica's `state.deks`-keyed filter dropping every record once `deks` is empty; GetRecord lacking a version while ListRecords is admin-only, which makes both the kick loop and orphan-group export unexecutable). One rule contradiction (bundle import carrier vs caller==author) and one security-relevant under-specification (replica ACL source of truth vs the RemoveIdentity FK cascade) need explicit decisions, and the silent loss of service-admin implicit group admin should be surfaced as a consequence of open question 3. All are fixable without touching the wrapping/proof scheme; fix them and add the listed replacement tests before planning. Full critique: /private/tmp/claude-502/-Users-dragan-fables-for-robots-secret-bunker-iroh/0c07f4bd-a1ff-4066-aa31-2b8de0a5ded7/scratchpad/critiques/e2e-impl-fit.json"
+}

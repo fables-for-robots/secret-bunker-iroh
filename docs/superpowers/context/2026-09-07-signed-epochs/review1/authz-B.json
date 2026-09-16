@@ -1,0 +1,96 @@
+{
+  "verdict": "Not ready. The stage/commit path has a silent data-integrity hole (delete-then-recreate during the window installs stale plaintext under the new writer's name), the client-signed kick and the offline recovery can both be starved indefinitely by the very party they exist to remove, and RemoveIdentity in mode A trades today's O(recipients) emergency path for whole-group re-encryption inside the global store mutex. Several gates contradict each other (StageVersions admin-only vs. recovery carried by any identity; reencrypted 'installed set' vs. 'staged set'), and the revoked list has no population path in either mode as written.",
+  "findings": [
+    {
+      "severity": "critical",
+      "section": "5 S4/S5, S8; 6.1 server commit",
+      "title": "Delete-then-recreate during the rotation window installs stale plaintext under the new writer's name",
+      "detail": "Store::delete_secret deletes the `secret` row and cascades every `secret_version`; Store::put_secret then recreates the name with versions restarting at 1. Sequence: (1) admin A exports; (name, v1) = \"old\", created_by=X. (2) A stages the re-encrypted (name, 1). (3) S5 runs OUTSIDE the lock (S8): it decrypts staged (name,1) under DEK_new and the row it replaces under DEK_old, both \"old\" -> pass. (4) writer W: Delete{name, expected_version:1}; Put{name, expected_version:0, \"new\"} -> the DB again has (name, 1), ciphertext of \"new\", created_by=W, created_at=t2. (5) A's SubmitEpoch takes the lock: S3 passes (head unchanged), S4 coverage passes ((name,1) is retained and is in the stage; 'rows staged for a version deleted meanwhile are ignored' does not fire because the version exists again), straggler detection keyed on (name, version) does not fire. (6) Install: `UPDATE secret_version SET dek_version, nonce, ciphertext` writes A's re-encryption of \"old\" over W's row. Result: W's write is silently lost, the row now says created_by=W/created_at=t2 with content W never wrote, and the record's `reencrypted` digest matches. No attacker required. If S5 were instead re-run under the lock, the rotation fails and W can repeat delete+recreate every attempt, making a rotation never finish.",
+      "fix": "Identify the row being replaced by content, not by (name, version): every staged SealedVersion carries `src_dek_gen` and `src_nonce` of the row it re-encrypts (the client has both from ExportGroup); at commit a staged row whose current source (dek_gen, nonce) differs is treated as a straggler (mode A: server re-encrypts from the *current* row; mode E: StaleVersions), never installed. State this in S4 and make the straggler rule normative: 'a retained row is a straggler iff no staged row names its current (dek_gen, nonce)'."
+    },
+    {
+      "severity": "major",
+      "section": "6.1 step 8; 5 S6",
+      "title": "An online kick target starves the client-signed kick indefinitely at zero cost",
+      "detail": "The target B is an admin of head until A's rotate lands. A's rotate costs export + re-encrypt + stage of the whole group (minutes, 2x ciphertext over the relay). B's counter-move costs one round trip: `carry` toggling the w-bit of any third reader (recipients unchanged, so no proof; not a no-op, so S6 accepts it). Sequence: A at head h stages, submits -> EpochConflict (B's carry h+1 landed). Step 8: 'refuse to rebase automatically over a record authored by the kick target' -> human confirms -> 'restart at 2' = full re-export. B toggles again. Repeat forever; B's records are valid (A2, author in head.acl). The only path that beats B is server-authored: legacy Grant{B, perms:0} (6.3) is built and CAS'd inside one lock hold, and RemoveIdentity. So the headline flow (admin kicks from their own machine) is best-effort against exactly the adversary it is for (a compromised admin key), while the design proposes dropping the server path in Q13.",
+      "fix": "(a) Cheap rebase: when every intervening record leaves dek_gen unchanged, re-sign only (new prev/epoch, acl = fresh head.acl minus target, wraps to the new recipient set) without re-export; rows staged under M_new stay valid. (b) Make churn costlier than rebase: S-rule per-author rate limit on non-rotate records (e.g. one per author per 30 s) with `Failed{reason: \"rate\"}`, audited. (c) Answer Q13 as 'keep': the authority-authored shrink is the guaranteed kick; say so in 6.1 and 7.4 rather than presenting the client flow as the only kick."
+    },
+    {
+      "severity": "major",
+      "section": "6.4; 5 C2, R2",
+      "title": "Offline recovery cannot land against the rogue admin it is meant to defeat",
+      "detail": "6.4's first trigger is 'a rogue admin locked everyone out'. A recovery record chains on prev = hash(head) (C2, no exception) and is authored offline, so bundle export -> air-gapped signing -> submit takes hours. The rogue admin is still an admin of head and submits a cheap `carry` (w-bit toggle) every few seconds; every recovery submit answers EpochConflict and the ceremony restarts. If the rogue instead rotates, the recovery's dek_gen (chosen offline as bundle head +1) violates R2 and its staged ciphertexts are under the wrong generation, so even a same-second submit fails. The design's only root is the backup key, and the one flow that uses it is unavailable while the attacker is online.",
+      "fix": "Add a service-admin `FreezeGroup{group}` / `db freeze` (audited): while frozen the server refuses every non-`recovery` SubmitEpoch and legacy Grant for the group with `Failed{reason: \"frozen\"}`; denial is already inside the authority's shrink-only power (D4), so no record kind changes. 6.4 step 1 exports after freezing so prev is stable; the recovery record clears the freeze on commit. Alternatively let `recovery` name any ancestor as prev and install as head+1 with dek_gen = head.dek_gen+1 assigned server-side, but that reintroduces the re-root accounting D9 rejected; the freeze is simpler."
+    },
+    {
+      "severity": "major",
+      "section": "4.3 vs 5 S4 / 6.1 step 6 / 6.5",
+      "title": "`reencrypted` cannot cover stragglers, so the spec contradicts itself and the audit claim",
+      "detail": "4.3 defines the digest 'over the ciphertext set installed with a rotating record'; 6.1 step 6 and S4 define it over 'the staged set as submitted'. In mode A the server re-encrypts stragglers at commit (D11), so whenever stragglers > 0 the installed set != staged set: after commit, ExportGroup + recompute != record.reencrypted, and an offline auditor cannot tell stragglers from tampering; the only attestation of which rows the server re-encrypted is the unsigned audit row. 6.5's 'who last re-encrypted = author of the newest rotating epoch' is then false for those rows. R2's 'reencrypted != 0' is satisfied either way, so nothing catches the inconsistency.",
+      "fix": "Make 4.3 normative as 'the digest over the client-staged subset that was installed'; record straggler leaves `(name, version, dek_gen, nonce)` in the audit row and expose them through GroupStatus/`epoch log` ('re-encrypted 143 + 2 by server'); have `epoch export` bundle the straggler list so an auditor can reconstruct. State in 6.5 that server-re-encrypted stragglers are server-attested."
+    },
+    {
+      "severity": "major",
+      "section": "6.3 RemoveIdentity; 5 S8; 8",
+      "title": "RemoveIdentity in mode A re-encrypts every group under the global store mutex and can now fail",
+      "detail": "Bunker::handle takes the single std Mutex<Store> before dispatch and holds it for the whole request; the spec keeps RemoveIdentity 'in the same transaction' and makes it a `rotate` with 'server-side re-encryption of every retained version' of every group the identity could read. Today that path is O(recipients) (age wraps, KB); now it is O(retained ciphertext across all those groups) of ChaCha20 + SQLite writes with every other request (including a service admin's Get, sync, other removals) blocked, and the iroh request stream may time out before the response. Any failure in any group (disk full, a row that fails S5-style decrypt, an unopenable authority wrap) aborts the whole transaction and the compromised identity stays registered, breaking the 'removing a compromised identity always wins' guarantee that crypto-design.md section 7 and this spec's section 1 both promise unconditionally.",
+      "fix": "Split the removal: under the lock, delete the identity row and author one authority `carry` per group that drops its rows and sets `needs_rotation` (R6 already allows exactly this for author = authority, in either mode); then perform the authority `rotate` per group asynchronously (A3 permits it), clearing `needs_rotation` on commit. Transport denial is immediate and replicas drop the reader on the carry; the interim exposure (a stashed DEK opening a stolen copy) equals today's, which never re-encrypts at all."
+    },
+    {
+      "severity": "major",
+      "section": "9 StageVersions/ExportGroup gates vs 6.4 step 3; 8 epoch_stage; 6.1 stage TTL",
+      "title": "Stages are neither bound to their submitter nor stageable by the recovery carrier",
+      "detail": "Three concrete mismatches. (1) 6.4 step 3: a recovery bundle is submitted by 'any registered identity ... staged like 6.1', but section 9 gates StageVersions on `admin`; the primary recovery case (orphaned group, no admins) therefore has nobody who may stage a `--rotate` recovery. (2) The `epoch_stage` PK is (group_id, stage_id, name, version); `submitter` is a plain column and neither StageVersions nor SubmitEpoch is specified to check it. If the gate is widened to fix (1), any registered identity that learns a stage_id (it travels in every StageVersions/SubmitEpoch and in client logs) can upsert rows into another submitter's stage or submit against it; and the per-group byte cap (2x ciphertext + 16 MiB) is shared, so one staging identity exhausts it and the real admin's StageVersions fails. (3) Expiry is '15 minutes' with `staged_at` per row: a large group paged over a relay-limited link has its first chunk expire while later chunks are still uploading, so S4 coverage fails on submit and the rotation can never complete for groups above a bandwidth-dependent size.",
+      "fix": "Key the stage by (group_id, submitter, stage_id, name, version); SubmitEpoch resolves the stage by (group, connection EndpointId, stage_id). Gate StageVersions on 'any registered identity' (rows are inert until a verified record references them) with the byte cap per (group, submitter). Define the TTL as an idle timeout refreshed by every StageVersions/SubmitEpoch on that stage, with a hard ceiling (e.g. 6 h)."
+    },
+    {
+      "severity": "major",
+      "section": "6.2; 5 G6, S6; 6.1 step 8",
+      "title": "6.2 has no EpochConflict rule; replaying the computed ACL silently revives a just-kicked reader",
+      "detail": "Add-reader is one round trip: A reads head h (acl {A, B, dave}), builds acl_h + carol, signs. Meanwhile B's rotate h+1 kicks dave. A's submit -> EpochConflict. 6.2 specifies no rebase; the obvious client behaviour (new prev/epoch, same acl, fresh wraps) yields a `rewrap` whose acl re-adds dave: A2 holds (A in head.acl), G6 explicitly permits reviving, S6 does not refuse (the ACL changes), R1/R3 hold. dave is back with the current M, attributed to A, who intended nothing of the kind. The auto-rebase refusal in 6.1 step 8 covers only the kick flow.",
+      "fix": "Normative client rule for every flow: on EpochConflict re-read the head and re-apply the *delta* (add carol / clear bits on X), never the previously computed state; abort with the diff if any recipient of the old head is missing from the new one. Server backstop (S-rule): a non-authority `rewrap` that re-adds an id present in head.prev's ACL but absent from head.acl is refused with `Failed{reason: \"revives id kicked in head\"}` unless the record's ACL delta relative to head is exactly that revival (i.e. an explicit, sole-purpose re-add), so G6 stays available on purpose but not by accident."
+    },
+    {
+      "severity": "minor",
+      "section": "6.3 legacy Grant; 17; D4",
+      "title": "Legacy Grant shrink launders every server-mediated kick through the authority key",
+      "detail": "A pure-shrink Grant is authored by the authority; only the unsigned audit row names the requesting admin. The chain, which is what replicas and `epoch log` verify, says 'the server kicked bob'. A compromised authoritative node can kick anyone and claim a legacy request, indistinguishable from a legitimate one; success criterion 'names, verifiably, the author of every membership change' is false for every such record. (This is also the only path that wins the race in finding 2, so it should be kept but labelled, not removed.)",
+      "fix": "Render authority-authored non-genesis records in `epoch log` and GroupStatus as 'authority (requested by <audit endpoint>, unsigned)'; state in 6.5 and 17 that legacy-Grant shrinks are server-attested; plan Q13's removal for the release in which every shipped client signs."
+    },
+    {
+      "severity": "minor",
+      "section": "6.3 RemoveIdentity; 10 P5; 5 S7; 8 revoked_identity",
+      "title": "The revoked list and S7 `revive` guard a state the design says cannot exist",
+      "detail": "The list is populated with 'a removed id that still appears in a head (mode E, until the rotate)'. But 6.3 mode E authors an authority `carry` that *drops the row* (R6 allows it), and R1 removes the wrap, so the id never remains in a head; mode A rotates it out immediately. Hence `revoked_identity`, the `revoked` sync field, P5's 'minus revoked', and S7's `revive: true` have no population path. They also cannot help the timing case: `revoked` travels in the same `Group` message as the record that already removed the id. The only reachable population is the failure case in finding 5 (the per-group server record could not be authored), which the spec does not describe.",
+      "fix": "Either delete `revoked_identity`, `revoked`, P5's subtraction and `revive`, or specify the one case they cover: RemoveIdentity succeeds fail-open by deleting the identity row and listing the id in `revoked` when a per-group authority record cannot be authored, with a background retry; then S7's revive gate is meaningful."
+    },
+    {
+      "severity": "minor",
+      "section": "5 S4 (stragglers), S8",
+      "title": "Mode A straggler re-encryption inside the commit transaction is a writer-driven stall of the whole server",
+      "detail": "A write-only identity that keeps writing cap-sized secrets during an admin's 15-minute window makes every one of them a straggler; the server decrypts and re-encrypts all of them 'now', inside the S3-S4 lock hold and one SQLite transaction. Handle is synchronous under the store mutex, so Get/Put/sync for every group stall for the duration and the submitting stream may time out, leaving the admin unsure whether the epoch committed (a retry answers EpochConflict against its own record).",
+      "fix": "Bound straggler bytes per commit (e.g. 16 MiB); above it answer `StaleVersions` in mode A too, so the client stages them (its stage is upsert-by-(name, version), so this converges). Alternatively pre-encrypt stragglers outside the lock and re-check only (dek_gen, nonce) identity under it, combined with the src-nonce rule of finding 1."
+    },
+    {
+      "severity": "minor",
+      "section": "9 GroupEpochs/GroupStatus gating; 10",
+      "title": "Read-gating hides the kick from its target and is unspecified on replicas",
+      "detail": "After epoch N kicks bob, bob is not in the `group_acl` projection, so GroupEpochs/GroupStatus answer Denied; the 'loud, attributable' record is invisible to the one party with standing to dispute it, and indistinguishable from server withholding. Separately, section 9 says new *mutations* answer ReadOnlyReplica on a replica but does not say whether ReplicaServer serves GroupEpochs/GroupStatus/ExportGroup from its mirror or against which ACL (head minus revoked?), so the operator's replica may or may not expose the chain.",
+      "fix": "Allow GroupEpochs{since} for any id in the ACL of the record at `since` (one-epoch grace: a kicked id may fetch exactly the record that removed it), and state the replica's answer for each new read variant (serve GroupEpochs/GroupStatus from the pinned chain with the mirrored ACL; ExportGroup -> Denied)."
+    },
+    {
+      "severity": "minor",
+      "section": "10 Hello manifest; P1",
+      "title": "Hello cannot ship 'records since each group's pinned head' because Hello carries nothing",
+      "detail": "`SyncRequest::Hello` has no fields and the spec adds none, yet section 10 says the manifest ships records since each group's pinned head. The server cannot know the replica's pin; it must either ship every chain in full on every reconnect (8 KB x epochs x groups, growing forever) or the replica must announce its pins. This matters for the drop/re-grant case: a replica dropped at epoch N-1 and re-granted at N+k must receive N..N+k to verify continuity through its pin.",
+      "fix": "Add `Hello{have: [[name, have_epoch, head_hash]]}` (or a `have` list in a first message after Hello) and specify that the server answers unknown names with the full chain; keep FetchGroup{have_epoch} as the paging path."
+    },
+    {
+      "severity": "minor",
+      "section": "5 S3; 7.4 equivocation; 10 P1/P4",
+      "title": "Every EpochConflict hands the server a valid fork record; recovery from equivocation is a manual reset per replica",
+      "detail": "A record rejected by S3 is fully valid for the head it names (signature, proof, A2). A compromised node that retains them can serve one to a replica sitting at that head; the replica accepts it (all E/C/R/A/G pass), pins it, and the real chain (prev = the other successor) is then 'a chain that does not pass through the pinned head' -> rejected forever until `db drop-group` on that replica. 7.4 lists equivocation, but withholding self-heals when the node is cleaned while this does not; every kick retry manufactures the material.",
+      "fix": "State the recovery cost in 7.4/10 and have `EpochRejected{reason: fork}` carry both heads so the operator can see which replicas need `reset_group`. Have the server never persist S3-rejected records (say so in S3), and have `Replica::reset_group` accept a target head hash so the reset is scripted from the operator chart rather than ad hoc."
+    }
+  ]
+}
