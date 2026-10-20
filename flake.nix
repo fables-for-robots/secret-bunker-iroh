@@ -37,9 +37,21 @@
             # iroh integration tests need (EPERM under sandbox-exec on Darwin).
             doCheck = false;
           };
+          cli = pkgs.rustPlatform.buildRustPackage {
+            pname = "secret-bunker-iroh";
+            inherit ((pkgs.lib.importTOML ./Cargo.toml).package) version;
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [ "--package" "secret-bunker-iroh" ];
+            # See operator.
+            doCheck = false;
+            meta.mainProgram = "secret-bunker-iroh";
+          };
         in
         {
           inherit operator;
+          secret-bunker-iroh = cli;
+          default = cli;
         });
     };
 }
