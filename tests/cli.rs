@@ -814,3 +814,157 @@ fn cli_replica_serves_reads_and_outlives_the_authoritative() {
         "the replica must serve reads with the authoritative node down"
     );
 }
+
+/// A free UDP port on every interface, as far as one can be known ahead
+/// of binding it: the socket that found it is closed again.
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// The ports of every `bound: ` line `serve` has logged so far.
+fn bound_ports(log_path: &Path) -> Vec<u16> {
+    std::fs::read_to_string(log_path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("bound: "))
+        .filter_map(|addr| addr.rsplit(':').next()?.parse::<u16>().ok())
+        .collect()
+}
+
+/// `serve --port` binds that UDP port and no other, so a bunker can be
+/// given a fixed address: a client reaches it there, and a bunker that
+/// is started again is where it was. Without the flag every start picks
+/// a new port, and anything that was told the old one has lost it.
+#[test]
+fn cli_serve_binds_the_port_it_is_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let db = root.join("bunker.sqlite");
+
+    let server = Actor::new(root, "xdg-server");
+    let admin = Actor::new(root, "xdg-admin");
+
+    let admin_id = admin.expect_ok(&["key", "generate", "client"], None);
+    let server_id = server.expect_ok(&["key", "generate", "server"], None);
+    let backup_path = root.join("backup.age");
+    let backup_pub = server.expect_ok(
+        &["keygen-age", "--out", backup_path.to_str().unwrap()],
+        None,
+    );
+    server.expect_ok(
+        &[
+            "init",
+            "--db",
+            db.to_str().unwrap(),
+            "--backup-pubkey",
+            &backup_pub,
+            "--admin-id",
+            &admin_id,
+        ],
+        None,
+    );
+
+    let port = free_udp_port();
+    let port_arg = port.to_string();
+    let serve_args = [
+        "--db",
+        db.to_str().unwrap(),
+        "--no-relay",
+        "--no-mdns",
+        "--port",
+        &port_arg,
+    ];
+    let addr = format!("127.0.0.1:{port}");
+    let to_server = |rest: &[&str]| -> Vec<String> {
+        ["client", "--server", &server_id, "--server-addr", &addr]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(rest.iter().map(|s| s.to_string()))
+            .collect()
+    };
+
+    let log = root.join("serve.log");
+    let (guard, bound) = spawn_serve(&server, &log, &serve_args);
+    assert_eq!(
+        bound, port,
+        "serve bound another IPv4 port than it was given"
+    );
+    // The IPv6 socket, where the machine has one, is on the same port.
+    assert!(
+        bound_ports(&log).iter().all(|p| *p == port),
+        "serve bound a port it was not given: {:?}",
+        bound_ports(&log)
+    );
+    assert_eq!(
+        admin.expect_ok(&to_server(&["create-group", "team"]), None),
+        "ok"
+    );
+
+    // Started again, it is at the same address.
+    drop(guard);
+    let log = root.join("serve-again.log");
+    let (_guard, bound) = spawn_serve(&server, &log, &serve_args);
+    assert_eq!(bound, port, "the restarted serve moved to another port");
+    assert_eq!(
+        admin.expect_ok(
+            &to_server(&["put", "--group", "team", "--name", "api-key"]),
+            Some(b"secret-v1"),
+        ),
+        "version 1"
+    );
+}
+
+/// A port that is taken is a startup error that says so, not a silent
+/// move to another port.
+#[test]
+fn cli_serve_fails_when_its_port_is_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let db = root.join("bunker.sqlite");
+    let server = Actor::new(root, "xdg-server");
+    server.expect_ok(&["init", "--db", db.to_str().unwrap()], None);
+
+    let holder = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = holder.local_addr().unwrap().port().to_string();
+
+    let mut child = Command::new(BIN)
+        .args([
+            "serve",
+            "--db",
+            db.to_str().unwrap(),
+            "--no-relay",
+            "--no-mdns",
+            "--port",
+            &port,
+        ])
+        .env("XDG_DATA_HOME", &server.xdg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning serve");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("serve kept running on a port that was taken");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(!status.success(), "serve succeeded on a taken port");
+    assert!(
+        stderr.contains("binding endpoint"),
+        "serve did not say it could not bind: {stderr}"
+    );
+    drop(holder);
+}

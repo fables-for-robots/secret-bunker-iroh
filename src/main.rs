@@ -1,10 +1,10 @@
 use std::io::{Read, Write};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use iroh::endpoint::presets;
+use iroh::endpoint::{BindOpts, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
@@ -97,6 +97,14 @@ enum Cmd {
         /// Do not advertise or resolve on the local network via mDNS.
         #[arg(long)]
         no_mdns: bool,
+        /// UDP port to listen on, on every interface (IPv4, and IPv6
+        /// where the machine has it). Without it each start picks a free
+        /// port, which is fine for clients that find the bunker by its
+        /// EndpointId; give a port where they are told an `ip:port`
+        /// (`--server-addr`, `--replica-addr`) that has to stay good
+        /// across restarts. A port that is taken is a startup error.
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Disaster recovery: re-wrap all group DEKs from the offline backup
     /// key to a new operational public key. Run offline, service stopped.
@@ -362,10 +370,16 @@ fn resolve_operational_key(explicit: Option<PathBuf>) -> Result<age::x25519::Ide
 /// `no_relay`) configure relays; hole punching is on by default, so
 /// clients behind NATs can dial the bare EndpointId. mDNS additionally
 /// announces on the local network for internet-free operation.
+///
+/// With a `port`, the endpoint's two sockets are bound there instead of
+/// on a port the system picks. The IPv4 socket has to bind; the IPv6
+/// one may fail, as it may without a port, for machines that have no
+/// IPv6.
 async fn bind_serve_endpoint(
     secret: iroh::SecretKey,
     no_relay: bool,
     no_mdns: bool,
+    port: Option<u16>,
 ) -> Result<Endpoint> {
     let mut builder = if no_relay {
         Endpoint::builder(presets::N0DisableRelay)
@@ -375,6 +389,19 @@ async fn bind_serve_endpoint(
     .secret_key(secret);
     if !no_mdns {
         builder = builder.address_lookup(MdnsAddressLookup::builder());
+    }
+    if let Some(port) = port {
+        // Naming an address replaces the unspecified one the builder
+        // comes with for that family, so each family is named once.
+        builder = builder
+            .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+            .and_then(|b| {
+                b.bind_addr_with_opts(
+                    SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+                    BindOpts::default().set_is_required(false),
+                )
+            })
+            .map_err(|e| anyhow::anyhow!("binding endpoint to port {port}: {e}"))?;
     }
     builder
         .bind()
@@ -669,6 +696,7 @@ async fn main() -> Result<()> {
             replica_addr,
             no_relay,
             no_mdns,
+            port,
         } => {
             if let Some(target) = replica_of {
                 anyhow::ensure!(
@@ -687,7 +715,8 @@ async fn main() -> Result<()> {
                         let replica_addr = replica_addr.clone();
                         async move {
                             let endpoint =
-                                bind_serve_endpoint(secret.clone(), no_relay, no_mdns).await?;
+                                bind_serve_endpoint(secret.clone(), no_relay, no_mdns, port)
+                                    .await?;
                             if generation == 1 {
                                 eprintln!("replica endpoint id: {}", endpoint.id());
                                 for addr in endpoint.bound_sockets() {
@@ -776,7 +805,7 @@ async fn main() -> Result<()> {
                     let secret = secret.clone();
                     let bunker = bunker.clone();
                     async move {
-                        let endpoint = bind_serve_endpoint(secret, no_relay, no_mdns).await?;
+                        let endpoint = bind_serve_endpoint(secret, no_relay, no_mdns, port).await?;
                         if generation == 1 {
                             eprintln!("bunker endpoint id: {}", endpoint.id());
                             for addr in endpoint.bound_sockets() {
