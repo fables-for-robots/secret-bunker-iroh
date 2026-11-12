@@ -183,7 +183,11 @@ depends on where the two ends are:
   Disable the announcement with `--no-mdns` if you don't want the bunker
   visible to the local segment.
 - **Static addressing**: pass `--server-addr ip:port` to the client to skip
-  discovery entirely.
+  discovery entirely. `serve` picks a free UDP port at every start and
+  prints it (`bound: …`); give it `--port` to listen on a port of your
+  choosing, so that the address clients were told stays good when the
+  bunker is restarted. It binds that port on every interface, and fails
+  to start when the port is taken.
 
 Every path ends in the same mutually authenticated handshake against the
 EndpointId being dialed, so discovery can only affect reachability, never
